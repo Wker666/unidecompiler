@@ -118,15 +118,6 @@ class DecompilerEngine:
         frontend_id: str | None = None,
     ) -> DecompileResult:
         """Decompile one already-expanded artifact without mutating host state."""
-        if artifact.kind == "resource":
-            return _empty(
-                artifact.display_path,
-                "resource",
-                None,
-                "input.resource",
-                "Input is not a supported bytecode artifact",
-                "info",
-            )
         return self.decompile_bytes(artifact.data, artifact.display_path, frontend_id)
 
 

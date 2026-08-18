@@ -61,9 +61,6 @@ def main(argv: list[str] | None = None, *, registry: FrontendRegistry | None = N
     ast_modules: list[dict[str, Any]] = []
     processed = 0
     for artifact in artifacts:
-        if artifact.kind == "resource":
-            print(f"resource: {artifact.display_path}", file=sys.stderr)
-            continue
         try:
             frontend = registry.select(
                 artifact.data, artifact.display_path, explicit_id=args.frontend
