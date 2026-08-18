@@ -23,9 +23,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes libegl1
       - run: python -m pip install build PySide6 pyinstaller
-      - run: python -m pip install -e packages/unidecompiler -e packages/unidecompiler-gui -e packages/unidecompiler-plugin-python-pyc -e packages/unidecompiler-plugin-jvm-class -e packages/unidecompiler-plugin-lua -e packages/unidecompiler-plugin-dotnet-cli -e packages/unidecompiler-plugin-wasm
+      - run: python -m pip install -e packages/unidecompiler -e packages/unidecompiler-cli -e packages/unidecompiler-gui -e packages/unidecompiler-plugin-python-pyc -e packages/unidecompiler-plugin-jvm-class -e packages/unidecompiler-plugin-lua -e packages/unidecompiler-plugin-dotnet-cli -e packages/unidecompiler-plugin-wasm -e packages/unidecompiler-all
       - run: python -m build packages/unidecompiler
       - run: python -m build packages/unidecompiler-gui
+      - run: python -m build packages/unidecompiler-all
       - run: python -c "import unidecompiler_gui"
       - run: pyinstaller --noconfirm packages/unidecompiler-gui/unidecompiler_gui.spec
       - run: >-

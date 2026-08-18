@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-all"
+version = "0.1.0"
+description = "Complete unidecompiler installation with CLI, GUI, and all frontend plugins"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "unidecompiler-cli>=0.1.0,<0.2.0",
+    "unidecompiler-gui>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-python-pyc>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-jvm-class>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-lua>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-dotnet-cli>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-wasm>=0.1.0,<0.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

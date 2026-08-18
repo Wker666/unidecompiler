@@ -45,6 +45,7 @@ lives under `packages/` and can be installed independently.
 - `unidecompiler-cli`: optional command-line host.
 - `unidecompiler-gui`: read-only PySide6 workbench.
 - `unidecompiler-plugin-*`: independently installable frontend adapters.
+- `unidecompiler-all`: complete-installation meta-package.
 
 The CLI and other hosts discover installed adapters through the
 `unidecompiler.frontends` Python entry-point group. An embedding application
@@ -81,6 +82,7 @@ Supported frontend families follow this model:
 - `packages/unidecompiler-cli/`: optional CLI host package.
 - `packages/unidecompiler-gui/`: read-only desktop workbench package.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
+- `packages/unidecompiler-all/`: complete-installation meta-package.
 - `opcode_projects/source/<project>`: source stress projects.
 - `opcode_projects/generate/<project>`: generated stress project outputs.
 - `docs/`: supporting design notes.
