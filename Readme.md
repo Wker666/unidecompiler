@@ -5,6 +5,21 @@ A small universal bytecode decompiler experiment.
 The project is built around one hard architectural rule: VM frontends are thin
 submitters, and the core owns recovery.
 
+## Purpose
+
+unidecompiler is designed for authorized analysis of VM-SDK and bytecode
+virtualization protection. Its goal is to provide one frontend-neutral recovery
+pipeline for proprietary or custom virtual machines, including SDK-protected
+applications where bytecode is the only practical analysis surface.
+
+The Python, JVM, Lua, .NET CLI, and WebAssembly frontends in this repository
+are reference implementations and regression coverage. They demonstrate the
+thin-IR contract; they are not the boundary of the project. A new VM frontend
+should decode its format and submit neutral bytecode facts while the core owns
+control-flow recovery, AST construction, diagnostics, and rendering.
+
+Use the project only for software you own or are authorized to analyze.
+
 ## Install
 
 For normal use, install released packages with `pip`. You do not need to clone
