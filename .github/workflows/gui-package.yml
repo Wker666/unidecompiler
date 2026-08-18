@@ -17,6 +17,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
+      - name: Install Linux Qt runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libegl1
       - run: python -m pip install build PySide6 pyinstaller
       - run: python -m pip install -e packages/unidecompiler -e packages/unidecompiler-gui -e packages/unidecompiler-plugin-python-pyc -e packages/unidecompiler-plugin-jvm-class -e packages/unidecompiler-plugin-lua -e packages/unidecompiler-plugin-dotnet-cli -e packages/unidecompiler-plugin-wasm
       - run: python -m build packages/unidecompiler
