@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-plugin-jvm-class"
+version = "0.1.0"
+description = "JVM class-file frontend plugin for unidecompiler"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["unidecompiler>=0.1.0,<0.2.0", "jawa>=2.2.0,<3"]
+
+[project.entry-points."unidecompiler.frontends"]
+jvm-class = "unidecompiler_plugin_jvm_class.plugin:JavaClassFrontendPlugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]

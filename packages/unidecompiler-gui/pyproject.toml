@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-gui"
+version = "0.1.0"
+description = "Read-only desktop workbench for unidecompiler"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["unidecompiler>=0.1.0,<0.2.0", "PySide6>=6.6"]
+
+[project.optional-dependencies]
+all-formats = [
+    "unidecompiler-plugin-python-pyc>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-jvm-class>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-lua>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-dotnet-cli>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-wasm>=0.1.0,<0.2.0",
+]
+
+[project.scripts]
+unidecompiler-gui = "unidecompiler_gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+unidecompiler_gui = ["themes/*.qss"]

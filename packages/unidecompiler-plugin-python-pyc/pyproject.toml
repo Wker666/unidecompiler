@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-plugin-python-pyc"
+version = "0.1.0"
+description = "Python bytecode frontend plugin for unidecompiler"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["unidecompiler>=0.1.0,<0.2.0"]
+
+[project.entry-points."unidecompiler.frontends"]
+python-pyc = "unidecompiler_plugin_python_pyc.plugin:PythonPycFrontendPlugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]

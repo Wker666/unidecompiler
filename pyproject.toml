@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+pythonpath = [
+    "packages/unidecompiler/src",
+    "packages/unidecompiler-cli/src",
+    "packages/unidecompiler-plugin-lua/src",
+    "packages/unidecompiler-plugin-python-pyc/src",
+    "packages/unidecompiler-plugin-jvm-class/src",
+    "packages/unidecompiler-plugin-dotnet-cli/src",
+    "packages/unidecompiler-plugin-wasm/src",
+    "packages/unidecompiler-gui/src",
+]
+testpaths = ["tests"]

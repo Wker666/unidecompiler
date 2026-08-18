@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-cli"
+version = "0.1.0"
+description = "Command-line host for unidecompiler plugins"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["unidecompiler>=0.1.0,<0.2.0"]
+
+[project.scripts]
+unidecompiler = "unidecompiler_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,29 @@
+QMainWindow, QWidget { background: #ffffff; color: #24292f; }
+QMenuBar, QMenu, QToolBar, QStatusBar { background: #f6f8fa; color: #24292f; border-color: #d0d7de; }
+QMenu::item:selected, QTreeWidget::item:selected, QTableWidget::item:selected { background: #0969da; color: #ffffff; }
+QTreeWidget::item:hover, QTableWidget::item:hover { background: #f6f8fa; }
+QTabWidget::pane, QTreeWidget, QTableWidget, QPlainTextEdit, QLineEdit { border: 1px solid #d0d7de; background: #ffffff; color: #24292f; }
+QHeaderView::section { background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; padding: 3px; }
+QTabBar::tab { background: #f6f8fa; color: #57606a; border: 1px solid #d0d7de; padding: 6px 12px; }
+QTabBar::tab:hover { background: #eaeef2; color: #24292f; }
+QTabBar::tab:selected { background: #ffffff; border-bottom: 2px solid #0969da; color: #24292f; }
+QPushButton { background: #f6f8fa; border: 1px solid #d0d7de; padding: 4px 8px; }
+QPushButton:hover { background: #eaeef2; }
+QFrame#findPanel { background: #ffffff; border: 1px solid #d0d7de; }
+QFrame#findPanel QLineEdit { min-height: 22px; }
+QFrame#findPanel QToolButton { color: #24292f; padding: 3px 5px; }
+QFrame#findPanel QToolButton:checked { background: #0969da; color: #ffffff; }
+QToolButton#globalSearchToggle { color: #24292f; border: 1px solid #d0d7de; padding: 3px 6px; }
+QToolButton#globalSearchToggle:checked { background: #0969da; border: 1px solid #0550ae; color: #ffffff; }
+QToolBar#workspaceToolbar { border: 0; border-bottom: 1px solid #d0d7de; spacing: 3px; padding: 3px 6px; }
+QToolBar#workspaceToolbar QToolButton { border: 1px solid transparent; border-radius: 3px; padding: 4px; }
+QToolBar#workspaceToolbar QToolButton:hover { background: #eaeef2; border-color: #d0d7de; }
+QToolBar#workspaceToolbar QToolButton:disabled { color: #8c959f; }
+QWidget#welcomePage { background: #ffffff; }
+QLabel#welcomeTitle { color: #24292f; font-size: 18px; font-weight: 600; }
+QLabel#welcomeSubtitle { color: #57606a; }
+QLabel#welcomeRecentLabel { color: #57606a; font-weight: 600; margin-top: 12px; }
+QPushButton#welcomeAction { background: #f6f8fa; border: 1px solid #d0d7de; min-width: 128px; padding: 7px 10px; }
+QPushButton#welcomeAction:hover { background: #eaeef2; border-color: #0969da; }
+QPushButton#welcomeRecentItem { background: transparent; border: 1px solid transparent; color: #24292f; min-width: 360px; padding: 4px 8px; text-align: left; }
+QPushButton#welcomeRecentItem:hover { background: #f6f8fa; border-color: #d0d7de; }
