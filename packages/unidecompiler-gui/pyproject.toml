@@ -24,11 +24,11 @@ Issues = "https://github.com/Wker666/unidecompiler/issues"
 
 [project.optional-dependencies]
 all-formats = [
-    "unidecompiler-plugin-python-pyc>=0.1.0,<0.2.0",
-    "unidecompiler-plugin-jvm-class>=0.1.0,<0.2.0",
-    "unidecompiler-plugin-lua>=0.1.0,<0.2.0",
-    "unidecompiler-plugin-dotnet-cli>=0.1.0,<0.2.0",
-    "unidecompiler-plugin-wasm>=0.1.0,<0.2.0",
+    "unidecompiler-plugin-python-pyc>=0.1.1,<0.2.0",
+    "unidecompiler-plugin-jvm-class>=0.1.1,<0.2.0",
+    "unidecompiler-plugin-lua>=0.1.1,<0.2.0",
+    "unidecompiler-plugin-dotnet-cli>=0.1.1,<0.2.0",
+    "unidecompiler-plugin-wasm>=0.1.1,<0.2.0",
 ]
 
 [project.scripts]
