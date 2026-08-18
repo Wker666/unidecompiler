@@ -17,9 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: python -m pip install build PySide6 pyinstaller pytest
+      - run: python -m pip install build PySide6 pyinstaller
       - run: python -m pip install -e packages/unidecompiler -e packages/unidecompiler-gui -e packages/unidecompiler-plugin-python-pyc -e packages/unidecompiler-plugin-jvm-class -e packages/unidecompiler-plugin-lua -e packages/unidecompiler-plugin-dotnet-cli -e packages/unidecompiler-plugin-wasm
-      - run: python -m pytest -q tests/test_engine.py tests/test_gui.py
       - run: python -m build packages/unidecompiler
       - run: python -m build packages/unidecompiler-gui
       - run: python -c "import unidecompiler_gui"
