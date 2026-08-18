@@ -8,6 +8,7 @@ from unidecompiler_plugin_dotnet_cli.assembly import (
     looks_like_dotnet,
 )
 from unidecompiler_plugin_dotnet_cli.lifter import lift_dotnet_assembly
+from unidecompiler_plugin_dotnet_cli.simulation import DotNetSimulationAdapter
 from unidecompiler_plugin_dotnet_cli.support import DOTNET_CLI_VERSION_SUPPORT
 
 
@@ -16,6 +17,7 @@ class DotNetFrontendPlugin:
     display_name = ".NET CLI assembly"
     supported_inputs = (".dll", ".exe")
     version_support = DOTNET_CLI_VERSION_SUPPORT
+    simulation_adapter = DotNetSimulationAdapter
 
     def __init__(self, decoder: DotNetAssemblyDecoder | None = None) -> None:
         self.decoder = decoder or DnfileAssemblyDecoder()

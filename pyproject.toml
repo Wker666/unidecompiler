@@ -8,5 +8,7 @@ pythonpath = [
     "packages/unidecompiler-plugin-dotnet-cli/src",
     "packages/unidecompiler-plugin-wasm/src",
     "packages/unidecompiler-gui/src",
+    "packages/unidecompiler-simulator/src",
+    "packages/unidecompiler-simulation-host-python/src",
 ]
 testpaths = ["tests"]

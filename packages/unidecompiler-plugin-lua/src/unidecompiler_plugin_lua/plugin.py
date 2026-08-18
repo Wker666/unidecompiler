@@ -10,6 +10,7 @@ from unidecompiler_plugin_lua.luac import (
     LuaChunkDecoder,
 )
 from unidecompiler_plugin_lua.normalize import normalized_functions_metadata
+from unidecompiler_plugin_lua.simulation import LuaSimulationAdapter
 from unidecompiler_plugin_lua.support import LUA_VERSION_SUPPORT
 
 
@@ -18,6 +19,7 @@ class LuaFrontendPlugin:
     display_name = "Lua bytecode"
     supported_inputs = (".luac",)
     version_support = LUA_VERSION_SUPPORT
+    simulation_adapter = LuaSimulationAdapter
 
     def __init__(self, decoder: LuaChunkDecoder | None = None) -> None:
         self.decoder = decoder or PreferredLuaChunkDecoder()

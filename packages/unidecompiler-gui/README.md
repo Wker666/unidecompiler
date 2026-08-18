@@ -20,4 +20,5 @@ python -m pip install 'unidecompiler-gui[all-formats]'
 
 The GUI never imports frontend plugin packages directly. It discovers installed
 plugins through `DecompilerEngine` and does not modify input artifacts or save
-workspace state.
+workspace state. Its optional Simulation tab uses the separate generic IR
+simulator and can load a trusted Python runtime file for unresolved functions.

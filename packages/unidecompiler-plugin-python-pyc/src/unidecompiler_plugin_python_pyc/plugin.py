@@ -4,6 +4,7 @@ from unidecompiler.core.ir import ModuleIR
 from unidecompiler.plugins import FrontendModule
 from unidecompiler_plugin_python_pyc.lifter import lift_pyc_module
 from unidecompiler_plugin_python_pyc.pyc import decode_pyc, looks_like_pyc
+from unidecompiler_plugin_python_pyc.simulation import PythonPycSimulationAdapter
 from unidecompiler_plugin_python_pyc.support import PYTHON_PYC_VERSION_SUPPORT
 
 
@@ -12,6 +13,7 @@ class PythonPycFrontendPlugin:
     display_name = "Python bytecode"
     supported_inputs = (".pyc",)
     version_support = PYTHON_PYC_VERSION_SUPPORT
+    simulation_adapter = PythonPycSimulationAdapter
 
     def can_load(self, data: bytes, filename: str | None = None) -> bool:
         return looks_like_pyc(data)

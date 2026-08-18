@@ -523,7 +523,12 @@ def _lua_forloop_effect(context: LuaEffectContext, instruction, source: SourceRe
     base = int(operands[0])
     index_name = _read_register_name(context.listing, base, instruction.pc)
     step_name = _read_register_name(context.listing, base + 2, instruction.pc)
-    visible_index_name = _write_register_name(context.listing, base + 3, instruction.pc)
+    body_target = _lua_jump_target(instruction)
+    visible_index_name = _write_register_name(
+        context.listing,
+        base + 3,
+        body_target if body_target is not None else instruction.pc,
+    )
     next_index = BinaryOp(
         source=source,
         op="+",
@@ -1139,13 +1144,7 @@ def _lua_instruction_hints(listing: LuaFunctionListing, instruction, source: Sou
                 flow="conditional",
             ),
         )
-    target = _lua_comment_target(instruction)
-    if instruction.operands:
-        if target is None:
-            try:
-                target = instruction.pc + 1 + int(instruction.operands[-1])
-            except ValueError:
-                target = None
+    target = _lua_jump_target(instruction)
     kind = "loop-backedge" if target is not None and target <= instruction.pc else "branch-target"
     detail = "target-if-true" if instruction.opcode == "FORLOOP" else None
     flow = "conditional" if instruction.opcode in {"FORLOOP", "TFORLOOP"} else "unconditional"
@@ -1170,6 +1169,16 @@ def _lua_comment_target(instruction) -> int | None:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def _lua_jump_target(instruction) -> int | None:
+    target = _lua_comment_target(instruction)
+    if target is not None or not instruction.operands:
+        return target
+    try:
+        return instruction.pc + 1 + int(instruction.operands[-1])
+    except ValueError:
+        return None
 
 
 def _lua_function_spec(listing: LuaFunctionListing, local_names: tuple[str, ...] = ()) -> VMFunctionSpec:

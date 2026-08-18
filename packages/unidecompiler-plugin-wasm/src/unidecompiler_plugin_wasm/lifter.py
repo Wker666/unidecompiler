@@ -233,9 +233,30 @@ def _wasm_unknown_opcode_effect(
     return (UnknownOpcode(source=source, opcode=instruction.opcode, raw=_wasm_raw_instruction_line(instruction)),)
 
 
-def _wasm_binary(op: str):
+def _wasm_numeric_facts(opcode: str) -> tuple[str, int | None]:
+    if opcode.startswith("f32"):
+        return "float", 32
+    if opcode.startswith("f64"):
+        return "float", 64
+    if opcode.startswith("i32"):
+        return ("unsigned" if "_u" in opcode else "signed"), 32
+    if opcode.startswith("i64"):
+        return ("unsigned" if "_u" in opcode else "signed"), 64
+    return "default", None
+
+
+def _wasm_binary(opcode: str, op: str):
     def factory(_function: WasmFunctionListing, _instruction: WasmInstruction, source: SourceRef) -> tuple:
-        return (Binary(source=source, op=op, semantics="static"),)
+        numeric_domain, bit_width = _wasm_numeric_facts(opcode)
+        return (
+            Binary(
+                source=source,
+                op=op,
+                semantics="static",
+                numeric_domain=numeric_domain,
+                bit_width=bit_width,
+            ),
+        )
 
     return factory
 
@@ -381,8 +402,8 @@ WASM_EFFECT_TABLE = VMEffectTable(
     opcode_attr="opcode",
     ignored=frozenset(IGNORED_OPS),
     exact={
-        **{opcode: _wasm_binary(op) for opcode, op in BINARY_OPS.items()},
-        **{opcode: _wasm_binary(op) for opcode, op in COMPARE_OPS.items()},
+        **{opcode: _wasm_binary(opcode, op) for opcode, op in BINARY_OPS.items()},
+        **{opcode: _wasm_binary(opcode, op) for opcode, op in COMPARE_OPS.items()},
         **{opcode: _wasm_unary(op) for opcode, op in UNARY_OPS.items()},
         **{opcode: _wasm_call_top(name) for opcode, name in NUMERIC_CALLS.items()},
         **{opcode: _wasm_call_stack_args(name, 2) for opcode, name in BINARY_NUMERIC_CALLS.items()},

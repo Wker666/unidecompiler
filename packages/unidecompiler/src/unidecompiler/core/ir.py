@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 ValueId = str
 BlockId = str
+NumericDomain = Literal["default", "signed", "unsigned", "float"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class BinaryOp(Expr):
     left: Expr = field(default_factory=Expr)
     right: Expr = field(default_factory=Expr)
     semantics: Literal["static", "dynamic"] = "dynamic"
+    numeric_domain: NumericDomain = "default"
+    bit_width: int | None = None
 
 
 @dataclass(frozen=True)

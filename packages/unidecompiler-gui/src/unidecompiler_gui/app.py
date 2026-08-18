@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import re
+import json
 from threading import Event
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
@@ -11,13 +12,22 @@ from typing import Any
 from unidecompiler import DecompileResult, DecompilerEngine, FrontendRegistrationError
 from unidecompiler.input_sources import InputEntry, iter_input_entries, load_input_entry
 from unidecompiler_gui.themes import Theme, builtin_themes, external_theme
+from unidecompiler_simulator import (
+    SimulationCancellation,
+    SimulationEngine,
+    SimulationLimits,
+    SimulationResult,
+    SimulationTarget,
+    SimulationTargetListing,
+)
+from unidecompiler_simulation_host_python import PythonFileEnvironment
 
 try:
     from PySide6.QtCore import QObject, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
     from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
     from PySide6.QtWidgets import (
         QApplication, QDialog, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-        QComboBox, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, QSplitter, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTabBar, QToolBar, QToolButton, QTreeWidget,
+        QComboBox, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, QSplitter, QSpinBox, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTabBar, QToolBar, QToolButton, QTreeWidget,
         QMenu, QTreeWidgetItem, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
     )
 except ImportError as error:  # Keeps package metadata inspectable without Qt installed.
@@ -362,6 +372,64 @@ class DecompileWorker(QObject):
         self.completed.emit(tuple(results), False)
 
 
+class SimulationWorker(QObject):
+    """GUI host worker; frontend selection and execution remain in simulator."""
+
+    completed = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        engine: DecompilerEngine,
+        entry: InputEntry,
+        *,
+        target: SimulationTarget | None = None,
+        args: tuple[object, ...] = (),
+        runtime_path: Path | None = None,
+        limits: SimulationLimits | None = None,
+        cancellation: SimulationCancellation | None = None,
+    ) -> None:
+        super().__init__()
+        self._engine = engine
+        self._entry = entry
+        self._target = target
+        self._args = args
+        self._runtime_path = runtime_path
+        self._limits = limits
+        self._cancellation = cancellation
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            artifact = load_input_entry(self._entry)
+            simulator = SimulationEngine.from_registry(self._engine.registry)
+            if self._target is None:
+                self.completed.emit(
+                    "targets",
+                    simulator.list_artifact_targets(artifact.data, artifact.display_path),
+                )
+                return
+            environment = (
+                PythonFileEnvironment.load(self._runtime_path)
+                if self._runtime_path is not None
+                else None
+            )
+            self.completed.emit(
+                "run",
+                simulator.simulate_artifact(
+                    artifact.data,
+                    artifact.display_path,
+                    self._target.query,
+                    args=self._args,
+                    environment=environment,
+                    limits=self._limits,
+                    cancellation=self._cancellation,
+                ),
+            )
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class Workbench(QMainWindow):
     def __init__(self, engine: DecompilerEngine | None = None) -> None:
         super().__init__()
@@ -380,6 +448,14 @@ class Workbench(QMainWindow):
         self._worker_thread: QThread | None = None
         self._worker: DecompileWorker | None = None
         self._cancelled: Event | None = None
+        self._simulation_thread: QThread | None = None
+        self._simulation_worker: SimulationWorker | None = None
+        self._simulation_cancellation: SimulationCancellation | None = None
+        self._simulation_targets: dict[str, SimulationTargetListing] = {}
+        self._simulation_result: SimulationResult | None = None
+        self._simulation_job_path = ""
+        self._simulation_result_path = ""
+        self._simulation_target_path = ""
         self._history: list[tuple[str, str | None]] = []
         self._history_index = -1
         self._restoring_history = False
@@ -540,6 +616,91 @@ class Workbench(QMainWindow):
         control_flow_panel.addWidget(self.control_flow_view)
         control_flow_panel.addWidget(self.control_flow)
         control_flow_panel.setSizes([420, 180])
+        self.simulation_frontend = QLabel("No simulation target selected")
+        self.simulation_target = QComboBox()
+        self.simulation_target.currentIndexChanged.connect(self._simulation_target_changed)
+        self.simulation_args = QLineEdit("[]")
+        self.simulation_args.setPlaceholderText("JSON argument array")
+        self.simulation_runtime = QLineEdit(
+            self._settings.value("simulation_runtime", "", type=str)
+        )
+        self.simulation_runtime.setPlaceholderText("Optional trusted runtime.py")
+        self.simulation_runtime.editingFinished.connect(self._remember_simulation_runtime)
+        self.simulation_runtime_browse = QToolButton()
+        self.simulation_runtime_browse.setText("...")
+        self.simulation_runtime_browse.setToolTip("Choose runtime.py")
+        self.simulation_runtime_browse.clicked.connect(self._choose_simulation_runtime)
+        self.simulation_steps = QSpinBox()
+        self.simulation_steps.setRange(1, 10_000_000)
+        self.simulation_steps.setValue(100_000)
+        self.simulation_depth = QSpinBox()
+        self.simulation_depth.setRange(1, 10_000)
+        self.simulation_depth.setValue(128)
+        self.simulation_trace_limit = QSpinBox()
+        self.simulation_trace_limit.setRange(1, 1_000_000)
+        self.simulation_trace_limit.setValue(10_000)
+        self.simulation_run = QPushButton("Run")
+        self.simulation_run.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.simulation_run.clicked.connect(self._run_simulation)
+        self.simulation_cancel = QToolButton()
+        self.simulation_cancel.setText("x")
+        self.simulation_cancel.setToolTip("Cancel simulation")
+        self.simulation_cancel.clicked.connect(self._cancel_simulation)
+        self.simulation_cancel.hide()
+        self.simulation_clear = QToolButton()
+        self.simulation_clear.setText("Clear")
+        self.simulation_clear.setToolTip("Clear simulation trace")
+        self.simulation_clear.clicked.connect(self._clear_simulation)
+        simulation_controls = QHBoxLayout()
+        simulation_controls.setContentsMargins(0, 0, 0, 0)
+        simulation_controls.addWidget(QLabel("Target"))
+        simulation_controls.addWidget(self.simulation_target, 2)
+        simulation_controls.addWidget(QLabel("Args"))
+        simulation_controls.addWidget(self.simulation_args, 2)
+        simulation_controls.addWidget(QLabel("Steps"))
+        simulation_controls.addWidget(self.simulation_steps)
+        simulation_controls.addWidget(QLabel("Depth"))
+        simulation_controls.addWidget(self.simulation_depth)
+        simulation_controls.addWidget(QLabel("Trace"))
+        simulation_controls.addWidget(self.simulation_trace_limit)
+        simulation_controls.addWidget(self.simulation_run)
+        simulation_controls.addWidget(self.simulation_cancel)
+        simulation_controls.addWidget(self.simulation_clear)
+        runtime_controls = QHBoxLayout()
+        runtime_controls.setContentsMargins(0, 0, 0, 0)
+        runtime_controls.addWidget(QLabel("Runtime"))
+        runtime_controls.addWidget(self.simulation_runtime, 1)
+        runtime_controls.addWidget(self.simulation_runtime_browse)
+        self.simulation_filter = QComboBox()
+        self.simulation_filter.addItem("All events", True)
+        self.simulation_filter.addItem("Key events", False)
+        self.simulation_filter.currentIndexChanged.connect(self._refresh_simulation_trace)
+        self.simulation_status = QLabel()
+        self.simulation_trace = QTableWidget(0, 7)
+        self.simulation_trace.setHorizontalHeaderLabels(
+            ["#", "Function", "Block", "Event", "Detail", "Offset", "Output"]
+        )
+        self.simulation_trace.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.simulation_trace.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.simulation_trace.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.simulation_trace.itemSelectionChanged.connect(self._simulation_event_selected)
+        self.simulation_details = QPlainTextEdit()
+        self.simulation_details.setReadOnly(True)
+        self.simulation_details.setFont(fixed_font)
+        simulation_splitter = QSplitter(Qt.Orientation.Vertical)
+        simulation_splitter.addWidget(self.simulation_trace)
+        simulation_splitter.addWidget(self.simulation_details)
+        simulation_splitter.setSizes([400, 180])
+        simulation_panel = QWidget()
+        simulation_layout = QVBoxLayout(simulation_panel)
+        simulation_layout.setContentsMargins(0, 0, 0, 0)
+        simulation_layout.addWidget(self.simulation_frontend)
+        simulation_layout.addLayout(simulation_controls)
+        simulation_layout.addLayout(runtime_controls)
+        simulation_layout.addWidget(self.simulation_status)
+        simulation_layout.addWidget(self.simulation_filter)
+        simulation_layout.addWidget(simulation_splitter, 1)
+        self.simulation_panel = simulation_panel
         self.global_search_query = QLineEdit()
         self.global_search_query.setPlaceholderText("Search all decompiled files")
         self.global_search_query.setClearButtonEnabled(True)
@@ -612,6 +773,8 @@ class Workbench(QMainWindow):
         self.detail_tabs.addTab(references_panel, "References / Calls")
         self.detail_tabs.addTab(browse_panel, "Browser")
         self.detail_tabs.addTab(control_flow_panel, "CFG")
+        self.detail_tabs.addTab(self.simulation_panel, "Simulation")
+        self.detail_tabs.currentChanged.connect(self._simulation_tab_changed)
         self.detail_tabs.setCurrentWidget(self.pseudocode)
         self.welcome_page = QWidget()
         self.welcome_page.setObjectName("welcomePage")
@@ -749,7 +912,7 @@ class Workbench(QMainWindow):
         self.frontend_manager = FrontendManagerDialog(self.engine, self)
         self.frontend_manager.changed.connect(self._update_frontend_status)
         self.frontend_manager.finished.connect(self._frontend_manager_closed)
-        self.frontend_manager.set_mutation_enabled(self._worker_thread is None)
+        self._update_frontend_mutation_enabled()
         self.frontend_manager.show()
 
     def _frontend_manager_closed(self, _result: int) -> None:
@@ -1061,6 +1224,9 @@ class Workbench(QMainWindow):
             return
         self.results = ()
         self._resource_data = {}
+        self._simulation_targets = {}
+        self._simulation_result = None
+        self._simulation_result_path = ""
         self._displayed_result_path = None
         self._displayed_function_id = None
         self._displayed_resource_path = None
@@ -1090,6 +1256,9 @@ class Workbench(QMainWindow):
     def _load_entries(self, entries: tuple[InputEntry, ...]) -> None:
         if self._worker_thread is not None:
             self.statusBar().showMessage("Decompiler is already running")
+            return
+        if self._simulation_thread is not None:
+            self.statusBar().showMessage("Simulation is already running")
             return
         pending = tuple(
             entry for entry in entries
@@ -1169,8 +1338,306 @@ class Workbench(QMainWindow):
         self.progress.hide()
         self.cancel_button.hide()
         self.cancel_button.setEnabled(True)
+        self._update_frontend_mutation_enabled()
+
+    def _update_frontend_mutation_enabled(self) -> None:
         if self.frontend_manager is not None:
-            self.frontend_manager.set_mutation_enabled(True)
+            self.frontend_manager.set_mutation_enabled(
+                self._worker_thread is None and self._simulation_thread is None
+            )
+
+    def _entry_for_display_path(self, display_path: str) -> InputEntry | None:
+        return next((entry for entry in self._entries if entry.display_path == display_path), None)
+
+    def _sync_simulation_target(
+        self,
+        result: DecompileResult,
+        function_id: str | None,
+        *,
+        prefer_tree_target: bool = True,
+    ) -> None:
+        if result.status != "ok":
+            self.simulation_frontend.setText("Simulation is available only for recovered bytecode artifacts")
+            self.simulation_target.clear()
+            self.simulation_run.setEnabled(False)
+            return
+        listing = self._simulation_targets.get(result.display_path)
+        if listing is None:
+            entry = self._entry_for_display_path(result.display_path)
+            if entry is None:
+                self.simulation_frontend.setText("Simulation input data is unavailable")
+                self.simulation_run.setEnabled(False)
+                return
+            if self._simulation_thread is None:
+                self._start_simulation_worker(entry)
+            self.simulation_frontend.setText("Discovering simulation targets...")
+            self.simulation_run.setEnabled(False)
+            return
+        frontend = listing.frontend_id or "unavailable"
+        self.simulation_frontend.setText(f"Frontend: {frontend}")
+        previous = self.simulation_target.currentData()
+        preserve_previous = (
+            previous if self._simulation_target_path == result.display_path else None
+        )
+        self.simulation_target.blockSignals(True)
+        try:
+            self.simulation_target.clear()
+            for target in listing.targets:
+                self.simulation_target.addItem(target.label, target)
+            if prefer_tree_target and function_id is not None:
+                index = next(
+                    (
+                        target.function_index
+                        for target in listing.targets
+                        if target.function_index < len(result.functions)
+                        and result.functions[target.function_index].id == function_id
+                    ),
+                    None,
+                )
+                if index is not None:
+                    for row in range(self.simulation_target.count()):
+                        target = self.simulation_target.itemData(row)
+                        if isinstance(target, SimulationTarget) and target.function_index == index:
+                            self.simulation_target.setCurrentIndex(row)
+                            break
+            elif isinstance(preserve_previous, SimulationTarget):
+                for row in range(self.simulation_target.count()):
+                    target = self.simulation_target.itemData(row)
+                    if (
+                        isinstance(target, SimulationTarget)
+                        and target.query == preserve_previous.query
+                        and target.function_index == preserve_previous.function_index
+                    ):
+                        self.simulation_target.setCurrentIndex(row)
+                        break
+        finally:
+            self.simulation_target.blockSignals(False)
+        self._simulation_target_path = result.display_path
+        # A healthy target refresh must not erase a completed run status while
+        # the worker thread is being disposed.
+        if listing.diagnostic:
+            self.simulation_status.setText(listing.diagnostic)
+        self.simulation_run.setEnabled(bool(listing.targets) and self._simulation_thread is None)
+        self._simulation_target_changed()
+
+    def _simulation_tab_changed(self, _index: int) -> None:
+        if self.detail_tabs.currentWidget() is not self.simulation_panel:
+            return
+        result = self._selected_result()
+        if not isinstance(result, DecompileResult):
+            self.simulation_frontend.setText("Select a recovered artifact to simulate")
+            self.simulation_target.clear()
+            self.simulation_run.setEnabled(False)
+            return
+        item = self.input_tree.currentItem()
+        data = None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
+        self._sync_simulation_target(result, data[1] if isinstance(data, tuple) else None)
+
+    def _simulation_target_changed(self, *_unused: object) -> None:
+        target = self.simulation_target.currentData()
+        if isinstance(target, SimulationTarget):
+            params = ", ".join(target.params) or "no parameters"
+            self.simulation_args.setToolTip(f"Target parameters: {params}")
+        else:
+            self.simulation_args.setToolTip("")
+
+    def _choose_simulation_runtime(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Choose runtime", "", "Python files (*.py)")
+        if filename:
+            self.simulation_runtime.setText(filename)
+            self._remember_simulation_runtime()
+
+    def _remember_simulation_runtime(self) -> None:
+        self._settings.setValue("simulation_runtime", self.simulation_runtime.text().strip())
+
+    def _start_simulation_worker(
+        self,
+        entry: InputEntry,
+        *,
+        target: SimulationTarget | None = None,
+        args: tuple[object, ...] = (),
+        runtime_path: Path | None = None,
+        limits: SimulationLimits | None = None,
+        cancellation: SimulationCancellation | None = None,
+    ) -> None:
+        if self._simulation_thread is not None:
+            return
+        self._simulation_job_path = entry.display_path
+        self._simulation_thread = QThread(self)
+        self._simulation_worker = SimulationWorker(
+            self.engine,
+            entry,
+            target=target,
+            args=args,
+            runtime_path=runtime_path,
+            limits=limits,
+            cancellation=cancellation,
+        )
+        self._simulation_worker.moveToThread(self._simulation_thread)
+        self._simulation_thread.started.connect(self._simulation_worker.run)
+        self._simulation_worker.completed.connect(self._simulation_completed)
+        self._simulation_worker.completed.connect(self._simulation_thread.quit)
+        self._simulation_worker.failed.connect(self._simulation_failed)
+        self._simulation_worker.failed.connect(self._simulation_thread.quit)
+        self._simulation_thread.finished.connect(self._dispose_simulation_worker)
+        self._update_frontend_mutation_enabled()
+        self._simulation_thread.start()
+
+    def _run_simulation(self) -> None:
+        result = self._selected_result()
+        target = self.simulation_target.currentData()
+        if not isinstance(result, DecompileResult) or not isinstance(target, SimulationTarget):
+            self.simulation_status.setText("Select a simulation target first")
+            return
+        if self._worker_thread is not None:
+            self.simulation_status.setText("Wait for decompilation to finish")
+            return
+        entry = self._entry_for_display_path(result.display_path)
+        if entry is None:
+            self.simulation_status.setText("Simulation input data is unavailable")
+            return
+        try:
+            parsed_args = json.loads(self.simulation_args.text())
+            if not isinstance(parsed_args, list):
+                raise ValueError("arguments must be a JSON array")
+            runtime = self.simulation_runtime.text().strip()
+            runtime_path = Path(runtime) if runtime else None
+            limits = SimulationLimits(
+                self.simulation_steps.value(),
+                self.simulation_depth.value(),
+                self.simulation_trace_limit.value(),
+            )
+            limits.validate()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.simulation_status.setText(f"Invalid simulation request: {error}")
+            return
+        self._simulation_cancellation = SimulationCancellation()
+        self.simulation_run.setEnabled(False)
+        self.simulation_cancel.show()
+        self.simulation_status.setText("Simulating...")
+        self._start_simulation_worker(
+            entry,
+            target=target,
+            args=tuple(parsed_args),
+            runtime_path=runtime_path,
+            limits=limits,
+            cancellation=self._simulation_cancellation,
+        )
+
+    def _cancel_simulation(self) -> None:
+        if self._simulation_cancellation is not None:
+            self._simulation_cancellation.cancel()
+            self.simulation_cancel.setEnabled(False)
+            self.simulation_status.setText("Cancelling simulation...")
+
+    def _simulation_completed(self, kind: str, payload: object) -> None:
+        if kind == "targets" and isinstance(payload, SimulationTargetListing):
+            self._simulation_targets[self._simulation_job_path] = payload
+            result = self._selected_result()
+            if isinstance(result, DecompileResult) and result.display_path == self._simulation_job_path:
+                data = self.input_tree.currentItem().data(0, Qt.ItemDataRole.UserRole)
+                function_id = data[1] if isinstance(data, tuple) else None
+                self._sync_simulation_target(result, function_id)
+            return
+        if kind == "run" and isinstance(payload, SimulationResult):
+            self._simulation_result = payload
+            self._simulation_result_path = self._simulation_job_path
+            suffix = " (trace truncated)" if payload.trace_truncated else ""
+            outcome = (
+                f"returned {payload.values!r}"
+                if payload.status.value == "completed"
+                else (payload.diagnostic or repr(payload.exception) or "no result")
+            )
+            self.simulation_status.setText(
+                f"{payload.status.value}; {payload.steps} steps; {outcome}{suffix}"
+            )
+            self.simulation_details.setPlainText(json.dumps({
+                "status": payload.status.value,
+                "values": payload.values,
+                "exception": payload.exception,
+                "cause": payload.cause,
+                "locals": payload.locals,
+                "steps": payload.steps,
+                "diagnostic": payload.diagnostic,
+                "trace_truncated": payload.trace_truncated,
+            }, default=repr, indent=2, sort_keys=True))
+            self._refresh_simulation_trace()
+
+    def _simulation_failed(self, message: str) -> None:
+        self._simulation_targets.setdefault(
+            self._simulation_job_path,
+            SimulationTargetListing(None, diagnostic=message),
+        )
+        self.simulation_status.setText(f"Simulation failed: {message}")
+
+    def _dispose_simulation_worker(self) -> None:
+        if self._simulation_worker is not None:
+            self._simulation_worker.deleteLater()
+        if self._simulation_thread is not None:
+            self._simulation_thread.deleteLater()
+        self._simulation_worker = None
+        self._simulation_thread = None
+        self._simulation_cancellation = None
+        self.simulation_cancel.hide()
+        self.simulation_cancel.setEnabled(True)
+        selected = self._selected_result()
+        if isinstance(selected, DecompileResult) and self.detail_tabs.currentWidget() is self.simulation_panel:
+            data = self.input_tree.currentItem().data(0, Qt.ItemDataRole.UserRole)
+            self._sync_simulation_target(
+                selected,
+                data[1] if isinstance(data, tuple) else None,
+                prefer_tree_target=False,
+            )
+        self._update_frontend_mutation_enabled()
+
+    def _clear_simulation(self) -> None:
+        self._simulation_result = None
+        self.simulation_trace.setRowCount(0)
+        self.simulation_details.clear()
+        self.simulation_status.clear()
+
+    def _refresh_simulation_trace(self) -> None:
+        self.simulation_trace.setRowCount(0)
+        result = self._simulation_result
+        if result is None:
+            return
+        show_all = bool(self.simulation_filter.currentData())
+        for index, event in enumerate(result.events):
+            if not show_all and event.kind not in {"external-call", "trace-truncated"}:
+                continue
+            row = self.simulation_trace.rowCount()
+            self.simulation_trace.insertRow(row)
+            output = " ".join(part for part in (event.stdout.strip(), event.stderr.strip()) if part)
+            values = (
+                str(index), event.function, event.block or "", event.kind, event.detail,
+                "" if getattr(event.source, "offset", None) is None else str(event.source.offset), output,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, event)
+                self.simulation_trace.setItem(row, column, item)
+
+    def _simulation_event_selected(self) -> None:
+        item = self.simulation_trace.currentItem()
+        event = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        if event is None:
+            return
+        self.simulation_details.setPlainText(json.dumps({
+            "args": event.args,
+            "values": event.values,
+            "exception": event.exception,
+            "locals": event.locals,
+            "stdout": event.stdout,
+            "stderr": event.stderr,
+        }, default=repr, indent=2, sort_keys=True))
+        result = next(
+            (candidate for candidate in self.results if candidate.display_path == self._simulation_result_path),
+            None,
+        )
+        if not isinstance(result, DecompileResult) or event.source is None:
+            return
+        if 0 <= event.function_index < len(result.functions):
+            self._focus_source(result, event.source, result.functions[event.function_index].id)
 
     def _refresh(self, selected_path: str | None = None) -> None:
         self._update_frontend_status()
@@ -1536,6 +2003,8 @@ class Workbench(QMainWindow):
                 self.document_tabs.blockSignals(False)
         self._record_location(result, function_id)
         if result.status == "resource":
+            if self.detail_tabs.currentWidget() is self.simulation_panel:
+                self._sync_simulation_target(result, function_id)
             self._display_resource(result)
             self.detail_stack.setCurrentWidget(self.resource_tabs)
             return
@@ -1555,6 +2024,8 @@ class Workbench(QMainWindow):
             self._displayed_function_id = function_id
         if function_id:
             self._select_function(function_id, result)
+        if self.detail_tabs.currentWidget() is self.simulation_panel:
+            self._sync_simulation_target(result, function_id)
 
     def _reopen_closed_tree_item(self, item: QTreeWidgetItem, _column: int) -> None:
         """Only a direct navigation action may reopen a user-closed document."""

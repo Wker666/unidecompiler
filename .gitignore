@@ -10,6 +10,7 @@ lua_corpus/generated/*.luac
 business_corpus/generated/**
 !business_corpus/generated/.gitkeep
 opcode_projects/
+simulator_projects/
 *.egg-info/
 packages/unidecompiler-gui/build/
 packages/unidecompiler-gui/dist/

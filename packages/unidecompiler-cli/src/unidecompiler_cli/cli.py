@@ -17,6 +17,11 @@ from unidecompiler.input_sources import expand_input_path
 
 
 def main(argv: list[str] | None = None, *, registry: FrontendRegistry | None = None) -> int:
+    command_argv = sys.argv[1:] if argv is None else argv
+    if command_argv[:1] == ["simulate"]:
+        from unidecompiler_cli.simulation import main as simulate_main
+
+        return simulate_main(command_argv[1:], registry=registry)
     parser = argparse.ArgumentParser(
         prog="unidecompiler",
         description="Decompile bytecode into generic pseudocode.",
@@ -38,7 +43,7 @@ def main(argv: list[str] | None = None, *, registry: FrontendRegistry | None = N
         default="pseudocode",
         help="output format (default: pseudocode)",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(command_argv)
 
     registry = registry or FrontendRegistry.discover()
     if args.versions:

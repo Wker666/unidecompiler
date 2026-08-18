@@ -305,9 +305,28 @@ def _signed_iinc_amount(amount: int) -> int:
     return amount
 
 
-def _jvm_binary(op: str):
+def _jvm_numeric_facts(opcode: str) -> tuple[str, int | None]:
+    if opcode[0] in {"f", "d"}:
+        return "float", 32 if opcode[0] == "f" else 64
+    if opcode[0] == "i":
+        return ("unsigned" if opcode == "iushr" else "signed"), 32
+    if opcode[0] == "l":
+        return ("unsigned" if opcode == "lushr" else "signed"), 64
+    return "default", None
+
+
+def _jvm_binary(opcode: str, op: str):
     def factory(_method: JavaMethodListing, _instruction: JavaInstruction, source: SourceRef) -> tuple:
-        return (Binary(source=source, op=op, semantics="static"),)
+        numeric_domain, bit_width = _jvm_numeric_facts(opcode)
+        return (
+            Binary(
+                source=source,
+                op=op,
+                semantics="static",
+                numeric_domain=numeric_domain,
+                bit_width=bit_width,
+            ),
+        )
 
     return factory
 
@@ -353,7 +372,7 @@ def _jvm_constant_effect(_method: JavaMethodListing, instruction: JavaInstructio
 JVM_EFFECT_TABLE = VMEffectTable(
     opcode_attr="opcode",
     exact={
-        **{opcode: _jvm_binary(op) for opcode, op in BINARY_OPS.items()},
+        **{opcode: _jvm_binary(opcode, op) for opcode, op in BINARY_OPS.items()},
         "pop": _jvm_pop,
         "pop2": _jvm_pop,
         "ireturn": _jvm_return_top,

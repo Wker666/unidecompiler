@@ -8,6 +8,7 @@ from unidecompiler_plugin_jvm_class.classfile import (
     looks_like_class,
 )
 from unidecompiler_plugin_jvm_class.lifter import lift_java_class
+from unidecompiler_plugin_jvm_class.simulation import JavaClassSimulationAdapter
 from unidecompiler_plugin_jvm_class.support import JVM_CLASS_VERSION_SUPPORT
 
 
@@ -16,6 +17,7 @@ class JavaClassFrontendPlugin:
     display_name = "JVM class file"
     supported_inputs = (".class",)
     version_support = JVM_CLASS_VERSION_SUPPORT
+    simulation_adapter = JavaClassSimulationAdapter
 
     def __init__(self, decoder: ClassFileDecoder | None = None) -> None:
         self.decoder = decoder or PreferredClassFileDecoder()

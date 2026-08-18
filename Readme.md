@@ -44,6 +44,9 @@ lives under `packages/` and can be installed independently.
 - `unidecompiler`: generic IR, lifting, analysis, structuring, and backends.
 - `unidecompiler-cli`: optional command-line host.
 - `unidecompiler-gui`: read-only PySide6 workbench.
+- `unidecompiler-simulator`: optional bounded executor for recovered generic IR.
+- `unidecompiler-simulation-host-python`: trusted Python runtime host for
+  applications that provide unresolved functions.
 - `unidecompiler-plugin-*`: independently installable frontend adapters.
 - `unidecompiler-all`: complete-installation meta-package.
 
@@ -68,6 +71,26 @@ The current frontend pipeline is:
 4. Submit the complete step stream through `lift_vm_step_function`.
 5. Let core produce full, partial, or unsupported generic IR.
 
+### Simulation Architecture
+
+Simulation is an optional consumer of recovered generic IR. It is deliberately
+decoupled from both core recovery and frontend bytecode execution:
+
+```txt
+frontend -> core generic IR <- simulator <- CLI / GUI / embedding host
+```
+
+The core does not depend on the simulator, and the simulator does not execute
+frontend bytecode, VM opcodes, effect tables, or frontend-private decoded
+models. A frontend may optionally provide a data-only simulation adapter for
+function lookup and runtime facts. Language-specific lookup, such as Lua names
+or JVM class/method names, remains owned by that frontend.
+
+The simulator returns structured results for completion, return values,
+exceptions, unsupported operations, limits, cancellation, and execution trace.
+See `packages/unidecompiler-simulator/README.md` for the public library API and
+frontend query formats.
+
 Supported frontend families follow this model:
 
 - Python `.pyc`
@@ -81,14 +104,20 @@ Supported frontend families follow this model:
 - `packages/unidecompiler/`: embeddable core package, using a standard `src/` layout.
 - `packages/unidecompiler-cli/`: optional CLI host package.
 - `packages/unidecompiler-gui/`: read-only desktop workbench package.
+- `packages/unidecompiler-simulator/`: bounded generic IR execution library.
+- `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
 - `packages/unidecompiler-all/`: complete-installation meta-package.
 - `opcode_projects/source/<project>`: source stress projects.
 - `opcode_projects/generate/<project>`: generated stress project outputs.
+- `simulator_projects/`: source fixtures and expected results for generic-IR
+  simulation.
 - `docs/`: supporting design notes.
 
-The stress corpus is local working data and is scanned by path rather than
-imported as a Python test package.
+The stress corpora are local working data and are scanned by path rather than
+imported as Python test packages. `opcode_projects` validates decompiler
+recovery; `simulator_projects` validates execution of recovered IR and the
+frontend adapter boundary.
 
 ## Installation And Use
 
@@ -114,6 +143,31 @@ Run `unidecompiler --help` to see CLI options. Plugins are discovered through
 Python entry points, so installing another frontend adds its input formats
 without changing the core or host application.
 
+The optional simulator command executes a selected function from the recovered
+generic IR. The frontend chooses how the function query is resolved:
+
+```sh
+unidecompiler simulate sample.pyc \
+  --function bubble_sort \
+  --args '[[5, 1, 4, 2, 8]]'
+```
+
+Calls made by the selected function that are not present in the lifted module
+can be handled by an explicit runtime file:
+
+```sh
+unidecompiler simulate sample.pyc \
+  --function bubble_sort \
+  --args '[[5, 1, 4, 2, 8]]' \
+  --environment runtime.py \
+  --show-host-output
+```
+
+The runtime file is trusted host Python code selected by the user. It is not a
+sandbox and is loaded by the application-host package, not by core, the
+simulator, or a frontend. The simulator itself receives only data-only call
+requests and validated runtime values.
+
 For the desktop workbench, install the GUI and all bundled frontend packages:
 
 ```sh
@@ -121,7 +175,12 @@ python -m pip install 'unidecompiler-gui[all-formats]'
 unidecompiler-gui
 ```
 
-The GUI is read-only and uses only the public `DecompilerEngine` facade.
+The GUI is read-only. Its decompiler workflow uses the public
+`DecompilerEngine` facade, while its optional Simulation tab uses the separate
+public simulator API. Select a recovered artifact to discover targets from the
+registered frontend, enter a JSON argument array, optionally choose a trusted
+`runtime.py`, and press Run to inspect the result and execution trace. The GUI
+does not implement language-specific target lookup or simulation semantics.
 
 ## Development
 
@@ -131,6 +190,8 @@ editable mode:
 
 ```sh
 .venv/bin/python -m pip install build -e packages/unidecompiler \
+  -e packages/unidecompiler-simulator \
+  -e packages/unidecompiler-simulation-host-python \
   -e packages/unidecompiler-cli \
   -e packages/unidecompiler-gui \
   -e packages/unidecompiler-plugin-lua \
@@ -145,7 +206,3 @@ Build the core package independently:
 ```sh
 .venv/bin/python -m build packages/unidecompiler
 ```
-
-Unit tests are only the first verification layer. After unit tests pass, compare
-real source code under `opcode_projects/source` with decompiled output from
-`opcode_projects/generate`.

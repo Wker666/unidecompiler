@@ -62,6 +62,56 @@ The stress corpus is organized as `opcode_projects/source/<project>` and
 local working data; they are scanned by path rather than imported as a Python
 test package.
 
+## Simulation Architecture Contract
+
+Simulation is a separate, optional consumer of recovered generic IR. Its
+architectural boundary is as strict as the frontend/core boundary: preserving
+this decoupling is mandatory.
+
+The simulation dependency direction is:
+
+```txt
+frontend -> core generic IR <- simulator <- CLI / GUI / other application hosts
+```
+
+`core` must not import, depend on, or know about the simulator. The simulator
+may depend on public generic IR, but it must not execute frontend bytecode,
+decoded frontend models, VM opcodes, opcode effect tables, or thin IR effects.
+It owns generic-IR frames, calls, control flow, limits, exceptions,
+cancellation, and execution tracing. It must not branch on a frontend ID or
+contain language-specific execution behavior.
+
+A frontend may optionally expose a `simulation_adapter`. Unsupported simulation
+is valid. A frontend that opts in may only:
+
+- enumerate presentation-safe, data-only target queries;
+- resolve a frontend-owned query to a `FunctionIR` belonging to the current
+  lifted `ModuleIR`, including frontend-specific ambiguity handling; and
+- supply narrow, data-only runtime facts when generic IR cannot express them.
+
+Simulation adapters must not execute or interpret functions or instructions,
+maintain frames or stacks, recover control flow, inspect simulator internals, or
+return executable callbacks. The simulator validates that a resolved function
+belongs to the current lifted module and retains sole ownership of execution.
+CLI and GUI treat frontend target queries as opaque data; they must not infer
+language-specific function names, overload resolution, class/member lookup, or
+dynamic call targets.
+
+Unresolved named calls may be delegated only through the data-only
+`ExternalEnvironment` protocol. An environment receives an
+`ExternalCallRequest` and returns an `ExternalCallResult`; it must never
+receive generic IR, frames, adapters, or execution control. Its inputs and
+outputs must be validated generic runtime values. A runtime file such as
+`runtime.py` is explicitly selected, trusted host code: it is not sandboxed and
+its loading belongs in a host-support package, never in core, the simulator, or
+a frontend.
+
+Every simulation outcome must be represented by a structured
+`SimulationResult`. Completed execution, raised values, unsupported IR,
+unhandled external calls, invalid requests, limits, and cancellation must never
+be silently converted into success or guessed behavior. Trace limits may
+truncate recorded events, but must not alter execution semantics.
+
 ## Frontend Version Metadata
 
 Each frontend owns a small version-support declaration that says which VM
@@ -113,6 +163,20 @@ These rules are mandatory.
 - Frontends must not inspect or depend on backend/core private recovery details.
 - Frontends must not add special cases for one business corpus, one fixture, or
   one language feature.
+- Core must not import or depend on simulator packages, simulation adapters, or
+  host runtime implementations.
+- The simulator must execute only recovered generic IR. It must not interpret
+  frontend bytecode, thin IR, opcode tables, or language-specific semantics.
+- Simulation adapters are optional and data-only. They must not expose function
+  execution, instruction stepping, evaluation, frame/stack management, control
+  flow recovery, or executable callback behavior.
+- GUI and CLI must consume simulator APIs and opaque frontend queries only; they
+  must not implement frontend-specific target lookup or simulation semantics.
+- Runtime-file loading and other executable host integrations must remain
+  outside core, simulator, and frontend packages. They are trusted host code,
+  not a simulator sandbox.
+- External environments must use the data-only environment protocol and must not
+  receive IR, frames, adapters, or execution control.
 - Metadata must only be passed through as provenance, diagnostics, and analysis
   context. It must not encode program logic or recovery behavior.
 - Frontends must parse or represent every opcode they can decode and submit it
@@ -180,6 +244,15 @@ If the new VM cannot be recovered correctly after that, fix or extend the core
 recovery layer, or add a shared thin IR concept. Do not solve it by adding
 source-structure recovery to the frontend.
 
+If a frontend elects to support simulation, it must additionally:
+
+1. Enumerate unambiguous, data-only simulation targets.
+2. Resolve every accepted query to a `FunctionIR` in the current lifted module.
+3. Keep all lookup and runtime facts inside an optional, non-executing
+   `simulation_adapter`.
+4. Add focused tests for target discovery, query ambiguity, arguments and
+   return values, and any frontend-specific runtime facts.
+
 ## Verification Guardrails
 
 Unit tests are only the first verification layer. A change is not correct just
@@ -196,6 +269,17 @@ The test suite includes frontend-decoupling checks that enforce this design:
 - VM frontends do not register lift rules.
 - VM frontends do not construct blocks, functions, or source structures directly.
 - Core VM layers remain frontend-neutral.
+- Simulator execution remains generic-IR-only and core has no simulator
+  dependency.
+- Simulation adapters remain optional, data-only, and cannot execute frontend
+  instructions or return executable callbacks.
+- Every simulation-enabled frontend is covered by `simulator_projects` with
+  generated artifacts and source-equivalent execution checks. Coverage must
+  include control flow, container/value operations, returns, and an external
+  environment call or an explicit unhandled-call result.
+- CLI and GUI integration tests consume only simulator results, preserve target
+  selection, and expose completion, failure, cancellation, and trace-truncation
+  outcomes visibly.
 
 Run:
 

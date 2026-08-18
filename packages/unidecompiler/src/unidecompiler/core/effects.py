@@ -29,6 +29,7 @@ from unidecompiler.core.ir import (
     Stmt,
     TableField,
     Var,
+    NumericDomain,
     Unsupported,
 )
 from unidecompiler.core.stack_machine import StackMachineState
@@ -132,6 +133,8 @@ class Pop(Effect):
 class Binary(Effect):
     op: str = ""
     semantics: Literal["static", "dynamic"] = "dynamic"
+    numeric_domain: NumericDomain = "default"
+    bit_width: int | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,8 @@ class Unary(Effect):
 class Compare(Effect):
     op: str = ""
     negate: bool = False
+    numeric_domain: NumericDomain = "default"
+    bit_width: int | None = None
 
 
 @dataclass(frozen=True)
@@ -601,6 +606,8 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 left=left,
                 right=right,
                 semantics=effect.semantics,
+                numeric_domain=effect.numeric_domain,
+                bit_width=effect.bit_width,
             )
         )
         return True
@@ -627,6 +634,8 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
             left=left,
             right=right,
             semantics="dynamic",
+            numeric_domain=effect.numeric_domain,
+            bit_width=effect.bit_width,
         )
         if effect.negate:
             expr = UnaryOp(source=effect.source, op="not ", value=expr)

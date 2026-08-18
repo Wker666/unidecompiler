@@ -199,16 +199,40 @@ def _dotnet_unknown_opcode_effect(
     return (UnknownOpcode(source=source, opcode=instruction.opcode, raw=_dotnet_raw_instruction_line(instruction)),)
 
 
-def _dotnet_binary(op: str):
+def _dotnet_numeric_facts(opcode: str) -> tuple[str, int | None]:
+    if opcode.endswith(".un") or opcode == "shr.un":
+        return "unsigned", 32
+    return "default", None
+
+
+def _dotnet_binary(opcode: str, op: str):
     def factory(_method: DotNetMethodListing, _instruction: DotNetInstruction, source: SourceRef) -> tuple:
-        return (Binary(source=source, op=op, semantics="static"),)
+        numeric_domain, bit_width = _dotnet_numeric_facts(opcode)
+        return (
+            Binary(
+                source=source,
+                op=op,
+                semantics="static",
+                numeric_domain=numeric_domain,
+                bit_width=bit_width,
+            ),
+        )
 
     return factory
 
 
-def _dotnet_compare(op: str):
+def _dotnet_compare(opcode: str, op: str):
     def factory(_method: DotNetMethodListing, _instruction: DotNetInstruction, source: SourceRef) -> tuple:
-        return (Binary(source=source, op=op, semantics="static"),)
+        numeric_domain, bit_width = _dotnet_numeric_facts(opcode)
+        return (
+            Binary(
+                source=source,
+                op=op,
+                semantics="static",
+                numeric_domain=numeric_domain,
+                bit_width=bit_width,
+            ),
+        )
 
     return factory
 
@@ -304,8 +328,8 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
     opcode_attr="opcode",
     ignored=frozenset(IGNORED_OPS),
     exact={
-        **{opcode: _dotnet_binary(op) for opcode, op in BINARY_OPS.items()},
-        **{opcode: _dotnet_compare(op) for opcode, op in COMPARE_OPS.items()},
+        **{opcode: _dotnet_binary(opcode, op) for opcode, op in BINARY_OPS.items()},
+        **{opcode: _dotnet_compare(opcode, op) for opcode, op in COMPARE_OPS.items()},
         "ldnull": lambda _method, _instruction, source: (Push(source=source, value=Const(value=None, source=source)),),
         "dup": lambda _method, instruction, source: (DuplicateTop(source=source, materialized_name=f"local_stack_{instruction.offset}"),),
         "pop": lambda _method, _instruction, source: (Pop(source=source, count=1, emit_calls=True),),

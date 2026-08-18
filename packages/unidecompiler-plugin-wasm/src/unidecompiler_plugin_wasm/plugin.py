@@ -8,6 +8,7 @@ from unidecompiler_plugin_wasm.module import (
     WasmModuleDecoder,
     looks_like_wasm,
 )
+from unidecompiler_plugin_wasm.simulation import WasmSimulationAdapter
 from unidecompiler_plugin_wasm.support import WASM_VERSION_SUPPORT
 
 
@@ -16,6 +17,7 @@ class WasmFrontendPlugin:
     display_name = "WebAssembly module"
     supported_inputs = (".wasm",)
     version_support = WASM_VERSION_SUPPORT
+    simulation_adapter = WasmSimulationAdapter
 
     def __init__(self, decoder: WasmModuleDecoder | None = None) -> None:
         self.decoder = decoder or WasmLibraryModuleDecoder()

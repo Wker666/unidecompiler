@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "unidecompiler"
+name = "unidecompiler-simulation-host-python"
 version = "0.1.1"
-description = "A small universal bytecode decompiler experiment."
+description = "Trusted Python runtime host for unidecompiler simulation"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Wker", email = "1670133844@qq.com" }]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["unidecompiler-simulator>=0.1.1,<0.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/Wker666/unidecompiler"
