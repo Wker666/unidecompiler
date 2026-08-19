@@ -30,9 +30,6 @@ cd /path/to/emojivm_frontend_case
 source /path/to/your/.venv/bin/activate
 ```
 
-这里的 `/path/to/...` 只是占位符。请替换成自己的路径，不要把本机绝对路径
-写进插件或文档。
-
 确认文件存在：
 
 ```bash

@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import re
 import json
+from importlib.metadata import PackageNotFoundError, version
 from threading import Event
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from unidecompiler.input_sources import InputEntry, iter_input_entries, load_inp
 from unidecompiler_gui.themes import Theme, builtin_themes, external_theme
 from unidecompiler_gui.plugin_host import PluginHost
 from unidecompiler_gui.plugin_install import GuiPluginStore, load_enabled_plugins
+from unidecompiler_gui.frontend_store import FrontendRestoreFailure, FrontendStore
 from unidecompiler_simulator import (
     SimulationCancellation,
     SimulationEngine,
@@ -26,7 +28,7 @@ from unidecompiler_simulation_host_python import PythonFileEnvironment
 
 try:
     from PySide6.QtCore import QObject, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
+    from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
     from PySide6.QtWidgets import (
         QApplication, QDialog, QFileDialog, QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
         QComboBox, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, QSplitter, QSpinBox, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTabBar, QToolBar, QToolButton, QTreeWidget,
@@ -141,30 +143,38 @@ class GlobalSearchHit:
 class FrontendManagerDialog(QDialog):
     changed = Signal()
 
-    def __init__(self, engine: DecompilerEngine, parent: QWidget) -> None:
+    def __init__(self, engine: DecompilerEngine, parent: QWidget, store: FrontendStore | None = None, restore_failures: tuple[FrontendRestoreFailure, ...] = ()) -> None:
         super().__init__(parent)
         self._engine = engine
+        self._store = store or FrontendStore()
+        self._restore_failures = {item.id: item for item in restore_failures}
+        self._mutations_enabled = True
         self.setWindowTitle("Frontends")
         self.resize(760, 420)
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Frontend", "ID", "Source", "Supported inputs"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Frontend", "ID", "Source", "Status", "Supported inputs"])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.itemSelectionChanged.connect(self._update_action_state)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table)
         buttons = QHBoxLayout()
         self.register_button = QPushButton("Register folder")
         self.register_button.clicked.connect(self._register_folder)
         self.unload_button = QPushButton("Unload selected")
         self.unload_button.clicked.connect(self._unload_selected)
+        self.remove_button = QPushButton("Remove from startup")
+        self.remove_button.clicked.connect(self._remove_selected)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
         buttons.addWidget(self.register_button)
         buttons.addWidget(self.unload_button)
+        buttons.addWidget(self.remove_button)
         buttons.addStretch(1)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
@@ -172,43 +182,93 @@ class FrontendManagerDialog(QDialog):
 
     def refresh(self) -> None:
         plugins = self._engine.registry.list()
-        self.table.setRowCount(len(plugins))
-        for row, plugin in enumerate(plugins):
-            values = (
+        records = {item.id: item for item in self._store.list()}
+        rows: list[tuple[str, str, str, str, str]] = []
+        for plugin in plugins:
+            record = records.get(plugin.id)
+            source = self._engine.registry.source_for(plugin.id)
+            rows.append((
                 plugin.display_name,
                 plugin.id,
-                self._engine.registry.source_for(plugin.id),
+                source,
+                "loaded",
                 ", ".join(plugin.supported_inputs),
-            )
+            ))
+            # Keep a persisted record visible when its ID is occupied by a
+            # different source, so failed restores and ID conflicts remain
+            # actionable instead of looking like a healthy loaded frontend.
+            if record is not None and source == record.path:
+                records.pop(plugin.id, None)
+        for record in records.values():
+            failure = self._restore_failures.get(record.id)
+            if failure is not None:
+                status = "unavailable"
+                diagnostic = failure.diagnostic
+            elif any(plugin.id == record.id for plugin in plugins):
+                status = "conflict"
+                diagnostic = "persisted path conflicts with the loaded frontend"
+            else:
+                status = "unloaded"
+                diagnostic = ""
+            rows.append((record.id, record.id, record.path, status, diagnostic))
+        self.table.setRowCount(len(rows))
+        for row, values in enumerate(rows):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 1:
-                    item.setData(Qt.ItemDataRole.UserRole, plugin.id)
+                    item.setData(Qt.ItemDataRole.UserRole, values[1])
                 self.table.setItem(row, column, item)
+        self._update_action_state()
 
     def set_mutation_enabled(self, enabled: bool) -> None:
+        self._mutations_enabled = enabled
         self.register_button.setEnabled(enabled)
-        self.unload_button.setEnabled(enabled)
+        self._update_action_state()
 
     def _register_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Register frontend folder")
         if not directory:
             return
         try:
-            self._engine.register_frontend_directory(directory)
+            plugin = self._engine.register_frontend_directory(directory)
+            try:
+                self._store.add(plugin.id, directory)
+            except Exception:
+                self._engine.unregister_frontend(plugin.id)
+                raise
+            self._restore_failures.pop(plugin.id, None)
         except (FrontendRegistrationError, ValueError, OSError) as error:
             QMessageBox.critical(self, "Frontend registration failed", str(error))
             return
         self.refresh()
         self.changed.emit()
 
-    def _unload_selected(self) -> None:
+    def _selected_frontend_id(self) -> str | None:
         row = self.table.currentRow()
         if row < 0:
-            return
+            return None
         item = self.table.item(row, 1)
-        frontend_id = None if item is None else item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(frontend_id, str):
+        value = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        return value if isinstance(value, str) else None
+
+    def _selected_is_loaded_external(self) -> bool:
+        frontend_id = self._selected_frontend_id()
+        record = None if frontend_id is None else self._store.record_for(frontend_id)
+        return (
+            record is not None
+            and frontend_id in {plugin.id for plugin in self._engine.registry.list()}
+            and self._engine.registry.source_for(frontend_id) == record.path
+        )
+
+    def _update_action_state(self) -> None:
+        frontend_id = self._selected_frontend_id()
+        has_record = frontend_id is not None and self._store.record_for(frontend_id) is not None
+        self.unload_button.setEnabled(self._mutations_enabled and self._selected_is_loaded_external())
+        self.remove_button.setEnabled(self._mutations_enabled and has_record)
+
+    def _unload_selected(self) -> None:
+        frontend_id = self._selected_frontend_id()
+        if frontend_id is None or not self._selected_is_loaded_external():
             return
         try:
             self._engine.unregister_frontend(frontend_id)
@@ -217,6 +277,69 @@ class FrontendManagerDialog(QDialog):
             return
         self.refresh()
         self.changed.emit()
+
+    def _remove_selected(self) -> None:
+        frontend_id = self._selected_frontend_id()
+        if frontend_id is None or self._store.record_for(frontend_id) is None:
+            return
+        try:
+            record = self._store.record_for(frontend_id)
+            if (
+                record is not None
+                and frontend_id in {plugin.id for plugin in self._engine.registry.list()}
+                and self._engine.registry.source_for(frontend_id) == record.path
+            ):
+                self._engine.unregister_frontend(frontend_id)
+        except ValueError as error:
+            QMessageBox.critical(self, "Frontend removal failed", str(error))
+            return
+        self._store.remove(frontend_id)
+        self._restore_failures.pop(frontend_id, None)
+        self.refresh()
+        self.changed.emit()
+
+
+class AboutDialog(QDialog):
+    """Project and author information with an offline bundled avatar."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About unidecompiler")
+        self.setFixedSize(460, 300)
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        avatar = QLabel()
+        pixmap = QPixmap(str(Path(__file__).with_name("assets") / "author-avatar.jpg"))
+        if not pixmap.isNull():
+            avatar.setPixmap(pixmap.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        avatar.setFixedSize(104, 104)
+        header.addWidget(avatar)
+        identity = QVBoxLayout()
+        title = QLabel("<h2>unidecompiler</h2>")
+        identity.addWidget(title)
+        description = QLabel("A VM-neutral bytecode decompiler and generic IR simulator.")
+        description.setWordWrap(True)
+        description.setFixedWidth(280)
+        identity.addWidget(description)
+        identity.addWidget(QLabel("Author: Wker"))
+        author_link = QLabel('<a href="https://github.com/Wker666">GitHub: @Wker666</a>')
+        author_link.setOpenExternalLinks(True)
+        identity.addWidget(author_link)
+        repository_link = QLabel('<a href="https://github.com/Wker666/unidecompiler">Repository: Wker666/unidecompiler</a>')
+        repository_link.setOpenExternalLinks(True)
+        identity.addWidget(repository_link)
+        header.addLayout(identity, 1)
+        layout.addLayout(header)
+        try:
+            gui_version = version("unidecompiler-gui")
+        except PackageNotFoundError:
+            gui_version = "development"
+        layout.addWidget(QLabel(f"Version: {gui_version}"))
+        layout.addWidget(QLabel("License: AGPL-3.0-or-later"))
+        layout.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
 
 
 class PluginManagerDialog(QDialog):
@@ -538,9 +661,11 @@ class SimulationWorker(QObject):
 
 
 class Workbench(QMainWindow):
-    def __init__(self, engine: DecompilerEngine | None = None) -> None:
+    def __init__(self, engine: DecompilerEngine | None = None, frontend_store: FrontendStore | None = None) -> None:
         super().__init__()
         self.engine = engine or DecompilerEngine.discover()
+        self.frontend_store = frontend_store or FrontendStore()
+        self._frontend_restore_failures = self.frontend_store.restore(self.engine)
         self.results: tuple[DecompileResult, ...] = ()
         self._document_revisions: dict[str, int] = {}
         self._resource_data: dict[str, bytes] = {}
@@ -629,6 +754,8 @@ class Workbench(QMainWindow):
         self.plugins_menu = self.menuBar().addMenu("Plugins")
         self.plugins_menu.addAction(QAction("Manage plugins", self, triggered=self.open_plugin_manager))
         self.plugin_commands_menu = self.plugins_menu.addMenu("Commands")
+        help_menu = self.menuBar().addMenu("Help")
+        help_menu.addAction(QAction("About unidecompiler", self, triggered=self.open_about))
         toolbar = QToolBar("Workspace", self)
         toolbar.setObjectName("workspaceToolbar")
         toolbar.setMovable(False)
@@ -990,6 +1117,8 @@ class Workbench(QMainWindow):
         self.plugin_host = PluginHost(self, self.plugin_commands_menu)
         load_enabled_plugins(self.plugin_store, self.plugin_host)
         self._apply_theme(self._theme)
+        if self.frontend_store.load_diagnostic:
+            self.statusBar().showMessage(self.frontend_store.load_diagnostic)
 
     def _update_frontend_status(self) -> None:
         """Refresh the compact frontend indicator without touching open results."""
@@ -1027,7 +1156,9 @@ class Workbench(QMainWindow):
             self.frontend_manager.raise_()
             self.frontend_manager.activateWindow()
             return
-        self.frontend_manager = FrontendManagerDialog(self.engine, self)
+        self.frontend_manager = FrontendManagerDialog(
+            self.engine, self, self.frontend_store, self._frontend_restore_failures,
+        )
         self.frontend_manager.changed.connect(self._update_frontend_status)
         self.frontend_manager.finished.connect(self._frontend_manager_closed)
         self._update_frontend_mutation_enabled()
@@ -1042,6 +1173,10 @@ class Workbench(QMainWindow):
         self.plugin_manager.show()
         self.plugin_manager.raise_()
         self.plugin_manager.activateWindow()
+
+    def open_about(self) -> None:
+        dialog = AboutDialog(self)
+        dialog.exec()
 
     def _frontend_manager_closed(self, _result: int) -> None:
         self.frontend_manager = None

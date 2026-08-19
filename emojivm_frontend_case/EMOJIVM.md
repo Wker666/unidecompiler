@@ -1,6 +1,6 @@
 # EmojiVM 虚拟机与指令集参考文档
 
-> 来源：反汇编 `emojivm`（ELF 64-bit, x86-64, PIE, stripped, C++）以及 `all_pseudocode.c`（IDA Hex-Rays 伪代码）。
+> 来源：反汇编 `emojivm`（ELF 64-bit, x86-64, PIE, stripped, C++）。
 > 配套工具：`disasm_evm.py`（反汇编器）、`emuvm.py`（模拟器）。
 
 ---

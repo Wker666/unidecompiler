@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-gui"
-version = "0.1.4"
+version = "0.1.5"
 description = "Read-only desktop workbench for unidecompiler"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -39,4 +39,4 @@ unidecompiler-gui = "unidecompiler_gui.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-unidecompiler_gui = ["themes/*.qss"]
+unidecompiler_gui = ["themes/*.qss", "assets/*.jpg"]

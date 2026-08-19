@@ -23,6 +23,24 @@ plugins through `DecompilerEngine` and does not modify input artifacts or save
 workspace state. Its optional Simulation tab uses the separate generic IR
 simulator and can load a trusted Python runtime file for unresolved functions.
 
+## Frontend persistence
+
+Custom VM frontend folders registered from `View -> Frontends` are persisted by
+the GUI host. After the first successful registration, the GUI restores the
+folder on the next startup before opening input files. The frontend registry
+and core remain runtime-only; the GUI stores only the normalized source path
+and frontend ID.
+
+`Unload selected` removes a frontend from the current process but keeps its
+startup record. `Remove from startup` removes it from the current process and
+from the GUI startup records, but never deletes the frontend directory from
+disk. Built-in entry-point frontends are not stored as user records.
+
+If a saved directory is missing or its manifest/module is invalid, startup
+continues. The frontend manager marks the record `unavailable` and shows the
+diagnostic so the path can be repaired or removed. Frontend source is trusted
+Python code and is not sandboxed.
+
 ## GUI plugins
 
 The `Plugins` menu manages optional Python GUI plugins. A plugin is an
