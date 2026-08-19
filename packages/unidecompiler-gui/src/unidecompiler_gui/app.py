@@ -751,6 +751,8 @@ class Workbench(QMainWindow):
         windows_menu.addAction(self.diagnostics_action)
         frontends_action = QAction("Frontends", self, triggered=self.open_frontend_manager)
         view_menu.addAction(frontends_action)
+        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu.addAction(QAction("Export extension template", self, triggered=self.open_template_export))
         self.plugins_menu = self.menuBar().addMenu("Plugins")
         self.plugins_menu.addAction(QAction("Manage plugins", self, triggered=self.open_plugin_manager))
         self.plugin_commands_menu = self.plugins_menu.addMenu("Commands")
@@ -1177,6 +1179,11 @@ class Workbench(QMainWindow):
     def open_about(self) -> None:
         dialog = AboutDialog(self)
         dialog.exec()
+
+    def open_template_export(self) -> None:
+        from unidecompiler_gui.template_dialog import TemplateDialog
+
+        TemplateDialog(self).exec()
 
     def _frontend_manager_closed(self, _result: int) -> None:
         self.frontend_manager = None

@@ -23,6 +23,19 @@ plugins through `DecompilerEngine` and does not modify input artifacts or save
 workspace state. Its optional Simulation tab uses the separate generic IR
 simulator and can load a trusted Python runtime file for unresolved functions.
 
+## Extension templates
+
+Use `Tools -> Export extension template` to create a self-contained starter
+project for either a VM frontend or a GUI plugin. The exporter writes a new
+directory only and never overwrites an existing path. Each project includes its
+matching full development guide, a focused `AGENTS.md`, a README containing the
+requested feature, packaging metadata, and test skeletons.
+
+The VM frontend template keeps decoding and thin-IR submission separate from
+core recovery. Its optional simulation adapter is data-only; the generic IR
+simulator remains responsible for execution. The GUI plugin template depends
+only on `unidecompiler-gui-sdk` and remains a read-only application extension.
+
 ## Frontend persistence
 
 Custom VM frontend folders registered from `View -> Frontends` are persisted by

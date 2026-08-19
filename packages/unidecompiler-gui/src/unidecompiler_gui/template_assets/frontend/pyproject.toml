@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-plugin-__PROJECT_ID__"
+version = "0.1.0"
+description = "__DESCRIPTION__"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "__AUTHOR__" }]
+requires-python = ">=3.11"
+dependencies = __DEPENDENCIES__
+
+[project.entry-points."unidecompiler.frontends"]
+__PROJECT_ID__ = "__PACKAGE__.plugin:Frontend"
+
+[tool.setuptools.packages.find]
+where = ["src"]

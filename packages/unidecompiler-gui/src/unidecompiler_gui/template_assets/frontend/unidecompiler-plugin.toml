@@ -1,0 +1,3 @@
+[frontend]
+id = "__PROJECT_ID__"
+module = "__PACKAGE__.plugin:Frontend"

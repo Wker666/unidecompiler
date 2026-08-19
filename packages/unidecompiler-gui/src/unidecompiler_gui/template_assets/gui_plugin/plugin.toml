@@ -1,0 +1,10 @@
+[plugin]
+id = "__PROJECT_ID__"
+name = "__DISPLAY_NAME__"
+version = "0.1.0"
+api = "1"
+entry = "__PACKAGE__.plugin:register"
+description = "__DESCRIPTION__"
+
+[python]
+requires = []

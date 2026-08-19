@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "__PROJECT_ID__"
+version = "0.1.0"
+description = "__DESCRIPTION__"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "__AUTHOR__" }]
+requires-python = ">=3.11"
+dependencies = ["unidecompiler-gui-sdk>=0.1.0,<0.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
