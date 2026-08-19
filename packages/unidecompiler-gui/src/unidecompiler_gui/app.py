@@ -684,6 +684,7 @@ class Workbench(QMainWindow):
         self.simulation_trace.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.simulation_trace.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.simulation_trace.itemSelectionChanged.connect(self._simulation_event_selected)
+        self.simulation_trace.cellDoubleClicked.connect(self._simulation_event_activated)
         self.simulation_details = QPlainTextEdit()
         self.simulation_details.setReadOnly(True)
         self.simulation_details.setFont(fixed_font)
@@ -1630,6 +1631,12 @@ class Workbench(QMainWindow):
             "stdout": event.stdout,
             "stderr": event.stderr,
         }, default=repr, indent=2, sort_keys=True))
+
+    def _simulation_event_activated(self, row: int, _column: int) -> None:
+        item = self.simulation_trace.item(row, 0)
+        event = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        if event is None:
+            return
         result = next(
             (candidate for candidate in self.results if candidate.display_path == self._simulation_result_path),
             None,
@@ -1637,7 +1644,12 @@ class Workbench(QMainWindow):
         if not isinstance(result, DecompileResult) or event.source is None:
             return
         if 0 <= event.function_index < len(result.functions):
-            self._focus_source(result, event.source, result.functions[event.function_index].id)
+            function_id = result.functions[event.function_index].id
+            self._navigate_to_function(function_id, result)
+            self.detail_stack.setCurrentWidget(self.detail_tabs)
+            self.detail_tabs.setCurrentWidget(self.pseudocode)
+            self._focus_source(result, event.source, function_id)
+            self.pseudocode.centerCursor()
 
     def _refresh(self, selected_path: str | None = None) -> None:
         self._update_frontend_status()
@@ -2363,6 +2375,24 @@ class Workbench(QMainWindow):
                 item for item in result.pseudocode.source_map
                 if _same_source(item.source, source) and item.function_id == function_id
             ]
+            if not ranges:
+                source_offset = getattr(source, "offset", None)
+                source_frontend = getattr(source, "frontend", None)
+                nearby = [
+                    item
+                    for item in result.pseudocode.source_map
+                    if item.function_id == function_id
+                    and getattr(item.source, "frontend", None) == source_frontend
+                    and isinstance(getattr(item.source, "offset", None), int)
+                    and isinstance(source_offset, int)
+                ]
+                if nearby:
+                    ranges = [
+                        min(
+                            nearby,
+                            key=lambda item: abs(item.source.offset - source_offset),
+                        )
+                    ]
             if ranges:
                 mapping = min(ranges, key=lambda item: item.end - item.start)
                 cursor = self.pseudocode.textCursor()
@@ -2373,6 +2403,7 @@ class Workbench(QMainWindow):
                     self.pseudocode.setTextCursor(cursor)
                 finally:
                     self.pseudocode.blockSignals(False)
+                self.pseudocode.centerCursor()
         if select_ast:
             ast_item = self._find_ast_item(source, function_id)
             if ast_item is not None:

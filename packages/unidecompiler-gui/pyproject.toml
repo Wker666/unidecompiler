@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-gui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Read-only desktop workbench for unidecompiler"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
