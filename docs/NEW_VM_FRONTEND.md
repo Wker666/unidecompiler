@@ -1,151 +1,141 @@
-# 编写新的 VM Frontend 完整指南
+# Complete guide to writing a new VM Frontend
 
-本文是 `unidecompiler` 新 VM/字节码 frontend 的实施手册。目标是：frontend 只提交 VM-neutral facts，core 负责栈恢复、CFG、结构化、AST、伪代码和诊断。
+This article is an implementation manual for `unidecompiler`’s new VM/bytecode frontend. The goal is: frontend only submits VM-neutral facts, and core is responsible for stack recovery, CFG, structuring, AST, pseudocode and diagnostics.
 
-如果你正在给一个新 VM 写插件，按本文顺序做即可。不要从“先让 GUI 看起来像 C 代码”开始；先保证 decoder、effects、hints 和 CFG facts 完整、可验证。
+If you are writing a plug-in for a new VM, just follow the steps in this article. Don't start with "make the GUI look like C code"; start by making sure the decoder, effects, hints, and CFG facts are complete and verifiable.
 
-如果你的 VM 不是栈机，先读第 29 节“选择你的 VM 建模路径”，再回来看 effects 和控制流模板。不要把栈机模板硬套到寄存器 VM 或三地址 VM。
+If your VM is not a stack machine, read Section 29, “Choosing your VM modeling path” first, and then come back to effects and control flow templates. Do not hard-wire stack machine templates into register VMs or three-address VMs.
 
-如果你希望 frontend 支持可选的模拟执行，还必须阅读第 20.1 节及其后
-的模拟验证清单。模拟支持不是把 frontend 变成解释器，而是为独立的
-generic-IR simulator 提供数据化的函数查找和运行时事实。
+If you want your frontend to support optional simulation, you must also read Section 20.1 and its simulation verification checklist. Simulation support does not turn the frontend into an interpreter; it provides data-only function lookup and runtime facts to the independent generic-IR simulator.
 
-## 0.1 先怎么读这份文档
+## 0.1 How to read this document first
 
-如果你是第一次写 frontend，按这个顺序读：
+If you are writing frontend for the first time, read it in this order:
 
-- Day 1：第 0、2、3、4、5、7、8、11、12、13 节。
-- Day 2：第 14、15、16、17、18、19、20、20.1 节。
-- Day 3：第 23、23.1、24、25、27、28 节。
-- Day 4：第 29、30、31、32、33、34、35、36、37 节。
-- 最后：第 39 节，对照一个完整最小插件。
+- Day 1: Sessions 0, 2, 3, 4, 5, 7, 8, 11, 12, 13.
+- Day 2: Sections 14, 15, 16, 17, 18, 19, 20, 20.1.
+- Day 3: Sections 23, 23.1, 24, 25, 27, 28.
+- Day 4: Sections 29, 30, 31, 32, 33, 34, 35, 36, 37.
+- Finally: Section 39, using the complete minimal plugin as a reference.
 
-如果你只想先把第一个 frontend 跑起来，优先做第 0.3 节的 7 步，然后直接复制第 39.1 节的小插件再替换自己的 opcode 语义。
+If you only want to run the first frontend first, do the 7 steps in Section 0.3 first, then directly copy the small plug-in in Section 39.1 and replace your own opcode semantics.
 
-如果你的 VM 不是栈机，先读第 29 节，再决定第 8～18 节该用哪条模板。
+If your VM is not a stack machine, read Section 29 first, and then decide which template to use in Sections 8 to 18.
 
-## 0.2 这份文档里最重要的几个词
+## 0.2 The most important words in this document
 
-| 词 | 你可以把它理解成 |
+| word | you can understand it as |
 |---|---|
-| frontend | 只负责“看懂字节码事实”的适配层 |
-| decoder | 把原始输入解析成稳定模型 |
-| model | frontend 自己保留的私有解析结果 |
-| step | 一条能提交给 core 的薄层指令事实 |
-| effect | 这条指令对栈、变量、调用、返回做了什么 |
-| hint | 这条指令告诉 core 的控制流/聚合/异常事实 |
-| SourceRef | 这条事实来自哪一个原始位置 |
-| target | 跳转要去的原始 offset |
-| profile | core 用来恢复 CFG 的 opcode 分类表 |
-| stateful callbacks | core 在复杂控制流下回调 frontend 的接口 |
+| frontend | The adaptation layer that is only responsible for "understanding the bytecode facts" |
+| decoder | Parse the original input into a stable model |
+| model | frontend's own private parsing results |
+| step | A thin instruction fact that can be submitted to core |
+| effect | What does this instruction do to the stack, variables, calls, and returns |
+| hint | This directive tells the core's control flow/aggregation/exception facts |
+| SourceRef | The original location from which this fact came |
+| target | original offset to jump to |
+| profile | the opcode classification table core uses to recover the CFG |
+| stateful callbacks | core's interface to call back frontend under complex control flow |
 
-最简单的心智模型是：
-
+The simplest mental model is:
 ```text
-decoder 负责“是什么”
-effect 负责“做了什么”
-hint 负责“往哪里去”
-core 负责“把这些事实拼回结构”
+decoder answers “what it is”
+effect answers “what it does”
+hint answers “where it goes”
+core assembles these facts back into structure
 ```
 
-## 0.3 最短上手路线
+## 0.3 The shortest route to get started
 
-如果你现在就要开始写第一个 frontend，只做这 7 步：
+If you want to start writing your first frontend now, just do these 7 steps:
 
-1. 先选一个很小的 VM，只保留 3～5 个 opcode。
-2. 写 `model.py`，只保留 `offset`、`opcode`、`size`、`operands`、`raw`。
-3. 写 `decoder.py`，先让 `can_load()` 和 `decode()` 稳定。
-4. 写 `plugin.py`，只负责注册和 `FrontendModule`。
-5. 写 `lifter.py`，先支持 `CONST`、`ADD`、`RETURN`。
-6. 再加一个 `JUMP` 和一个条件跳转。
-7. 跑第 23～25 节的验证脚本，确认 GUI 和 CFG 都正常。
+1. First select a very small VM and only keep 3 to 5 opcodes.
+2. Write `model.py` and keep only `offset`, `opcode`, `size`, `operands` and `raw`.
+3. Write `decoder.py` and make `can_load()` and `decode()` stable first.
+4. Write `plugin.py`, which is only responsible for registration and `FrontendModule`.
+5. Write `lifter.py`, first support `CONST`, `ADD`, `RETURN`.
+6. Add a `JUMP` and a conditional jump.
+7. Run the verification scripts in Sections 23 to 25 to confirm that both the GUI and CFG are normal.
 
-如果你想最快看到结果，直接复制第 39.1 节的小插件示例，再把 opcode 名和 operand 解码替换成你的 VM 语义。
+If you want to see the results as quickly as possible, just copy the small plug-in example in Section 39.1, and replace the opcode name and operand decoding with your VM semantics.
 
-## 0. 先明确 frontend 的边界
+## 0. First clarify the boundaries of frontend
 
-Frontend 可以做：
+Frontend can do:
 
-- 识别输入格式。
-- 解析文件、函数、指令、常量、调试信息。
-- 给每条指令生成 `VMBytecodeStep`。
-- 给 step 填写 `decoded`、`raw`、`effects`、`hints`。
-- 提供 `VMRegionOpcodeClasses`。
-- 提供 `VMStatefulCallbacks`，让 core 能跨 basic block 保存 VM 栈和局部状态。
-- 提交 branch target、loop backedge、case target、exception region 等中立事实。
+- Recognize input formats.
+- Parse files, functions, instructions, constants, and debugging information.
+- Generate `VMBytecodeStep` for each instruction.
+- Fill in `decoded`, `raw`, `effects`, `hints` for step.
+- Provide `VMRegionOpcodeClasses`.
+- Provide `VMStatefulCallbacks`, allowing core to save VM stack and local state across basic blocks.
+- Submit neutral facts such as branch target, loop backedge, case target, exception region, etc.
 
-Frontend 不可以做：
+Frontend cannot do:
 
-- 构造 `If`、`While`、`Switch`、`BasicBlock`、`FunctionIR`。
-- 直接调用 `assemble_function`、`assemble_module`。
-- 注册 CFG structurer。
-- 在 backend/pseudocode 层补救控制流。
-- 针对某个样本、fixture 或业务输入硬编码恢复规则。
-- 把私有 decoder 对象塞进 core-visible operand、hint 或 metadata 里表达程序逻辑。
-- 为 simulation 编写 VM bytecode interpreter、opcode 执行器或 frontend-specific
-  frame/stack machine。
-- 在 GUI、CLI 或 simulator 中实现自己的函数查找、重载选择或语言运行时语义。
-- 让 `simulation_adapter` 返回 executable callback、frame、stack、decoder
-  model 或不属于当前 lifted module 的函数。
+- Construct `If`, `While`, `Switch`, `BasicBlock`, `FunctionIR`.
+- Directly call `assemble_function`, `assemble_module`.
+- Register CFG structurer.
+- Remediate control flow at the backend/pseudocode layer.
+- Enter hard-coded recovery rules for a sample, fixture or business.
+- Insert private decoder objects into core-visible operands, hints, or metadata to express program logic.
+- Write VM bytecode interpreter, opcode executor or frontend-specific for simulation
+  frame/stack machine.
+- Implement your own function lookup, overload selection, or language runtime semantics in the GUI, CLI, or simulator.
+- Let `simulation_adapter` return executable callback, frame, stack, decoder
+  model or a function that does not belong to the current lifted module.
 
-关键判断标准：
-
+Key judgment criteria:
 ```text
-如果这个信息是“字节码事实”，frontend 可以提交。
-如果这个信息是“源码结构”，必须交给 core 恢复。
+If this information is a “bytecode fact”, the frontend may submit it.
+If this information is a “source structure”, core must recover it.
 ```
+For example:
 
-例如：
+- The fact that the `jnz` at offset 120 targets offset 80 can be submitted.
+- ``offset 80..120 is a while loop`` is a source structure; the frontend must not construct it.
 
-- `offset 120 的 jnz 目标是 offset 80` 是事实，可以提交。
-- `offset 80..120 是 while 循环` 是结构，frontend 不可以构造。
-
-## 1. 总体数据流
-
+## 1. Overall data flow
 ```text
-文件字节
+file bytes
   -> FrontendPlugin.can_load()
   -> FrontendPlugin.decode()
   -> FrontendModule(payload + metadata)
-  -> frontend 转换为 VM 薄层事实
+  -> frontend converts them into thin VM facts
   -> VMBytecodeStep(decoded + raw + effects + hints)
   -> lift_vm_step_function()
-  -> core 栈恢复 / CFG / region / SSA / AST
-  -> DecompilerEngine 统一结果
+  -> core stack recovery / CFG / regions / SSA / AST
+  -> DecompilerEngine unified result
   -> pseudocode backend / GUI / CLI
-  -> [可选] generic IR simulator
+  -> [optional] generic IR simulator
   -> SimulationResult / trace
   -> CLI / GUI / embedding host
 ```
+Frontend's private decoder payload can only be used within its own package. Core can receive `FrontendModule.metadata`, but metadata can only be provenance, diagnostics and analysis context, and cannot express control flow decisions.
 
-Frontend 私有的 decoder payload 只能在自己的包内使用。Core 可以接收 `FrontendModule.metadata`，但 metadata 只能是 provenance、diagnostics 和分析上下文，不能表达控制流决策。
+## 2. Recommended directory structure
 
-## 2. 推荐目录结构
-
-外部目录插件推荐这样放：
-
+The external directory plug-in is recommended to be placed like this:
 ```text
 my-vm-plugin/
 ├── unidecompiler-plugin.toml
 ├── README.md
-├── pyproject.toml                  # 可选，作为 pip 包发布时需要
+├── pyproject.toml                  # optional; required when publishing as a pip package
 ├── my_vm_frontend/
 │   ├── __init__.py
-│   ├── plugin.py                   # FrontendPlugin 门面
-│   ├── decoder.py                  # 文件/字节码解析
-│   ├── model.py                    # decoder 私有模型
+│   ├── plugin.py                   # FrontendPlugin facade
+│   ├── decoder.py                  # file/bytecode parsing
+│   ├── model.py                    # decoder-private model
 │   ├── lifter.py                   # VMBytecodeStep/effects/hints
-│   ├── simulation.py               # 可选：目标查找和数据化运行时适配
-│   └── support.py                  # 可选，版本支持声明
+│   ├── simulation.py               # optional target lookup and data-only runtime adapter
+│   └── support.py                  # optional version-support declaration
 └── tests/
     ├── test_decoder.py
     ├── test_lifter.py
-    ├── test_simulation.py          # 声明支持模拟时必须有
+    ├── test_simulation.py          # required when simulation is supported
     └── test_integration.py
 ```
-
-如果使用 `src/` 布局：
-
+If using `src/` layout:
 ```text
 my-vm-plugin/
 ├── unidecompiler-plugin.toml
@@ -157,45 +147,38 @@ my-vm-plugin/
         ├── model.py
         └── lifter.py
 ```
-
-GUI 注册外部目录时，传入插件根目录：
-
+When the GUI registers an external directory, pass in the plug-in root directory:
 ```text
 /path/to/my-vm-plugin
 ```
 
-## 3. 外部 manifest
+## 3. External manifest
 
-插件根目录必须有：
-
+The plugin root directory must have:
 ```toml
 # unidecompiler-plugin.toml
 [frontend]
 id = "my-vm"
 module = "my_vm_frontend.plugin:MyVmFrontendPlugin"
 ```
+Rules:
 
-规则：
+- `id` must be globally unique and stable.
+- `module` must be `python.module:attribute`.
+- `attribute` can be a plugin instance or a zero-argument plugin class.
+- The registered directory root or `src/` will be added to the Python import path.
+- The GUI will not automatically execute `pip install`; third-party dependencies require users to install them in advance.
 
-- `id` 必须全局唯一、稳定。
-- `module` 必须是 `python.module:attribute`。
-- `attribute` 可以是 plugin 实例，也可以是零参数 plugin 类。
-- 注册目录根或 `src/` 会被加入 Python import path。
-- GUI 不会自动执行 `pip install`；第三方依赖要用户提前装好。
-
-如果发布为 Python distribution，同时加 entry point：
-
+If published as Python distribution, also add entry point:
 ```toml
 [project.entry-points."unidecompiler.frontends"]
 my-vm = "my_vm_frontend.plugin:MyVmFrontendPlugin"
 ```
+The entry point is automatically discovered by `FrontendRegistry.discover()`. External manifests are registered explicitly by the host.
 
-entry point 由 `FrontendRegistry.discover()` 自动发现。外部 manifest 由宿主显式注册。
+## 4. FrontendPlugin facade
 
-## 4. FrontendPlugin 门面
-
-最小 plugin：
-
+Minimal plugin:
 ```python
 from __future__ import annotations
 
@@ -247,19 +230,17 @@ class MyVmFrontendPlugin:
             raise TypeError(f"wrong frontend module: {module.frontend_id!r}")
         return lift_program(module.payload, module.metadata)
 ```
+`can_load()` should be fast, have no side effects, and cannot execute external programs. When multiple frontends return true at the same time, the engine will report ambiguous instead of guessing.
 
-`can_load()` 要快速、无副作用、不能执行外部程序。多个 frontend 同时返回 true 时，engine 会报告 ambiguous，而不是猜。
+`decode()` only does format parsing. It can return the frontend private model, but cannot construct the core IR.
 
-`decode()` 只做格式解析。它可以返回 frontend 私有模型，但不能构造 core IR。
+`lift()` only converts the private model into thin VM facts and then calls the core helper.
 
-`lift()` 只把私有模型转换成 thin VM facts，再调用 core helper。
+## 5. Decoder model
 
-## 5. Decoder 模型
+The Decoder's responsibility is to turn the input into a stable frontend private model.
 
-Decoder 的职责是把输入变成稳定的 frontend 私有模型。
-
-推荐模型：
-
+Recommended model:
 ```python
 from dataclasses import dataclass
 from typing import Any
@@ -295,12 +276,11 @@ class MyProgram:
     word_size: int | None = None
 ```
 
-### 平坦 VM 程序
+### Flat VM program
 
-有些 VM 没有函数表，整个文件就是一段平坦指令流。
+Some VMs do not have function tables, and the entire file is just a flat instruction stream.
 
-这时 frontend 应把整段程序包装成一个入口函数：
-
+At this time, frontend should wrap the entire program into an entry function:
 ```python
 main = MyFunction(
     name="main",
@@ -310,37 +290,35 @@ main = MyFunction(
     local_names=(),
 )
 ```
+Don't skip `VMFunctionSpec` just because there is no function table. Core's recovery entry is still a function.
 
-不要因为没有函数表就跳过 `VMFunctionSpec`。Core 的恢复入口仍然是函数。
+### Text VM with whitespace characters
 
-### 文本 VM 与空白字符
+Parsing of text VM must be consistent with the interpreter.
 
-文本 VM 的解析必须跟解释器保持一致。
+The decoder can skip whitespace if the interpreter allows whitespace separation. If the interpreter takes character-by-character instructions and treats unknown characters as an error, the decoder should also treat whitespace as an error.
 
-如果解释器允许空白分隔，decoder 可以跳过 whitespace。如果解释器逐字符取指并把未知字符视为错误，decoder 也应该把 whitespace 视为错误。
+Don't ignore characters loosely just to make the sample "easier to parse". Frontend's decoder is the format source of truth and should try to match the real VM.
 
-不要为了让样本“更容易解析”而宽松忽略字符。Frontend 的 decoder 是格式事实来源，应尽量匹配真实 VM。
+Decoder must be retained:
 
-Decoder 必须保留：
+- Original bytecode offset.
+- opcode name.
+- operand original value.
+- raw disassembled text.
+- Function boundaries.
+- Available locals, parameter names, constant names, and debug lines.
+- malformed input in wrong position.
 
-- 原始 bytecode offset。
-- opcode 名称。
-- operand 原始值。
-- raw 反汇编文本。
-- 函数边界。
-- 可用的 locals、参数名、常量名、debug line。
-- malformed 输入的错误位置。
+Error handling:
 
-错误处理：
+- The input is clearly not in this format: `can_load()` returns `False`.
+- Input formatted like this but corrupted: `decode()` throws `FrontendDecodeError`.
+- Unknown opcode: When the boundary can be determined, the instruction is still generated, and `UnknownOpcode` is used during lift; when the boundary cannot be determined, a decode error is thrown.
 
-- 输入明显不是该格式：`can_load()` 返回 `False`。
-- 输入像该格式但损坏：`decode()` 抛 `FrontendDecodeError`。
-- 未知 opcode：能确定边界时仍生成 instruction，并在 lift 时用 `UnknownOpcode`；不能确定边界时抛 decode error。
+## 6. SourceRef and offset units
 
-## 6. SourceRef 与 offset 单位
-
-每个可定位事实都应该带 `SourceRef`：
-
+Every locatable fact should have a `SourceRef`:
 ```python
 from unidecompiler.core.ir import SourceRef
 
@@ -351,44 +329,38 @@ source = SourceRef(
     detail=f"function={function.name}",
 )
 ```
+Field rules:
 
-字段规则：
+- `frontend`: must be equal to plugin id.
+- `offset`: the original VM instruction position, not the pseudocode line number, nor the instruction index.
+- `line`: VM debug/source line, if not, `None`.
+- `detail`: only put provenance, such as function name, section name, method signature.
 
-- `frontend`：必须等于 plugin id。
-- `offset`：原始 VM 指令位置，不是伪代码行号，也不是 instruction index。
-- `line`：VM debug/source line，没有就 `None`。
-- `detail`：只放 provenance，例如函数名、段名、方法签名。
+The unit of `offset` is determined by the VM format, but must use the same coordinate system as the branch target.
 
-`offset` 的单位由 VM 格式决定，但必须和 branch target 使用同一坐标系。
+Common choices:
 
-常见选择：
+- Binary bytecode: Use in-file byte offset.
+- Function bytecode in the container: Use the byte offset in the function code area, or the global byte offset, but it must be consistent throughout.
+- Text VM: Use the character positions actually used by the interpreter.
+- Unicode text VM: If the interpreter fetches by Unicode codepoint, use codepoint index; do not use UTF-8 byte offset.
 
-- 二进制 bytecode：使用文件内 byte offset。
-- 容器内函数 bytecode：使用函数 code 区内 byte offset，或全局 byte offset，但必须全程一致。
-- 文本 VM：使用解释器实际使用的字符位置。
-- Unicode 文本 VM：如果解释器按 Unicode codepoint 取指，就用 codepoint index；不要用 UTF-8 byte offset。
+If an instruction occupies multiple input units, `SourceRef.offset` should point to the location of the opcode, not the location of the operand. The branch target must also fall on the opcode offset.
 
-如果一条指令占多个输入单位，`SourceRef.offset` 应指向 opcode 的位置，不是 operand 的位置。Branch target 也必须落在 opcode offset 上。
-
-例如一个 Unicode 文本 VM：
-
+For example a Unicode text VM:
 ```text
 OP ARG
 ```
+If `OP ARG` occupies two Unicode codepoints, the instruction offset is the codepoint index of `OP`, and `ARG` is operand, which is not a legal jump target.
 
-如果 `OP ARG` 占两个 Unicode codepoints，指令 offset 是 `OP` 的 codepoint index，`ARG` 是 operand，不是合法跳转目标。
-
-验证 target 时应该检查：
-
+When validating target you should check:
 ```python
 valid_offsets = {instruction.offset for instruction in instructions}
 assert target in valid_offsets
 ```
+Don't put control flow decisions into `SourceRef.detail` or metadata. Control flow facts must use `VMHint`.
 
-不要把控制流决策放进 `SourceRef.detail` 或 metadata。控制流事实必须用 `VMHint`。
-
-推荐 module metadata：
-
+Recommended module metadata:
 ```python
 metadata={
     "filename": filename,
@@ -404,10 +376,9 @@ metadata={
 }
 ```
 
-## 7. VMOperand 与 VMDecodedInstruction
+## 7. VMOperand and VMDecodedInstruction
 
-`VMDecodedInstruction` 是 GUI/CLI 可展示的中立反汇编行，不执行语义。
-
+`VMDecodedInstruction` is a GUI/CLI displayable neutral disassembly line with no execution semantics.
 ```python
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
 
@@ -421,48 +392,46 @@ decoded = VMDecodedInstruction(
     raw=instruction.raw,
 )
 ```
+Commonly used `VMOperand.role`:
 
-常用 `VMOperand.role`：
-
-| role | 用途 |
+| role | purpose |
 |---|---|
-| `constant` | 常量索引或已解析常量 |
-| `local` | 局部变量槽位或名称 |
-| `global` | 全局变量标识 |
-| `register` | VM 寄存器 |
-| `target` | branch/switch 目标 offset |
-| `attribute` | 属性名 |
-| `member` | 成员/字段名 |
-| `immediate` | 数字、mode、宽度等立即数 |
-| `raw` | 无法归类但仍要展示的 operand |
+| `constant` | Constant index or resolved constant |
+| `local` | Local variable slot or name |
+| `global` | Global variable identifier |
+| `register` | VM register |
+| `target` | branch/switch target offset |
+| `attribute` | attribute name |
+| `member` | member/field name |
+| `immediate` | Number, mode, width and other immediate numbers |
+| `raw` | An operand that cannot be classified but still needs to be displayed |
 
-规则：
+Rules:
 
-- `value` 用稳定、可序列化的中立值。
-- `text` 用于展示。
-- 不要把 decoder 私有对象放进 operand。
-- branch target 使用 `role="target"`。
-- opcode 没有 operand 时传空 tuple。
+- `value` uses stable, serializable neutral values.
+- `text` is used for display.
+- Don't put decoder private objects into operand.
+- branch target uses `role="target"`.
+- Opcode passes empty tuple when there is no operand.
 
-## 8. Effect：描述栈和值行为
+## 8. Effect: Describe stack and value behavior
 
-Effect 是 core 能执行的最小 VM 语义。Frontend 选择 effect，不直接操作 `StackMachineState`。
+Effect is the minimum VM semantics that core can execute. Frontend selects the effect and does not directly operate `StackMachineState`.
 
-常用类别：
+Common categories:
 
-| 类别 | Effect 示例 | 用途 |
+| Category | Effect Example | Usage |
 |---|---|---|
-| 值/栈 | `Push`, `Pop`, `Copy`, `DuplicateTop`, `Swap`, `Unpack` | 栈形状和常量值 |
-| 局部变量 | `LoadLocal`, `StoreLocal`, `AssignValue`, `UpdateLocal`, `StoreMany` | locals |
-| 运算 | `Unary`, `Binary`, `Compare`, `Truthy`, `SelectValue` | 表达式和条件 |
-| 属性/索引 | `LoadAttr`, `StoreAttr`, `LoadItem`, `StoreItemEffect`, `LoadIndirect` | member/index |
-| 容器 | `BuildArray`, `BuildSet`, `BuildMap`, `BuildString` | aggregate |
-| 调用 | `Invoke`, `BuildCall`, `CallStackArgs` | 调用 |
-| 终止 | `ReturnTop`, `ReturnVoid`, `RaiseTop`, `YieldTop` | terminator |
-| 回退 | `UnknownOpcode` | 可诊断 unsupported |
+| Value/Stack | `Push`, `Pop`, `Copy`, `DuplicateTop`, `Swap`, `Unpack` | Stack shape and constant values |
+| Local variables | `LoadLocal`, `StoreLocal`, `AssignValue`, `UpdateLocal`, `StoreMany` | locals |
+| Operations | `Unary`, `Binary`, `Compare`, `Truthy`, `SelectValue` | Expressions and conditions |
+| Properties/index | `LoadAttr`, `StoreAttr`, `LoadItem`, `StoreItemEffect`, `LoadIndirect` | member/index |
+| Container | `BuildArray`, `BuildSet`, `BuildMap`, `BuildString` | aggregate |
+| Call | `Invoke`, `BuildCall`, `CallStackArgs` | Call |
+| Termination | `ReturnTop`, `ReturnVoid`, `RaiseTop`, `YieldTop` | terminator |
+| Fallback | `UnknownOpcode` | Diagnosable unsupported |
 
-Effect table 示例：
-
+Effect table example:
 ```python
 from unidecompiler.core.effects import Binary, LoadLocal, Push, ReturnTop, StoreLocal, UnknownOpcode
 from unidecompiler.core.ir import Const
@@ -493,84 +462,70 @@ MY_EFFECT_TABLE = VMEffectTable(
     ),
 )
 ```
+Unknown opcode Do not return empty tuple. Empty tuples are only suitable for clear and unsemantic noise opcodes, such as `nop`, padding, and line markers.
 
-未知 opcode 不要返回空 tuple。空 tuple 只适合明确无语义的 noise opcode，比如 `nop`、padding、line marker。
+### Opcode mapping table template
 
-### Opcode 映射表模板
+When writing a frontend for a new VM, fill out a form first and then write the code.
 
-给新 VM 写 frontend 时，先填一张表，再写代码。
-
-| VM opcode | operands | 栈输入 | 栈输出 | effect | hints | 测试 |
+| VM opcode | operands | stack input | stack output | effect | hints | test |
 |---|---|---|---|---|---|---|
-| `CONST` | const id | 无 | value | `Push(Const(...))` | 无 | 常量值正确 |
-| `LOAD_LOCAL` | slot | 无 | local | `LoadLocal` | 无 | local 名正确 |
-| `STORE_LOCAL` | slot | value | 无 | `StoreLocal` | 无 | 赋值目标正确 |
-| `ADD` | 无 | left, right | result | `Binary("+")` | 无 | 操作数顺序 |
-| `CALL` | argc | args | return(s) | `Invoke`/`CallStackArgs` | `call-shape` 可选 | 参数数量 |
-| `JUMP` | target 或栈值 | target 可选 | 无 | target 在栈上时 `Pop` | `branch-target`/`loop-backedge` | target 存在 |
-| `JUMP_IF_*` | target 或栈值 | condition/target | 无 | 通常不提前 pop | `branch-target`、`materialized-condition` | if/goto |
-| `RETURN` | 无 | value 可选 | 函数结束 | `ReturnTop`/`ReturnVoid` | 无 | terminator |
-| `NOP` | 无 | 无 | 无 | `()` | 可选 `noise` | 不产生语句 |
+| `CONST` | const id | None | value | `Push(Const(...))` | None | The constant value is correct |
+| `LOAD_LOCAL` | slot | None | local | `LoadLocal` | None | local name is correct |
+| `STORE_LOCAL` | slot | value | None | `StoreLocal` | None | The assignment target is correct |
+| `ADD` | None | left, right | result | `Binary("+")` | None | Operand order |
+| `CALL` | argc | args | return(s) | `Invoke`/`CallStackArgs` | `call-shape` optional | number of parameters |
+| `JUMP` | target or stack value | target optional | None | `Pop` if target is on stack | `branch-target`/`loop-backedge` | target exists |
+| `JUMP_IF_*` | target or stack value | condition/target | None | usually not pop in advance | `branch-target`, `materialized-condition` | if/goto |
+| `RETURN` | None | value optional | Function end | `ReturnTop`/`ReturnVoid` | None | terminator |
+| `NOP` | None | None | None | `()` | Optional `noise` | Produce no statement |
 
-这张表应由 VM 规范或解释器实现驱动，不由某个样本的反编译结果驱动。
+This table should be driven by the VM specification or interpreter implementation, not by the decompilation results of a certain sample.
 
-每行至少回答：
+Answer at least: for each line:
 
-- opcode 是否改变栈深度？
-- 操作数顺序是否和 core 默认一致？
-- 是否可能结束函数？
-- 是否产生控制流 target？
-- target 是 immediate、table entry、还是栈值？
-- 条件是否已经物化在栈上？
-- 是否需要 runtime call 名称表达副作用？
+- Does opcode change stack depth?
+- Is the order of operands consistent with core default?
+- Is it possible to end a function?
+- Whether to generate a control flow target?
+- Is the target immediate, table entry, or stack value?
+- Has the condition been materialized on the stack?
+- Are runtime call names needed to express side effects?
 
-## 9. 栈操作数顺序
+## 9. Stack operand order
 
-栈机 frontend 最容易错的是二元操作顺序。
+The most common error in the stack machine frontend is the binary operation sequence.
 
-Core 的栈约定：
-
+Core’s stack convention:
 ```text
-stack[-1] 是栈顶
-stack[0] 是当前可见栈片段的最底部
+stack[-1] is the top of the stack
+stack[0] is the bottom of the currently visible stack slice
 ```
-
-假设运行时语义是：
-
+Assume the runtime semantics are:
 ```text
 right = pop()
 left = pop()
 push(left OP right)
 ```
-
-那 effect 通常可以直接用：
-
+The effect can usually be used directly:
 ```python
 Binary(source=source, op="+")
 ```
-
-这时：
-
+At this time:
 ```text
 const 5; const 2; sub
 ```
-
-应该恢复为：
-
+It should be restored to:
 ```text
 5 - 2
 ```
-
-如果 VM 语义是“栈顶作为左操作数”：
-
+If the VM semantics are "top of stack as left operand":
 ```text
 left = pop()
 right = pop()
 push(left OP right)
 ```
-
-那对非交换操作必须先交换：
-
+The pair of non-swap operations must be swapped first:
 ```python
 from unidecompiler.core.effects import Binary, Swap
 
@@ -580,29 +535,23 @@ if opcode in {"SUB", "MOD", "LT"}:
         Binary(source=source, op=op, semantics="static"),
     )
 ```
-
-必须为这些 opcode 写小样例：
-
+Small examples must be written for these opcodes:
 ```text
 const 5; const 2; sub; print
 const 5; const 2; mod; print
 const 2; const 5; lt; print
 ```
-
-如果这个 VM 是“栈顶作为左操作数”，验证伪代码分别应类似：
-
+If this VM is "top of stack as left operand", the verification pseudocode should be similar to:
 ```text
 print(2 - 5)
 print(2 % 5)
 print(5 < 2)
 ```
+If you see `5 - 2`, `5 % 2`, `2 < 5`, it means you are modeling according to the default `left=below, right=top`. Both semantics are possible, and the target VM interpreter or format documentation must prevail.
 
-如果你看到 `5 - 2`、`5 % 2`、`2 < 5`，说明你按默认 `left=below, right=top` 建模了。两种语义都可能存在，必须以目标 VM 解释器或格式文档为准。
+## 10. Call, memory and VM runtime API
 
-## 10. 调用、内存和 VM runtime API
-
-如果 VM opcode 调用 runtime API，可以用 `CallStackArgs`：
-
+If the VM opcode calls the runtime API, `CallStackArgs` can be used:
 ```python
 from unidecompiler.core.effects import CallStackArgs
 
@@ -615,107 +564,91 @@ if opcode == "LOAD_BYTE":
 if opcode == "STORE_BYTE":
     return (CallStackArgs(source=source, callee_name="store_byte", arg_count=3, returns=0),)
 ```
-
-注意参数顺序要和 VM 运行时一致。比如如果 bytecode 栈上顺序是：
-
+Note that the parameter order must be consistent with the VM runtime. For example, if the order on the bytecode stack is:
 ```text
 const index
 const offset
 STORE
 ```
-
-而你希望输出：
-
+And you want to output:
 ```c
 store_byte(index, offset, value)
 ```
+You must use `Swap` or adjust the effect to ensure that the parameters seen by the core are in the correct order.
 
-就必须用 `Swap` 或调整 effect，保证 core 看到的参数顺序正确。
+Runtime call names should be stable, readable, and VM-neutral. Do not write the business semantics of a sample as a name like `validate_domain_rule()` unless the opcode of the VM itself has this meaning.
 
-运行时调用名应稳定、可读、VM-neutral。不要把某个样本的业务语义写成 `validate_domain_rule()` 这种名称，除非 VM 本身 opcode 就是这个含义。
+### Fixed parameter API
 
-### 固定参数 API
+If the opcode consumes a fixed number of stack arguments, use `CallStackArgs` first.
 
-如果 opcode 消费固定数量的栈参数，优先用 `CallStackArgs`。
-
-例如：
-
+For example:
 ```text
-READ    消费 buffer_index
-WRITE   消费 buffer_index
-LOAD    消费 index, offset，返回 byte
-STORE   消费 index, offset, value，不返回
+READ    consumes buffer_index
+WRITE   consumes buffer_index
+LOAD    consumes index, offset and returns a byte
+STORE   consumes index, offset, value and returns nothing
 ```
-
-对应可表示为：
-
+The correspondence can be expressed as:
 ```python
 CallStackArgs(source=source, callee_name="read_buffer", arg_count=1, returns=0)
 CallStackArgs(source=source, callee_name="write_buffer", arg_count=1, returns=0)
 CallStackArgs(source=source, callee_name="load_byte", arg_count=2, returns=1)
 CallStackArgs(source=source, callee_name="store_byte", arg_count=3, returns=0)
 ```
+If the parameter order does not match, first use the existing stack effect to adjust, such as `Swap`. If the existing effect cannot express the rearrangement losslessly, you should consider adding a new VM-neutral effect, or conservatively downgrade it to partial/unsupported.
 
-如果参数顺序不匹配，先用已有 stack effect 调整，例如 `Swap`。如果现有 effect 不能无损表达该重排，应考虑新增 VM-neutral effect，或保守降级为 partial/unsupported。
+Don't cover up ordering errors by changing function names.
 
-不要通过改函数名来掩盖顺序错误。
+### Dynamic parameter API
 
-### 动态参数 API
+The consumption quantity of some opcodes is not a fixed value. For example `PRINT_UNTIL_ZERO` may keep popping until 0 sentinel is encountered.
 
-有些 opcode 消费数量不是固定值。例如 `PRINT_UNTIL_ZERO` 可能持续 pop，直到遇到 0 sentinel。
+If core does not yet have a corresponding VM-neutral effect, the recommended order is:
 
-如果 core 还没有对应的 VM-neutral effect，推荐顺序是：
+1. If the opcode does not affect subsequent stack merge, it can be expressed with a conservative runtime call name, such as `puts_until_zero(...)`.
+2. If it will affect the subsequent stack state, return `effects=None` or `UnknownOpcode` and let core give partial/unsupported.
+3. If this is a mode that multiple VMs will encounter, the VM-neutral effect should be added and supported by core.
 
-1. 如果该 opcode 不影响后续 stack merge，可用保守 runtime call 名称表达，例如 `puts_until_zero(...)`。
-2. 如果会影响后续栈状态，返回 `effects=None` 或 `UnknownOpcode`，让 core 给出 partial/unsupported。
-3. 如果这是多 VM 都会遇到的模式，应新增 VM-neutral effect，再由 core 支持。
+Don't manually pop the stack to sentinel in the frontend and spell the string. That's a special case interpretation of runtime data, not a thin IR fact.
 
-不要在 frontend 里手动弹栈到 sentinel 并拼字符串。那是对运行时数据的特例解释，不是 thin IR fact。
+### Implicit return and implicit status
 
-### 隐式返回和隐式状态
+Some opcodes modify the VM internal state but do not push the results back onto the stack.
 
-有些 opcode 修改 VM 内部状态，但不把结果压回栈。
-
-例如 allocator：
-
+For example allocator:
 ```text
 ALLOC_BUFFER size
 ```
-
-如果 VM 运行时把新 buffer 放进第一个空槽，但 opcode 不返回槽位，那么可以先表达成：
-
+If the VM puts the new buffer into the first empty slot when running, but the opcode does not return the slot, then it can be expressed as:
 ```python
 CallStackArgs(source=source, callee_name="alloc", arg_count=1, returns=0)
 ```
+This preserves the side effect call but doesn't pretend to know the return value.
 
-这保留了副作用调用，但不会假装知道返回值。
+If subsequent analysis must know "which slot is allocated", this is beyond the expressive capabilities of ordinary runtime calls. Consider adding VM-neutral memory/allocation fact, or accepting partial/low-level output.
 
-如果后续分析必须知道“分配到了哪个槽”，这已经超出普通 runtime call 的表达能力。应考虑新增 VM-neutral memory/allocation fact，或接受 partial/低层输出。
+## 11. General principles of control flow
 
-## 11. 控制流总原则
+Control flow recovery relies on three types of information:
 
-控制流恢复依赖三类信息：
+1. Opcode classification: Is this a jump, conditional jump, return, noise or normal instruction.
+2. Target hint: What is the offset of the jump target.
+3. Conditional stack status: whether core can get the conditional expression when generating `Branch`.
 
-1. opcode 分类：这是 jump、conditional jump、return、noise 还是普通指令。
-2. target hint：跳转目标 offset 是多少。
-3. 条件栈状态：core 在生成 `Branch` 时能否拿到条件表达式。
+Frontend does not construct a CFG, but must submit all three types of facts.
 
-Frontend 不构造 CFG，但必须把这三类事实提交完整。
-
-最低合格结果：
-
+Minimum qualifying results:
 ```text
-简单控制流 -> core 输出 if/while/switch
-复杂控制流 -> core 输出低层 if/goto CFG
-无法安全恢复 -> explicit partial/unsupported + raw context
+simple control flow -> core emits if/while/switch
+complex control flow -> core emits a low-level if/goto CFG
+cannot recover safely -> explicit partial/unsupported + raw context
 ```
+At worst, complex control flows should not be linearized silently. Linearization can mislead analysis.
 
-最坏情况也不应该 silently 线性化复杂控制流。线性化会误导分析。
+## 12. VMHint: branch, loop, switch, exception
 
-## 12. VMHint：branch、loop、switch、exception
-
-`VMHint` 只提交事实：
-
+`VMHint` only submits facts:
 ```python
 from unidecompiler.core.vm_hints import VMHint
 
@@ -725,9 +658,7 @@ VMHint(kind="case-target", source=source, target=case_offset, value=case_value)
 VMHint(kind="default-target", source=source, target=default_offset)
 VMHint(kind="exception-region", source=source, value={"start": start, "end": end, "target": handler})
 ```
-
-合法 kind：
-
+Legal kind:
 ```text
 block-boundary
 branch-target
@@ -743,20 +674,17 @@ call-shape
 aggregate-shape
 ```
 
-### branch-target 与 loop-backedge
+### branch-target and loop-backedge
 
-通常规则：
-
+General rules:
 ```python
 kind = "loop-backedge" if target <= instruction.offset else "branch-target"
 ```
+Use `loop-backedge` for the backward edge and `branch-target` for the forward edge. This does not construct a while, it just tells the core that this edge is backward control flow.
 
-后向边用 `loop-backedge`，前向边用 `branch-target`。这不会构造 while，只是告诉 core 这条边是后向控制流事实。
+### Conditional polarity
 
-### 条件极性
-
-`detail` 可以说明 target 是 true 边还是 false 边：
-
+`detail` can indicate whether target is a true edge or a false edge:
 ```python
 VMHint(
     kind="branch-target",
@@ -766,25 +694,19 @@ VMHint(
     detail="target-if-true",
 )
 ```
-
-如果 `branch_condition()` 返回“跳转目标被采用时为真”的表达式，必须用：
-
+If `branch_condition()` returns an expression that is true when the jump target is taken, you must use:
 ```text
 detail="target-if-true"
 ```
-
-如果 `branch_condition()` 返回“fallthrough 时为真”的表达式，可以使用默认极性，或明确写：
-
+If `branch_condition()` returns an expression that is true on fallthrough, you can use the default polarity, or write explicitly:
 ```text
 detail="target-if-false"
 ```
-
-极性错了，伪代码里的 `if` 分支会反，失败路径和成功路径可能被读反。
+If the polarity is wrong, the `if` branch in the pseudocode will be reversed, and the failure path and success path may be read reversely.
 
 ### materialized-condition
 
-如果 VM 的条件是先在栈上算出来，然后由 `jz/jnz` 消费，例如：
-
+If the VM condition is calculated on the stack first and then consumed by `jz/jnz`, for example:
 ```text
 LOAD x
 CONST 0
@@ -792,23 +714,19 @@ EQ
 CONST target
 JUMP_IF_TRUE
 ```
-
-应该给 `JUMP_IF_TRUE` 同时提交：
-
+Should be given `JUMP_IF_TRUE` while submitting:
 ```python
 VMHint(kind="materialized-condition", source=source, detail="stack", flow="conditional")
 ```
+The meaning of this hint is: the condition has been materialized as a stack value, and the core should resume control flow according to the stack condition.
 
-这个 hint 的含义是：条件已经作为栈值物化，core 应按 stack condition 恢复控制流。
+Without this hint, core may treat conditional calculations as ordinary linear expressions, and complex functions may not see `if/goto` in the end.
 
-没有这个 hint 时，core 可能把条件计算当普通线性表达式，复杂函数可能最终看不到 `if/goto`。
+## 13. Correct way to write conditional jump
 
-## 13. 条件跳转的正确写法
+This is the most important part of the stack machine frontend.
 
-这是栈机 frontend 最重要的部分。
-
-先确认 target 从哪里来。Immediate target 和 stack target 的写法不同。
-
+First confirm where the target comes from. Immediate target and stack target are written differently.
 ```text
 # immediate target
 ... condition
@@ -818,62 +736,48 @@ JUMP_IF_TRUE target
 ... condition target
 JUMP_IF_TRUE
 ```
+If target is immediate, branch usually only consumes condition from the stack. If the target is on the stack, the branch usually consumes both condition and target.
 
-如果 target 是 immediate，branch 通常只从栈上消费 condition。如果 target 在栈上，branch 通常同时消费 condition 和 target。
+`branch_condition(branch, stack)` receives the stack fragment that will be consumed by branch, not the complete VM stack.
 
-`branch_condition(branch, stack)` 收到的是即将被 branch 消费的栈片段，不是完整 VM 栈。
-
-约定：
-
+Agreement:
 ```text
-stack[-1] 是该片段的栈顶
-stack[0] 是该片段中最早压入的值
+stack[-1] is the top of this slice
+stack[0] is the earliest value pushed in this slice
 ```
-
-如果运行时布局是：
-
+If the runtime layout is:
 ```text
 ... condition target
 JUMP_IF_TRUE
 ```
-
-且 `branch_stack_width()` 返回 `2`，那么 callback 收到：
-
+and `branch_stack_width()` returns `2`, then callback receives:
 ```text
 stack == (condition, target)
 stack[0] == condition
 stack[-1] == target
 ```
-
-如果运行时布局是：
-
+If the runtime layout is:
 ```text
 ... target condition
 JUMP_IF_TRUE
 ```
-
-那么 callback 收到：
-
+Then callback receives:
 ```text
 stack == (target, condition)
 stack[0] == target
 stack[-1] == condition
 ```
+Therefore documentation examples cannot be mechanically reproduced. You must first write down the branch stack layout of the target VM, and then decide whether to take the condition from `stack[0]` or `stack[-1]`.
 
-所以文档示例不能机械复制。必须先写清楚目标 VM 的 branch 栈布局，再决定从 `stack[0]` 还是 `stack[-1]` 取 condition。
+### immediate target template
 
-### immediate target 模板
-
-如果运行时语义是：
-
+If the runtime semantics are:
 ```text
 condition = pop()
 if condition != 0:
     pc = instruction.target
 ```
-
-control effects 通常不需要弹栈。Core 会根据 `branch_stack_width` 在控制流边上消费 condition。
-
+Control effects usually don't require stack popping. Core will consume condition on the edge of the control flow according to `branch_stack_width`.
 ```python
 from unidecompiler.core.ir import BinaryOp, Const
 
@@ -906,26 +810,23 @@ def branch_condition(branch, stack):
     return None
 ```
 
-### stack target 模板
+### stack target template
 
-如果运行时语义是：
-
+If the runtime semantics are:
 ```text
 target = pop()
 condition = pop()
 if condition != 0:
     pc = target
 ```
+Unconditional jump can pop the target on the top of the stack during the effect phase; conditional jump should not pop the condition/target in advance during the effect phase.
 
-无条件 jump 可以在 effect 阶段弹掉栈顶 target；条件 jump 不要在 effect 阶段提前弹 condition/target。
+The responsibilities here should be distinguished:
 
-这里的职责要分清：
-
-- `Pop` 是线性 lift 阶段对 VM stack 的语义建模。
-- `branch_stack_width` 是 stateful control recovery 在分支边上需要从当前 stack state 取出/移除多少个控制值。
-- immediate target jump 不消费栈上 target，所以两者通常都不为 target 额外消费栈值。
-- stack target jump 的 target 本来就在栈上，所以必须明确由哪一层消费，不能既在普通 effect 里消费，又在同一条路径里重复消费。
-
+- `Pop` is a semantic modeling of VM stack in linear lift stage.
+- `branch_stack_width` is how many control values need to be fetched/removed from the current stack state on the branch edge for stateful control recovery.
+- Immediate target jump does not consume the target on the stack, so both of them usually do not consume additional stack values for the target.
+- The target of stack target jump is originally on the stack, so it must be clear which layer it is consumed from. It cannot be consumed in a normal effect and consumed repeatedly in the same path.
 ```python
 from unidecompiler.core.effects import Pop
 from unidecompiler.core.ir import BinaryOp, Const
@@ -936,11 +837,11 @@ CONTROL = frozenset({"JUMP", "JUMP_IF_TRUE", "JUMP_IF_FALSE"})
 
 def effects_for_control(instruction, source):
     if instruction.opcode == "JUMP":
-        # 仅适用于 target 位于栈顶的无条件跳转。
+        # Only applies to an unconditional jump with target at the stack top.
         return (Pop(source=source),)
     if instruction.opcode in {"JUMP_IF_TRUE", "JUMP_IF_FALSE"}:
-        # 不在 effect 阶段 pop 条件/目标。
-        # branch_stack_width 会告诉 core 分支消费几个栈值。
+        # Do not pop the condition/target during the effect phase.
+        # branch_stack_width tells core how many stack values the branch consumes.
         return ()
 
 
@@ -958,8 +859,8 @@ def branch_stack_width(instruction):
 def branch_condition(branch, stack):
     if len(stack) < 2:
         return None
-    # 本模板假设运行时布局是: ... condition target
-    # 因此 branch_stack_width=2 时，stack == (condition, target)。
+    # This template assumes the runtime layout is: ... condition target
+    # Therefore, with branch_stack_width=2, stack == (condition, target).
     condition = stack[0]
     if branch.opcode == "JUMP_IF_TRUE":
         return BinaryOp(source=condition.source, op="!=", left=condition, right=Const(value=0, source=condition.source))
@@ -967,11 +868,9 @@ def branch_condition(branch, stack):
         return BinaryOp(source=condition.source, op="==", left=condition, right=Const(value=0, source=condition.source))
     return None
 ```
+Note that what is returned here is target-taken condition. Even if the opcode is named `JUMP_IF_FALSE`, as long as `condition == 0` is returned, it means "jump to target if expression is true".
 
-注意这里返回的是 target-taken condition。即使 opcode 名叫 `JUMP_IF_FALSE`，只要返回 `condition == 0`，它就表示“表达式为真时跳到 target”。
-
-把 callback 接到 core：
-
+Connect callback to core:
 ```python
 
 stateful_callbacks=VMStatefulCallbacks(
@@ -981,9 +880,7 @@ stateful_callbacks=VMStatefulCallbacks(
     branch_stack_width=branch_stack_width,
 )
 ```
-
-并在 step 上提交：
-
+And submit on step:
 ```python
 hints = (
     VMHint(
@@ -1003,37 +900,33 @@ hints = (
     ),
 )
 ```
-
-这个模式会让 core 至少能生成低层 CFG：
-
+This mode will enable core to generate at least low-level CFG:
 ```c
 if (condition) goto block_target else goto block_fallthrough
 ```
+If the function structure is simple, core may further revert to `if` or `while`. If the structure is complex, conservative `if/goto` is the correct output.
 
-如果函数结构简单，core 可能进一步恢复为 `if` 或 `while`。如果结构复杂，保守的 `if/goto` 是正确输出。
+### Conditional jump checklist
 
-### 条件跳转检查清单
+Each conditional jump opcode needs to answer:
 
-每个条件跳转 opcode 都要回答：
+- Is target immediate or stack value?
+- Is condition an immediate mode/marker, or a stack value?
+- How many stack values does the runtime consume?
+- Is `branch_stack_width` equal to the number of core values that need to be removed?
+- Is `branch_condition()` using the correct stack location?
+- Does `branch_condition()` return the target establishment condition or the fallthrough establishment condition?
+- Is `detail="target-if-true"` or `detail="target-if-false"` required?
+- Is the condition already materialized on the stack? Is `materialized-condition` required?
+- Is `loop-backedge` used for backward target?
 
-- target 是 immediate，还是栈值？
-- condition 是 immediate mode/marker，还是栈值？
-- runtime 消费几个栈值？
-- `branch_stack_width` 是否等于 core 需要移除的值数？
-- `branch_condition()` 使用的是正确的栈位置吗？
-- `branch_condition()` 返回的是 target 成立条件，还是 fallthrough 成立条件？
-- 是否需要 `detail="target-if-true"` 或 `detail="target-if-false"`？
-- 条件是否已经物化在栈上，是否需要 `materialized-condition`？
-- 后向 target 是否用 `loop-backedge`？
+If any of these items are unclear, first write a minimum control flow sample to verify, rather than going directly to a real large sample.
 
-如果其中任一项不清楚，先写最小控制流样例验证，不要直接上真实大样本。
+## 14. Calculate static jump target
 
-## 14. 计算静态跳转目标
+Some VM jump targets are immediate operands, and some are constants calculated on the stack or in registers. Different resolvers are used for different sources.
 
-有些 VM 的跳转目标是 immediate operand，有些是栈上或寄存器里算出的常量。不同来源用不同 resolver。
-
-Immediate absolute target：
-
+Immediate absolute target:
 ```python
 CONTROL_WITH_IMMEDIATE_TARGET = frozenset({"JUMP", "JUMP_IF_TRUE", "JUMP_IF_FALSE"})
 
@@ -1068,11 +961,9 @@ def immediate_relative_targets(function) -> dict[int, int]:
             targets[ins.offset] = target
     return targets
 ```
+Stack target requires constant propagation.
 
-Stack target 需要常量传播。
-
-例如：
-
+For example:
 ```text
 CONST 7
 CONST 10
@@ -1081,11 +972,9 @@ CONST 5
 ADD
 JUMP
 ```
+The target is `75`. Frontend can propagate local constants and restore target hints.
 
-目标是 `75`。Frontend 可以做局部常量传播，恢复 target hint。
-
-stack-target VM 的保守 resolver 示例：
-
+Conservative resolver example for stack-target VM:
 ```python
 def const_binary(opcode: str, left: int | None, right: int | None) -> int | None:
     if left is None or right is None:
@@ -1154,18 +1043,16 @@ def static_branch_targets(function) -> dict[int, int]:
 
     return targets
 ```
+Rules:
 
-规则：
+- Only submit targets that can be determined and fall at the real instruction offset.
+- Don't guess if you can't figure it out.
+- Invalid targets should be exposed as diagnostics or unsupported context.
+- target is the original bytecode offset, not the instruction index.
 
-- 只提交能确定且落在真实 instruction offset 上的 target。
-- 算不出来就不要猜。
-- 无效 target 应作为 diagnostics 或 unsupported context 暴露。
-- target 是原始 bytecode offset，不是 instruction index。
+## 15. Opcode classification and region profile
 
-## 15. Opcode 分类与 region profile
-
-需要控制流恢复时，提交 `VMRegionOpcodeClasses`：
-
+When control flow restoration is required, submit `VMRegionOpcodeClasses`:
 ```python
 from unidecompiler.core.vm_region import VMRegionOpcodeClasses, build_hint_region_profile
 
@@ -1185,17 +1072,15 @@ profile = build_hint_region_profile(
     raw_window=lambda index: raw_window(instructions, index),
 )
 ```
+If the same opcode may jump forward or backward, it can be listed in both `forward_jumps` and `backward_jumps`. The specific direction is determined by hint target and source offset.
 
-如果同一个 opcode 既可能前跳也可能后跳，可以同时列在 `forward_jumps` 和 `backward_jumps`，具体方向由 hint target 与 source offset 决定。
+`noise` only contains truly semantic-free instructions. Don't put opcodes that failed to parse into noise.
 
-`noise` 只放真正无语义指令。不要把失败解析的 opcode 放进 noise。
+## 16. lift_linear and stateful callbacks
 
-## 16. lift_linear 与 stateful callbacks
+Complex control flows require `stateful_callbacks`.
 
-复杂控制流需要 `stateful_callbacks`。
-
-模板：
-
+template:
 ```python
 from unidecompiler.core.vm_function import lift_steps
 from unidecompiler.core.vm_region import VMLinearState, VMStatefulCallbacks
@@ -1228,24 +1113,22 @@ def make_stateful_callbacks(program, function):
         branch_stack_width=branch_stack_width,
     )
 ```
+`lift_linear` only interprets the linear instruction slice of `[start, end)`. It cannot structure control flow.
 
-`lift_linear` 只解释 `[start, end)` 的线性指令 slice。它不能结构化控制流。
+Note:
 
-注意：
+- `start/end` is the index of the current function instruction tuple, not the byte offset.
+- `locals_` and `stack` are the current status passed in by core.
+- Pass them to `lift_steps()`.
+- `result.stopped_at` is the step object in the slice; when returning `VMLinearState.stopped_at` it must be converted to the global instruction index.
+- Don't merge basic blocks yourself.
+- Do not write special logic based on specific offsets.
 
-- `start/end` 是当前函数 instruction tuple 的 index，不是 byte offset。
-- `locals_` 和 `stack` 是 core 传入的当前状态。
-- 要把它们传给 `lift_steps()`。
-- `result.stopped_at` 是 slice 内的 step 对象；返回 `VMLinearState.stopped_at` 时要换算成全局 instruction index。
-- 不要自己合并 basic block。
-- 不要根据特定 offset 写特殊逻辑。
+## 17. make_step complete template
 
-## 17. make_step 完整模板
+The following template takes the immediate target VM as an example. In other words: the jump target is in instruction operand, not on the operand stack.
 
-下面模板以 immediate target VM 为例。也就是说：跳转目标在 instruction operand 中，不在 operand stack 上。
-
-如果你的 VM 是 stack target，仍然保留原始 decoded operands；只把常量传播恢复出的 target 用于 `VMHint.target`，不要用它替换原始 operands。
-
+If your VM is a stack target, still keep the original decoded operands; only use the target recovered by constant propagation to `VMHint.target`, do not use it to replace the original operands.
 ```python
 from unidecompiler.core.vm_bytecode import VMBytecodeStep
 from unidecompiler.core.vm_hints import VMHint
@@ -1259,8 +1142,8 @@ STACK_MATERIALIZED_CONDITION = frozenset({"JUMP_IF_TRUE", "JUMP_IF_FALSE"})
 
 
 def operand_for(instruction, index: int, value: object) -> VMOperand:
-    # 真实 frontend 应按 opcode 语义逐个分类 operand。
-    # 不能因为 opcode 是 control，就把所有 operand 都标成 target。
+    # A real frontend should classify operands individually according to opcode semantics.
+    # Do not mark every operand as a target merely because the opcode is control-flow.
     if instruction.opcode in CONTROL and index == 0:
         return VMOperand(role="target", value=int(value), text=f"{int(value):#x}")
     if instruction.opcode == "LOAD_LOCAL":
@@ -1334,15 +1217,13 @@ def make_step(program, instruction, targets: dict[int, int] | None = None) -> VM
         hints=control_hints(instruction, source, targets),
     )
 ```
+If the condition comes from a register or immediate, rather than an expression whose preceding opcode has been pushed onto the stack, remove that opcode from `STACK_MATERIALIZED_CONDITION`.
 
-如果条件来自寄存器或 immediate，而不是前序 opcode 已经压到栈上的表达式，把该 opcode 从 `STACK_MATERIALIZED_CONDITION` 移除。
+The `branch` received by `branch_condition()` is `VMBytecodeStep`. If you need to read the decoded operand, you should pass `branch.decoded.operands`, or look up the original instruction in the frontend private instruction to step mapping. Don't assume that `VMBytecodeStep` comes with the `operands` field.
 
-`branch_condition()` 接收到的 `branch` 是 `VMBytecodeStep`。如果需要读取 decoded operand，应通过 `branch.decoded.operands`，或在 frontend 私有 instruction 到 step 的映射中查回原始 instruction。不要假设 `VMBytecodeStep` 自带 `operands` 字段。
+## 18. lift_function complete template
 
-## 18. lift_function 完整模板
-
-下面延续第 17 节的 immediate target 模板。若 target 需要常量传播，把 `immediate_absolute_targets(function)` 换成自己的 resolver，但 `targets` 的类型仍应是 `{branch_instruction_offset: target_offset}`。
-
+The immediate target template from Section 17 continues below. If target requires constant propagation, replace `immediate_absolute_targets(function)` with your own resolver, but the type of `targets` should still be `{branch_instruction_offset: target_offset}`.
 ```python
 from unidecompiler.core.vm_function import VMFunctionSpec, lift_vm_step_function, recover_vm_function
 
@@ -1377,13 +1258,11 @@ def lift_function(function, program):
         raw=tuple(ins.raw for ins in function.instructions),
     )
 ```
-
-`recover_vm_function()` 会把意外异常转成可诊断的 unsupported。开发时仍应把 supported path 的 unsupported 修到零。
+`recover_vm_function()` will convert unexpected exceptions into diagnosable unsupported. During development, the unsupported value of the supported path should still be revised to zero.
 
 ## 19. Module assembly
 
-模块组装用 `assemble_vm_module()`：
-
+Module assembly uses `assemble_vm_module()`:
 ```python
 from unidecompiler.core.vm_module import assemble_vm_module
 
@@ -1396,14 +1275,13 @@ def lift_program(program, metadata):
         functions=tuple(lift_function(function, program) for function in program.functions),
     )
 ```
+Do not call `assemble_module()`, `assemble_function()` or construct `FunctionIR` directly from the frontend.
 
-不要从 frontend 直接调用 `assemble_module()`、`assemble_function()` 或构造 `FunctionIR`。
+## 20. GUI display and bytecode_instructions
 
-## 20. GUI 展示与 bytecode_instructions
+`lift_vm_step_function()` will project the step into the `bytecode_instructions` of the function metadata, and the GUI uses these lines to display the disassembly and control edges.
 
-`lift_vm_step_function()` 会把 step 投影到 function metadata 的 `bytecode_instructions`，GUI 使用这些行展示反汇编和控制边。
-
-每条展示行应有：
+Each display line should:
 
 - `offset`
 - `opcode`
@@ -1412,58 +1290,55 @@ def lift_program(program, metadata):
 - `source`
 - `control`
 
-如果 GUI 控制流视图崩溃，先检查：
+If the GUI control flow view crashes, first check:
 
-- 是否有 target 不存在。
-- 是否把 instruction index 当 byte offset。
-- 是否出现 source/target 同 basic block 的自环展示边。
-- 是否同一条条件跳转提交了多个互相矛盾的 target。
+- Whether any target does not exist.
+- Whether to treat instruction index as byte offset.
+- Whether there is a self-loop display edge between source/target and basic block.
+- Whether multiple conflicting targets are submitted for the same conditional jump.
 
-如果 core 内部 CFG 是正确的，但 GUI 展示元数据里有同块自环，可以只过滤展示 metadata 中的那条 control hint。不要改 core CFG，也不要丢掉真实恢复所需的 hint。
+If the core's internal CFG is correct, but there is a self-loop of the same block in the GUI display metadata, you can filter and display only the control hint in the metadata. Don't change the core CFG, and don't lose hints required for real recovery.
 
-## 20.1 可选的模拟执行支持
+## 20.1 Optional simulation support
 
-模拟执行不是 frontend 的必选职责。一个 frontend 即使只能反编译、不能
-模拟，也是合法的。只有当该 VM 的函数边界、调用约定和必要运行时事实
-足够明确时，才应声明支持模拟。
+Simulating execution is not a required responsibility of the frontend. Even if a frontend can only decompile, it cannot
+Simulation is also legal. Only if the VM's function boundaries, calling conventions, and necessary runtime facts
+Support for mocking should only be declared when it is sufficiently explicit.
 
-模拟器与 frontend 的依赖方向必须保持严格解耦：
-
+The dependency direction of the simulator and frontend must remain strictly decoupled:
 ```text
 frontend -> core generic IR <- unidecompiler-simulator <- CLI / GUI / host
 ```
+This means:
 
-这意味着：
+- core cannot import simulator, nor can it know the type or life cycle of simulator.
+- The simulator can only execute `ModuleIR`, `FunctionIR` and other public generic IR produced by core.
+- The simulator does not execute frontend bytecode, does not read the decoder private model, and does not interpret VM opcode.
+  Does not execute `Effect` or `VMBytecodeStep` directly.
+- The simulator has its own frames, calls, control flow, exceptions, step limits, cancellation and trace.
+- The frontend must not add a language interpreter, opcode switch, or VM stack to support simulation.
+  executor or dedicated control flow restorer.
+- CLI, GUI and other hosts only call the simulator public API and do not copy the frontend functions
+  Find or execute logic.
 
-- core 不能 import simulator，也不能知道 simulator 的类型或生命周期。
-- simulator 只能执行 core 产出的 `ModuleIR`、`FunctionIR` 和其它公开 generic IR。
-- simulator 不执行 frontend bytecode，不读取 decoder 私有模型，不解释 VM opcode，
-  不直接执行 `Effect` 或 `VMBytecodeStep`。
-- simulator 自己拥有 frame、调用、控制流、异常、步数限制、取消和 trace。
-- frontend 不得因为支持模拟而新增一个语言解释器、opcode switch、VM stack
-  executor 或专用控制流恢复器。
-- CLI、GUI 和其它 host 只调用 simulator public API，不复制 frontend 的函数
-  查找或执行逻辑。
+### 20.1.1 When should simulation be supported?
 
-### 20.1.1 什么时候应该支持模拟
+It is recommended to support when the following conditions are met at the same time:
 
-建议在以下条件同时满足时支持：
+1. The decoder can stably identify function boundaries, or can package flat programs into stable entry functions.
+2. `lift()` can generate a semantically correct generic IR for the target function.
+3. The parameter sources, return values, calling conventions and local variable scopes are clear enough.
+4. The target function query can be represented by stable and serializable data.
+5. Language-specific member access, closures, indirect calls, or container behavior can be accessed through a narrow runtime
+   Fact expressions without the need for a frontend to execute instructions.
+6. Can write repeatable tests for completions, exceptions, unsupported operations, and external calls.
 
-1. decoder 能稳定识别函数边界，或能把平坦程序包装成稳定的入口函数。
-2. `lift()` 能为目标函数生成语义正确的 generic IR。
-3. 参数来源、返回值、调用约定和局部变量作用域足够明确。
-4. 目标函数查询可以用稳定、可序列化的数据表示。
-5. 语言特有的成员访问、闭包、间接调用或容器行为能够通过窄的运行时
-   事实表达，而不需要 frontend 执行指令。
-6. 可以为完成、异常、未支持操作和外部调用编写可重复的测试。
+If these conditions are not met, do not declare support for impersonation just to have a Run button appear in the GUI.
+Preserve decompilation capabilities and have the simulator explicitly report that this frontend does not support simulation.
 
-如果这些条件不满足，不要为了让 GUI 出现一个 Run 按钮而声明支持模拟。
-保留反编译能力，并让 simulator 明确报告该 frontend 不支持 simulation。
+### 20.1.2 Responsibilities of simulation adapter
 
-### 20.1.2 simulation adapter 的职责
-
-frontend 可以通过 plugin 的可选 `simulation_adapter` 属性提供 adapter：
-
+The frontend can provide an adapter via the optional `simulation_adapter` attribute of the plugin:
 ```python
 class MyVmFrontendPlugin:
     id = "my-vm"
@@ -1471,9 +1346,7 @@ class MyVmFrontendPlugin:
     supported_inputs = (".mvm",)
     simulation_adapter = MyVmSimulationAdapter
 ```
-
-最小 adapter 形状如下：
-
+The minimum adapter shape is as follows:
 ```python
 from unidecompiler_simulator import (
     NotHandled,
@@ -1495,7 +1368,7 @@ class MyVmSimulationAdapter:
             if function.name == query
         )
         if len(matches) != 1:
-            # 0 个或多个匹配都不能猜测。
+            # Do not guess when there are zero or multiple matches.
             return NotHandled
         return ResolvedFunction(matches[0], identifier=query)
 
@@ -1516,72 +1389,66 @@ class MyVmSimulationAdapter:
             yield function
             yield from MyVmSimulationAdapter._walk(function.nested_functions)
 ```
+The return value of `resolve_function()` must be in the current lifted module
+`FunctionIR`. A function cannot be re-created, the decoder private function object cannot be returned, and the
+Return Python callable. The simulator will verify the function ownership again.
 
-`resolve_function()` 的返回值必须是当前 lifted module 中的
-`FunctionIR`。不能重新创建一个函数，不能返回 decoder 私有函数对象，不能
-返回 Python callable。simulator 会再次验证函数归属关系。
+The query of `list_simulation_targets()` is frontend-owned opaque data. GUI and
+The CLI can save, display, and pass it, but it cannot parse it. query must be data that can be transmitted safely,
+Cannot be a function, bound method, interpreter object, frame, or object containing execution behavior.
 
-`list_simulation_targets()` 的 query 是 frontend-owned opaque data。GUI 和
-CLI 可以保存、显示和传递它，但不能解析它。query 必须是可安全传输的数据，
-不能是函数、bound method、解释器对象、frame 或包含执行行为的对象。
-
-如果函数名存在重载、匿名函数或多个闭包实例，frontend 必须选择一种稳定
-且无歧义的 query，例如：
-
+If there are overloads, anonymous functions or multiple closure instances of the function name, frontend must choose a stable
+and unambiguous query, for example:
 ```text
 Lua:     module.submodule.function
 JVM:     Class.method(descriptor)
 .NET:    Namespace.Type.Method(signature)
-WASM:    export name 或 $funcN
-Python:  唯一函数名或稳定的 nested-function 标识
+WASM:    export name or $funcN
+Python:  unique function name or stable nested-function identifier
 ```
+Do not write name resolution rules for these languages in the simulator, GUI, or CLI.
 
-不要在 simulator、GUI 或 CLI 中写这些语言的名称解析规则。
+### 20.1.3 What runtime facts can the adapter provide?
 
-### 20.1.3 adapter 可以提供哪些运行时事实
+The adapter can implement narrow operations detected by the simulator and is used to express the problems that the generic IR cannot directly
+Express language facts without requiring execution of the VM. Common operations include:
 
-adapter 可以实现 simulator 探测的窄操作，用于表达 generic IR 无法直接
-表达、但又不需要执行 VM 的语言事实。常见操作包括：
-
-| 操作 | 用途 |
+| Operation | Purpose |
 |---|---|
-| `resolve_global` | 将 frontend 语义中的全局名称解析为 `ResolvedFunction` 或 `IntrinsicCall` |
-| `resolve_call` | 解析数据化的动态调用请求 |
-| `resolve_indirect_call` | 解析受控的间接调用目标 |
-| `truthy` | 提供语言定义的真假值规则 |
-| `binary_op` | 提供语言特有的二元运算 |
-| `unary_op` | 提供语言特有的一元运算 |
-| `get_attr` / `set_attr` | 提供语言特有的成员访问 |
-| `get_item` / `set_item` | 提供语言特有的索引或表访问 |
-| `iterate` | 提供语言特有的可迭代值视图 |
-| `set_captured` | 在闭包捕获变量赋值需要时提供数据化更新 |
+| `resolve_global` | Resolve global names in frontend semantics to `ResolvedFunction` or `IntrinsicCall` |
+| `resolve_call` | Parse data-based dynamic call requests |
+| `resolve_indirect_call` | Resolve controlled indirect call targets |
+| `truthy` | Provides language-defined rules for truth and false values |
+| `binary_op` | Provides language-specific binary operations |
+| `unary_op` | Provides language-specific unary operations |
+| `get_attr` / `set_attr` | Provide language-specific member access |
+| `get_item` / `set_item` | Provide language-specific index or table access |
+| `iterate` | Provides language-specific views of iterable values |
+| `set_captured` | Provides data-based updates when closure captures variable assignments |
 
-这些 hook 必须满足：
+These hooks must meet:
 
-- 只接收公开的 runtime value、字符串、数字和 data-only context。
-- 返回 generic runtime value、`ResolvedFunction`、`IntrinsicCall` 或 `NotHandled`。
-- 返回值必须通过 simulator 的 runtime-value 校验。
-- `NotHandled` 表示不能安全处理，simulator 应产生显式 unsupported 或
-  其它结构化失败，而不是猜测。
-- hook 不得调用 frontend bytecode，不得递归执行 frontend interpreter。
-- hook 不得返回 Python function、lambda、文件句柄、线程、模块、frame 或
-  其它 executable callback。
+- Only accepts public runtime values, strings, numbers and data-only contexts.
+- Returns generic runtime value, `ResolvedFunction`, `IntrinsicCall` or `NotHandled`.
+- The return value must pass the simulator's runtime-value check.
+- `NotHandled` means it cannot be safely handled and the simulator should produce an explicit unsupported or
+  Other structured failures are not guesswork.
+-Hooks must not call frontend bytecode and must not recursively execute the frontend interpreter.
+- hooks must not return Python functions, lambdas, file handles, threads, modules, frames or
+  Other executable callbacks.
 
-`VMStatefulCallbacks` 和 `simulation_adapter` 是两个不同的边界：
-
+`VMStatefulCallbacks` and `simulation_adapter` are two different boundaries:
 ```text
-VMStatefulCallbacks: frontend -> core，用于 lifting 复杂 VM 线性片段和栈状态
-simulation_adapter: frontend -> simulator，用于函数查询和运行时数据事实
+VMStatefulCallbacks: frontend -> core，for lifting complex VM linear slices and stack state
+simulation_adapter: frontend -> simulator，for function queries and runtime data facts
 ```
+The simulator cannot call `VMStatefulCallbacks`, and the adapter cannot use this to execute the VM.
+Logic switches back to frontend.
 
-simulator 不能调用 `VMStatefulCallbacks`，adapter 也不能借此把 VM 执行
-逻辑转回 frontend。
+### 20.1.4 External functions and complementary environments
 
-### 20.1.4 外部函数和补环境
-
-generic IR 中无法解析的命名函数，可以交给 host 提供的
-`ExternalEnvironment`：
-
+Named functions that cannot be parsed in generic IR can be handed over to those provided by host
+`ExternalEnvironment`:
 ```python
 from unidecompiler_simulator import (
     ExternalCallRequest,
@@ -1595,123 +1462,350 @@ class MyEnvironment:
     def call(self, request: ExternalCallRequest):
         if request.name != "print":
             return NotHandled
-        # 这里由 host 决定如何处理；返回值必须是受支持的 runtime value。
+        # The host decides how to handle this; the return value must be a supported runtime value.
         return ExternalCallResult(
             ExternalCallStatus.RETURNED,
             values=(),
             stdout=" ".join(map(str, request.args)) + "\\n",
         )
 ```
+Environment protocols are data boundaries, not execution control boundaries. environment:
 
-环境协议是数据边界，不是执行控制边界。environment：
+- Receives `ExternalCallRequest`, not IR, frame, stack, adapter or runner.
+- Returns `ExternalCallResult` or `NotHandled`.
+- Only in-memory runtime values supported by the simulator can be returned.
+- Unhandled functions must return `NotHandled` and cannot fake success results.
+- Frontend private objects should not be put into request or result.
 
-- 接收 `ExternalCallRequest`，不接收 IR、frame、stack、adapter 或 runner。
-- 返回 `ExternalCallResult` 或 `NotHandled`。
-- 只能返回 simulator 支持的 in-memory runtime values。
-- 未处理的函数必须返回 `NotHandled`，不能伪造成功结果。
-- 不应把 frontend 私有对象放入 request 或 result。
+Files like `runtime.py` belong to the application host. It is a trusted one explicitly selected by the user
+Python code, not sandbox. It should be read and loaded by the independent host-support package,
+Cannot be loaded by core, simulator or frontend.
 
-`runtime.py` 之类的文件属于 application host。它是用户明确选择的受信任
-Python 代码，不是 sandbox。它应由独立的 host-support package 读取和加载，
-不能由 core、simulator 或 frontend 加载。
+Note: environment can only supplement the external functions called during the execution of the target function, and cannot replace it.
+`resolve_function()`, nor the simulator's objective function itself.
 
-注意：environment 只能补充目标函数执行过程中调用的外部函数，不能替代
-`resolve_function()`，也不能提供 simulator 的目标函数本身。
+#### 20.1.4.1 Decide first: adapter hook or host runtime
 
-### 20.1.5 SimulationResult 语义
+Don't cram into `simulation_adapter` all the behavior that generic IR can't do directly.
+First select according to the following boundaries:
 
-frontend 不负责构造 `SimulationResult`，但测试和宿主必须正确处理这些结果：
-
-| 状态 | 含义 | 要求 |
+| Situation | Correct location | Reason |
 |---|---|---|
-| `completed` | 函数正常返回 | 检查 `values`，不能只检查 status |
-| `raised` | 执行产生语言/运行时异常 | 保留 exception 和 cause |
-| `unsupported` | generic IR 或运行时事实无法安全表达 | 保留 diagnostic 和 trace context |
-| `invalid_request` | query、参数或 environment 协议错误 | 明确显示错误 |
-| `step_limit` | 达到最大执行步数 | 不能伪装为 completed |
-| `call_depth_limit` | 达到最大调用深度 | 不能继续猜测 |
-| `cancelled` | 用户或 host 请求取消 | 保留已产生的 trace |
-| `yielded` | 执行遇到受支持范围外的 yield 行为 | 明确标注非 completed |
+| truthiness of function queries, overload selection, language definitions | adapter | data-only language facts that are frontend |
+| Pure language operations, attribute/indexing rules | Narrow hooks for adapters or `IntrinsicCall` | No I/O or mutable external resources required |
+| stdin, stdout, file, network, time, random number | host `ExternalEnvironment` | They are host resources, not frontend semantics |
+| Variable runtime state such as buffer, heap, handle table, etc. | host `ExternalEnvironment` | The state belongs to the trusted host environment of a simulated run |
+| VM opcode dispatch, VM program counter, VM data stack | Implementation not allowed | This will turn the frontend into a second interpreter |
 
-trace 限制只限制记录事件的数量，不得改变函数执行语义。被截断时必须
-通过 `trace_truncated` 或等价诊断告知宿主。
+A practical judgment is: if the implementation needs to read the frontend decoder model and traverse the VM
+instructions, maintain VM `ip` or replay the effect, then it is not a runtime fact and cannot be written
+adapter or `runtime.py`.
 
-### 20.1.6 模拟支持的最小交付流程
+#### 20.1.4.2 Loading ABI of Python `runtime.py`
 
-实现可选模拟时，按以下顺序执行：
+The GUI/CLI can select a trusted Python runtime file and is provided by the host-support package
+Wrap it into `ExternalEnvironment`. For the current Python-file host, runtime file
+A top-level function with the exact same name as `Global(name=...)` in generic IR should be exported:
+```python
+# generic IR: Call(Global("write_text"), args=(value,), returns=0)
+def write_text(value):
+    print(value, end="")
+```
+Calling rules:
 
-1. 先完成 decoder、thin IR、generic IR 和反编译测试。
-2. 确认函数边界、名称、参数和返回值已经稳定。
-3. 实现 `simulation.py` 中的 `resolve_function()`。
-4. 实现 `list_simulation_targets()`，过滤歧义目标。
-5. 为一个纯计算函数写 `simulate_function()` 或 `simulate_artifact()` 测试。
-6. 为分支、循环、容器/成员操作增加测试。
-7. 如果需要语言特有行为，只增加窄的 data-only adapter hook。
-8. 为一个未解析外部调用增加 `ExternalEnvironment` 测试。
-9. 验证没有 environment 时得到显式 unsupported，而不是错误成功。
-10. 通过 CLI 执行一次真实 artifact，确认参数和返回值保持不变。
-11. 通过 GUI target discovery 和 Run 流程，确认 target 不被自动重置。
-12. 检查 simulator 包没有被 core import，frontend 没有执行器或解释器。
+1. The simulator generates `ExternalCallRequest(name, args, keywords, caller, source)`.
+2. host searches for the `name` function with the same name in `runtime.py`.
+3. The host calls it with `function(*args, **keywords)`.
+4. The Python return value of the function is converted to the external call return value; if the generic IR
+   `Call.returns == 0`, the return value will be ignored, ordinary `None` will do.
+5. The text written by the runtime to stdout/stderr will become the corresponding external-call event
+   `stdout`/`stderr`, visible in the Output column of GUI trace.
+6. Unexported functions do not "return null", but `NotHandled`, and the simulator must report
+   explicit unsupported.
 
-先支持一个最小函数，再扩大覆盖范围。不要先为所有语言特性设计一个
-frontend-specific runtime framework。
+This is a host integration ABI, not a frontend API. frontend is not allowed to import,
+Read or load the file.
 
-## 21. 什么时候期待 while，什么时候接受 goto
+Runtime files must assume that stdout/stderr may be redirected by the host as text capture objects. Therefore:
 
-Frontend 的目标不是强行让输出出现 `while`。
+- Use `print(...)` or `sys.stdout.write(...)` when outputting text;
+- Do not assume `sys.stdout.buffer` exists;
+- If the VM outputs raw bytes, explicitly select the encoding, e.g.
+  `bytes(data).decode("utf-8", errors="replace")`;
+- Do not use buffer, file handle, thread, Python callable and other objects as function return values.
 
-正确预期：
+#### 20.1.4.3 Generic template for stateful buffer runtime
 
-- 简单单入口单出口循环：可能输出 `while`。
-- 多出口循环、switch-like 分派、共享失败块、复杂 join：可能输出 `if/goto`。
-- target 缺失或栈形状无法合并：应该 partial/unsupported。
+The generic IR of many interpreter VMs includes named calls such as
+`alloc_buffer`, `load_byte`, `store_byte`, `read_buffer`, and `write_buffer`.
+The frontend is responsible only for keeping the function name, parameter order,
+and number of `returns` consistent with VM semantics; mutable memory is maintained
+by the host runtime.
 
-如果复杂函数只输出线性代码，没有 `if`、没有 `goto`、也没有 unsupported，这是高风险信号。通常说明：
+The following template is not an implementation of a specific VM. It is simply a
+copyable runtime shape for fixed slots, byte buffers, and one state per simulation.
+Replace the capacity, out-of-bounds behavior, read/write encoding, and function
+names to match your VM documentation:
+```python
+# runtime.py -- trusted host code, not imported by the frontend
+from __future__ import annotations
 
-- 条件跳转 effect 提前消费了条件。
-- 没有提交 `materialized-condition`。
-- branch target 没恢复。
-- `branch_stack_width` 错。
-- 条件极性 hint 错。
-- profile 没把 opcode 标成 control/jump/conditional。
+import os
+import sys
 
-验证时要明确区分：
+MAX_SLOTS = 16
+MAX_SIZE = 4096
+buffers: list[bytearray | None] = [None] * MAX_SLOTS
+pending_input: bytes | None = None
 
+
+def _require_index(index: int) -> int:
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise TypeError("buffer index must be an integer")
+    if not 0 <= index < MAX_SLOTS:
+        raise IndexError(f"buffer index out of range: {index}")
+    return index
+
+
+def _require_buffer(index: int) -> bytearray:
+    buffer = buffers[_require_index(index)]
+    if buffer is None:
+        raise ValueError(f"buffer {index} is not allocated")
+    return buffer
+
+
+def _require_offset(buffer: bytearray, offset: int) -> int:
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise TypeError("buffer offset must be an integer")
+    if not 0 <= offset < len(buffer):
+        raise IndexError(f"buffer offset out of range: {offset}")
+    return offset
+
+
+def alloc_buffer(size: int) -> None:
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError("buffer size must be an integer")
+    if not 0 <= size <= MAX_SIZE:
+        raise ValueError(f"buffer size must be in [0, {MAX_SIZE}]")
+    try:
+        slot = buffers.index(None)
+    except ValueError as error:
+        raise MemoryError("no free buffer slots") from error
+    buffers[slot] = bytearray(size)
+
+
+def free_buffer(index: int) -> None:
+    index = _require_index(index)
+    _require_buffer(index)
+    buffers[index] = None
+
+
+def load_byte(index: int, offset: int) -> int:
+    buffer = _require_buffer(index)
+    return buffer[_require_offset(buffer, offset)]
+
+
+def store_byte(index: int, offset: int, value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("stored value must be an integer")
+    buffer = _require_buffer(index)
+    buffer[_require_offset(buffer, offset)] = value & 0xFF
+
+
+def _take_input(limit: int) -> bytes:
+    global pending_input
+    if pending_input is None:
+        # GUI has no universal stdin widget.  A host/user-selected convention
+        # such as this environment variable makes runs deterministic.
+        configured = os.environ.get("MY_VM_RUNTIME_INPUT")
+        pending_input = configured.encode("utf-8") if configured is not None else b""
+    value, pending_input = pending_input[:limit], pending_input[limit:]
+    return value
+
+
+def read_buffer(index: int) -> None:
+    buffer = _require_buffer(index)
+    data = _take_input(len(buffer))
+    buffer[:len(data)] = data
+
+
+def write_buffer(index: int) -> None:
+    buffer = _require_buffer(index)
+    end = buffer.find(0)
+    data = buffer if end < 0 else buffer[:end]
+    sys.stdout.write(bytes(data).decode("utf-8", errors="replace"))
+```
+This template deliberately does not do three things:
+
+- Does not parse or execute VM bytecode;
+- Do not read frontend's private program/model;
+- Do not write special cases based on an artifact or flag/secret.
+
+If your VM's `ALLOC` returns a buffer index, the frontend should model its generic IR call
+For `returns=1`, the runtime's `alloc_buffer()` should also `return slot`. If the VM's
+`ALLOC` does not return a value but implicitly occupies the first empty slot, then `returns=0`, and is determined by the runtime according to the VM
+Rules select slots. Don't change the calling convention of generic IR just to make the runtime "convenient".
+
+#### 20.1.4.4 Input, state life cycle and GUI
+
+The Args control of the GUI is only used in `FunctionIR.params`, not stdin of all VMs. Therefore, with
+`READ`/`read_buffer` The frontend of a type of opcode must be at the top of the README or runtime file
+Describe the input source. Options:
+
+| Solution | Applicability | Notes |
+|---|---|---|
+| Environment variables | Text input, GUI manual validation | Not suitable for binary samples containing NUL |
+| runtime internal fixtures | unit tests, repeatable analysis | fixtures must be explicitly set in tests and cannot be artifact special cases |
+| The input file path provided by the host | Large input or binary input | The runtime only reads the path selected by the user and is not determined by the frontend |
+| embedding host custom environment | product-level interactive input | host responsible for cancellation, encoding and permissions |
+
+Do not call `sys.stdin.read()` unconditionally in a GUI worker: graphical interfaces usually have no interactive
+stdin, which can cause a hang. The running state must be initialized within a simulation run; do not replace the last
+Run's buffer, random state, or input residues are implicitly carried over to the next Run.
+
+#### 20.1.4.5 Runtime Observability and Debugging
+
+Generic simulator trace will record the name, args, stdout, stderr,
+source offset and caller. It does not automatically stuff runtime private heap/buffer objects
+`SimulationResult.locals`. So when analyzing a stateful VM:
+
+1. First confirm which buffer is the input, output and intermediate value through the parameters of `external-call` event.
+2. For debugging runtime, you can provide the read-only `debug_snapshot()` helper function, or in the test host
+   Read module private state after run.
+3. Do not allow normal `write_buffer()` to output debug logs; otherwise it will pollute the program semantic output.
+4. If status must be logged, use a separate, explicitly enabled debug text prefix, or by embedding
+   host holds the snapshot; do not use Python `bytearray`, file object or callable as
+   simulator runtime value returns.
+
+### 20.1.5 target enumeration and recovery status
+
+`decompile_status` is the quality information of generic-IR recovery, not the second one of simulator
+execution engine. The frontend must be clear about its enumeration strategy and not leave it to GUI users to guess:
+
+| Strategy | `list_simulation_targets()` behavior | Applicability |
+|---|---|---|
+| strict | List only functions with `decompile_status == "ok"` | Product features that have verified lift integrity |
+| diagnostic | `partial` is also listed, but the label/README clearly indicates experimental | For reverse analysis, you need to use trace to locate the gap |
+| permissive | Only enumerate by stable query, do not filter by recovery status | The host needs to compare paths or verify semantics by itself |
+
+No matter which one you choose:
+
+- `completed` only indicates that the generic IR reached `Return`; it **does not prove** that the frontend
+  The semantics, conditional polarity, or call argument order is correct.
+- For `partial` targets, verify both the original VM/reference implementation and the
+  The simulator's stdout, return value, or key external call sequence.
+- If partial results encounter unmodeled behavior, `unsupported`/`raised` should be retained, not for
+  Display a Run button and return fake success.
+- The GUI should display or be able to trace the recovery status and diagnostics of the target.
+
+### 20.1.6 SimulationResult Semantics
+
+The frontend is not responsible for constructing `SimulationResult`, but the test and host must handle these results correctly:
+
+| Status | Meaning | Requirements |
+|---|---|---|
+| `completed` | The function returns normally | Check `values`, not just status |
+| `raised` | Execution raises a language/runtime exception | Reserved exception and cause |
+| `unsupported` | generic IR or runtime fact cannot be expressed safely | diagnostic and trace context reserved |
+| `invalid_request` | query, parameter, or environment protocol error | Show error explicitly |
+| `step_limit` | Maximum number of execution steps reached | Cannot be disguised as completed |
+| `call_depth_limit` | Maximum call depth reached | Cannot continue guessing |
+| `cancelled` | User or host request cancellation | Keep the generated trace |
+| `yielded` | Execution encounters yield behavior outside the supported scope | Explicitly mark non-completed |
+
+Trace limits only limit the number of logged events and must not change function execution semantics. Must be truncated
+Notify the host via `trace_truncated` or equivalent diagnostics.
+
+#### Use trace for reverse analysis
+
+trace is not just a test log. For input validation, state machine, decryption, or interpreter artifacts, press
+The following steps are analyzed without adding sample special cases in the frontend:
+
+1. Run with empty input or minimum legal input first, and record the failure stdout and the last block entered.
+2. Find the input function in `external-call` events and confirm the runtime state the input falls into.
+3. Find the `load_*`/`store_*` calls in the loop, distinguishing between inputs, transformation results, and constant targets.
+4. Use the source offset of the event to return to the pseudocode/AST and read the items of the generic IR
+   Arithmetic, comparison and branch.
+5. Trace backward from the success/failure branch: compare target constant → transform output → input bytes/parameters.
+6. Run the inversion candidate in the simulator and the original reference implementation, and compare the success output with the critical status.
+
+This is an analytics workflow that does not change the responsibilities of the frontend, adapter, or core. runtime only
+External state is provided; control flow and expressions are still executed by the generic simulator.
+
+### 20.1.7 Minimum delivery process supported by simulation
+
+When implementing optional simulations, proceed in the following order:1. Complete the decoder, thin IR, generic IR and decompilation tests first.
+2. Confirm that function boundaries, names, parameters, and return values have stabilized.
+3. Implement `resolve_function()` in `simulation.py`.
+4. Implement `list_simulation_targets()` to filter ambiguous targets.
+5. Write a `simulate_function()` or `simulate_artifact()` test for a purely computational function.
+6. Add tests for branches, loops, container/member operations.
+7. If language-specific behavior is required, only add narrow data-only adapter hooks.
+8. Add `ExternalEnvironment` test for an unresolved external call.
+9. Verification without environment gets explicitly unsupported instead of error on success.
+10. Execute the real artifact once through the CLI and confirm that the parameters and return values remain unchanged.
+11. Through the GUI target discovery and Run process, confirm that the target is not automatically reset and the runtime
+    The input source does not block the GUI.
+12. For stateful runtime, verify that one run will not pollute the next run.
+13. Check that the simulator package is not core imported, and the frontend does not have an executor or interpreter.
+
+First support a minimal function, and then expand the coverage. Don’t design one for all language features first
+frontend-specific runtime framework.
+
+## 21. When to expect while and when to accept goto
+
+The goal of Frontend is not to force the output to appear `while`.
+
+Correct expectations:
+
+- Simple single entry single exit loop: possible output `while`.
+- Multi-exit loops, switch-like dispatch, shared failure blocks, complex joins: possible output of `if/goto`.
+- target is missing or stack shapes cannot be merged: should be partial/unsupported.
+
+If a complex function outputs only linear code, no `if`, no `goto`, and no unsupported, this is a high-risk signal. Usually stated:
+
+- The conditional jump effect consumes the condition in advance.
+- No `materialized-condition` was committed.
+- branch target is not restored.
+- `branch_stack_width` is wrong.
+- Conditional polarity hint is wrong.
+- profile does not mark opcode as control/jump/conditional.
+
+Make a clear distinction when verifying:
 ```text
-结构化好结果：has_while 或 has_if
-保守正确结果：has_if + has_goto
-危险结果：复杂 CFG 被线性化
+well-structured result: has_while or has_if
+conservative correct result: has_if + has_goto
+dangerous result: complex CFG was linearized
 ```
 
-## 22. 错误、unsupported 与诊断
+## 22. Errors, unsupported and diagnostics
 
-Decoder 错误：
+Decoder error:
 
-- 输入不是该格式：`can_load=False`。
-- 格式匹配但损坏：`decode` 抛 `FrontendDecodeError`。
-- 未知版本：metadata 或 diagnostics 中明确报告。
+- Input is not in this format: `can_load=False`.
+- Format matched but corrupted: `decode` throws `FrontendDecodeError`.
+- Unknown version: explicitly reported in metadata or diagnostics.
 
-Lift 错误：
+Lift error:
 
-1. 仍然提交指令和 raw 文本。
-2. 使用 `UnknownOpcode` 或 `effects=None`。
-3. 提供 `raw_window`、decoded operands、target/region hints。
-4. 让 core 返回 `partial` 或 `unsupported`，不要猜测。
+1. Still submit the command and raw text.
+2. Use `UnknownOpcode` or `effects=None`.
+3. Provide `raw_window`, decoded operands, target/region hints.
+4. Let core return `partial` or `unsupported`, don't guess.
 
-`unsupported` 不是开发终点。支持范围内出现 unsupported，应该通过：
+`unsupported` is not a development endpoint. If unsupported appears in the support range, it should be passed:
 
-- 修正 opcode effect。
-- 补 target/case/exception hints。
-- 补 stateful callbacks。
-- 补 VM-neutral thin IR concept。
-- 或在 core 中增强 VM-neutral recovery。
+- Fixed opcode effect.
+- Added target/case/exception hints.
+- Supplement stateful callbacks.
+- Supplement VM-neutral thin IR concept.
+- Or enhance VM-neutral recovery in core.
 
-不要把 unsupported 用 frontend 特例“绕过去”。
+Don't "bypass" unsupported with the frontend special case.
 
-## 23. 验证脚本
+## 23. Verification script
 
-外部目录插件 smoke test：
-
+External directory plug-in smoke test:
 ```python
 from pathlib import Path
 from unidecompiler import DecompilerEngine
@@ -1740,9 +1834,7 @@ print("has_unsupported", "unsupported" in text)
 print("cfg", [(len(g.blocks), len(g.edges)) for g in result.control_flow])
 print("self_edges", [e for g in result.control_flow for e in g.edges if e.source == e.target])
 ```
-
-严格成功样本断言：
-
+Strictly successful sample assertion:
 ```python
 assert result.pseudocode is not None
 assert result.status == "ok"
@@ -1753,9 +1845,7 @@ assert result.control_flow
 assert any(len(g.blocks) >= 1 for g in result.control_flow)
 assert not [e for g in result.control_flow for e in g.edges if e.source == e.target]
 ```
-
-partial 可接受样本断言：
-
+partial accepts sample assertions:
 ```python
 assert result.pseudocode is not None
 assert result.status in {"ok", "partial"}
@@ -1765,33 +1855,27 @@ assert result.control_flow
 assert any(len(g.blocks) >= 1 for g in result.control_flow)
 assert not [e for g in result.control_flow for e in g.edges if e.source == e.target]
 ```
+Don't mix the two types of assertions. Core paths within the supported scope should use strict assertions; while semantic coverage is being extended, partial acceptable assertions can be used temporarily, but unsupported reasons should be included in the fix list.
 
-不要把两类断言混用。支持范围内的核心路径应使用严格断言；正在扩展语义覆盖时，可以临时使用 partial 可接受断言，但要把 unsupported 原因纳入修复列表。
-
-如果当前样本本应完全支持：
-
+If the current sample should have fully supported:
 ```python
 assert result.status == "ok"
 assert result.frontend_id == "my-vm"
 assert result.functions
 assert "unsupported" not in text
 ```
-
-对复杂控制流样本，至少应满足：
-
+For complex control flow samples, at least the following should be met:
 ```text
 status ok
-frontend_id 是你的 frontend id
-没有 unsupported 文本
-CFG 有多个 blocks/edges
-伪代码有 while/if，或者至少有 if/goto
-GUI control_flow 无自环崩溃
+frontend_id is your frontend id
+no unsupported text
+CFG has multiple blocks/edges
+pseudocode contains while/if, or at least if/goto
+GUI control_flow does not crash on self-loops
 ```
+If the goal is "semantic completeness", `partial` + `if/goto` is acceptable. If the goal is "advanced structuring", the core needs to be able to safely match the CFG shape.
 
-如果目标是“语义完整”，`partial` + `if/goto` 可以接受。如果目标是“高级结构化”，需要 core 能安全匹配该 CFG 形状。
-
-复杂控制流断言可以更严格：
-
+Complex control flow assertions can be more restrictive:
 ```python
 has_structured_control = "while" in text or "if (" in text or "if " in text
 has_low_level_cfg = "goto block_" in text
@@ -1800,23 +1884,19 @@ has_cfg_shape = any(len(g.blocks) > 1 and len(g.edges) > 0 for g in result.contr
 assert has_cfg_shape
 assert has_structured_control or has_low_level_cfg
 ```
-
-如果样本已知有条件跳转和后向边，可以直接检查展示 CFG：
-
+If the sample is known to have conditional jumps and backward edges, you can directly check the display CFG:
 ```python
 edges = [edge for graph in result.control_flow for edge in graph.edges]
 assert any(edge.kind == "branch" for edge in edges)
 assert any(int(edge.target.split("_")[-1]) <= int(edge.source.split("_")[-1]) for edge in edges)
 ```
+These assertions do not require all VMs to output `while`. They require that complex control flows cannot be mislinearized.
 
-这些断言不是要求所有 VM 都输出 `while`。它们要求复杂控制流不能被误线性化。
+### 23.1 Simulate execution of verification script
 
-### 23.1 模拟执行验证脚本
-
-如果 frontend 声明支持模拟，必须在反编译 smoke test 之外增加 simulator
-验证。以下示例使用 public simulator API，不直接调用 frontend 的 decoder
-私有函数或执行器：
-
+If the frontend is declared to support simulation, a simulator must be added in addition to the decompiled smoke test
+Verify. The following example uses the public simulator API and does not directly call the frontend decoder.
+Private function or executor:
 ```python
 from pathlib import Path
 
@@ -1850,19 +1930,15 @@ assert result.exception is None
 assert result.diagnostic is None
 assert result.steps > 0
 ```
-
-目标发现测试必须覆盖：
-
+Target discovery tests must cover:
 ```python
 assert listing.targets
 assert all(target.query is not None for target in listing.targets)
 assert all(target.function_index >= 0 for target in listing.targets)
 assert len({target.label for target in listing.targets}) == len(listing.targets)
 ```
-
-歧义查询不能猜测。可以不列出歧义 target，也可以让执行返回明确的
-`invalid_request`，但不能随机选择函数：
-
+Ambiguous queries cannot be guessed. You can not list ambiguous targets, or you can have execution return an unambiguous
+`invalid_request`, but the function cannot be chosen randomly:
 ```python
 ambiguous = simulator.simulate_artifact(
     artifact.data,
@@ -1873,9 +1949,7 @@ ambiguous = simulator.simulate_artifact(
 assert ambiguous.status is SimulationStatus.INVALID_REQUEST
 assert ambiguous.diagnostic
 ```
-
-外部 environment 测试必须验证返回值、stdout、异常和未处理调用：
-
+External environment tests must verify return values, stdout, exceptions, and unhandled calls:
 ```python
 from unidecompiler_simulator import (
     ExternalCallResult,
@@ -1915,9 +1989,7 @@ without_environment = simulator.simulate_artifact(
 assert without_environment.status is SimulationStatus.UNSUPPORTED
 assert without_environment.diagnostic
 ```
-
-限额、取消和 trace 截断也属于 frontend integration 的验证范围：
-
+Quotas, cancellations and trace truncation also fall within the validation scope of frontend integration:
 ```python
 from unidecompiler_simulator import SimulationCancellation, SimulationLimits
 
@@ -1941,100 +2013,107 @@ cancelled = simulator.simulate_artifact(
 )
 assert cancelled.status is SimulationStatus.CANCELLED
 ```
+These tests must verify the generic IR execution results, not the frontend re-execution itself
+The result obtained after bytecode. It is recommended to put the source code, generated artifacts and expected values in
+`simulator_projects/source/<project>` and the corresponding expected file.
 
-这些测试必须验证 generic IR 执行结果，而不是验证 frontend 自己重新执行
-字节码后得到的结果。推荐把源代码、生成 artifact 和期望值放到
-`simulator_projects/source/<project>` 及对应的期望文件中。
-
-## 24. 单元测试清单
+## 24. Unit test checklist
 
 Decoder：
 
-- 正确识别 header/magic/version/endianness。
-- 正确处理扩展名。
-- 截断输入报错。
-- 错误长度报错。
-- 损坏常量表报错。
-- 所有 opcode 都有 offset、size、operands、raw。
-- 空输入报错。
-- 非本格式输入 `can_load=False`。
+- Correctly identify header/magic/version/endianness.
+- Correct handling of extensions.
+- Truncate input and report error.
+- Wrong length error reported.
+- An error is reported when the constant table is damaged.
+- All opcodes have offset, size, operands, and raw.
+- Empty input error.
+- Enter `can_load=False` when not in this format.
 
-Effect：
+Effect:
 
-- 常量 push。
-- local load/store。
-- 二元运算顺序。
-- 调用参数顺序。
-- return/halt。
-- unknown opcode。
+- constant push.
+- local load/store.
+- Binary order of operations.
+- Call parameter order.
+- return/halt.
+- unknown opcode.
 
 Control：
 
-- unconditional jump target。
-- conditional jump target。
-- backward jump -> `loop-backedge`。
-- materialized condition。
-- branch polarity。
-- invalid target。
-- switch/case/default。
-- exception region。
+- unconditional jump target.
+- conditional jump target.
+- backward jump -> `loop-backedge`.
+- materialized condition.
+- branch polarity.
+- invalid target.
+- switch/case/default.
+- exception region.
 
-Integration：
+Integration:
 
-- 线性函数输出伪代码。
-- if/else。
-- while 或低层 if/goto。
-- nested control。
-- 多函数模块。
-- 一个函数失败不影响其他函数。
-- GUI 可以打开 sample，不显示为 resource。
+- Linear function output pseudocode.
+- if/else.
+- while or low-level if/goto.
+- nested control.
+- Multi-function module.
+- Failure of one function does not affect other functions.
+- The GUI can open the sample without displaying it as a resource.
 
-如果 frontend 声明支持 simulation，还必须增加：
+If the frontend is declared to support simulation, it must also be added:
 
 Target discovery：
 
-- `simulation_adapter` 可以被 registry 识别。
-- `list_simulation_targets()` 返回稳定、唯一、data-only 的 query。
-- 不支持或歧义的函数不会被随机列出。
-- 每个列出的 query 都能解析到当前 `ModuleIR` 中的 `FunctionIR`。
-- nested function、匿名函数和重载函数的命名策略有测试。
+- `simulation_adapter` is recognized by the registry.
+- `list_simulation_targets()` returns a stable, unique, data-only query.
+- Unsupported or ambiguous functions are not randomly listed.
+- Each listed query can be resolved to the `FunctionIR` in the current `ModuleIR`.
+- There are tests for the naming strategy of nested functions, anonymous functions and overloaded functions.
 
-Generic-IR execution：
+Generic-IR execution:
 
-- `simulate_function()` 可以执行一个没有 frontend 私有 runtime 依赖的纯函数。
-- `simulate_artifact()` 可以通过 frontend query 找到同一个函数。
-- 参数绑定顺序、默认参数行为和返回值数量正确。
-- 分支、循环、比较、容器、成员和闭包场景覆盖目标 VM 的支持范围。
-- 一个函数的 simulation failure 不会破坏其它函数的 decompile result。
+- `simulate_function()` can execute a pure function without frontend private runtime dependencies.
+- `simulate_artifact()` can find the same function through frontend query.
+- Parameter binding order, default parameter behavior and number of return values are correct.
+- Branch, loop, comparison, container, member and closure scenarios are covered by target VM support.
+- Simulation failure of one function does not destroy the decompile result of other functions.
 
-Adapter boundary：
+Adapter boundary:
 
-- adapter 只返回 `ResolvedFunction`、`IntrinsicCall`、runtime value 或 `NotHandled`。
-- adapter 不包含 execute/run/step/eval/interpreter 逻辑。
-- adapter 不返回 executable callback、frame、stack 或 frontend 私有执行对象。
-- adapter 返回的函数属于当前 lifted module。
-- 未处理的 global、call、attribute、item 或 iterator 行为产生显式结果。
+- adapter only returns `ResolvedFunction`, `IntrinsicCall`, runtime value or `NotHandled`.
+- adapter does not contain execute/run/step/eval/interpreter logic.
+- adapter does not return executable callback, frame, stack or frontend private execution objects.
+- The function returned by adapter belongs to the current lifted module.
+- Unhandled global, call, attribute, item or iterator behavior produces explicit results.
 
-Environment and outcomes：
+Environment and outcomes:
 
-- `ExternalEnvironment` 能处理至少一个外部调用。
-- 没有 environment 时，未解析调用得到显式 `unsupported`，不能假装成功。
-- host 返回值、stdout、stderr 和异常都经过结构化结果传递。
-- `completed`、`raised`、`unsupported`、`invalid_request`、step limit、call
-  depth limit 和 cancellation 至少覆盖目标支持范围内的相关状态。
-- trace 截断不会改变返回值或控制流结果。
+- `ExternalEnvironment` can handle at least one external call.
+- Without environment, unresolved calls get explicitly `unsupported` and cannot pretend to succeed.
+- Host return values, stdout, stderr, and exceptions are passed through structured results.
+- The function names, parameter order and `Call.returns` of the Python-file runtime are consistent with the generic IR.
+- The runtime does not assume that `sys.stdout.buffer` exists and does not block reading stdin in GUI workers.
+- Stateful runtime starts from a clean state in every simulation run.
+- The capacity, unallocated access, out-of-bounds and input exhaustion of host states such as buffer/heap are tested.
+- `completed`, `raised`, `unsupported`, `invalid_request`, step limit, call
+  depth limit and cancellation cover at least the relevant state supported by the target.
+- Trace truncation does not change the return value or control flow results.
+- For diagnostic/permissive partial targets, at least one is compared with the reference implementation
+  Path testing; `completed` cannot be relied upon as the only evidence of semantic correctness.
 
-Host integration：
+Host integration:
 
-- CLI 只传递 frontend-owned query 并显示 `SimulationResult`。
-- GUI 自动列举 target，不实现 frontend-specific lookup。
-- GUI Run 后目标选择不被重置，返回值、状态和 trace 都可见。
-- runtime 文件加载发生在 application host，frontend 和 simulator 不加载文件。
+- CLI only passes frontend-owned query and displays `SimulationResult`.
+- The GUI automatically enumerates targets and does not implement frontend-specific lookup.
+- Target selection is not reset after GUI Run, return value, status and trace are all visible.
+- Runtime file loading occurs on the application host, frontend and simulator do not load files.
+- GUI/README clearly states the source of runtime input; Args only corresponds to function parameters and does not default to equal
+  VM stdin.
+- The GUI can display the recovery status of the target or allow the user to trace back the corresponding diagnostics.
 
-## 25. 命令行和 GUI 注册
+## 25. Command line and GUI registration
 
-Python API 注册：
-
+Python API registration:
 ```python
 from unidecompiler import DecompilerEngine
 from unidecompiler.plugin_registry import FrontendRegistry
@@ -2043,306 +2122,312 @@ registry = FrontendRegistry.discover()
 registry.register_directory("/path/to/my-vm-plugin")
 engine = DecompilerEngine.from_registry(registry)
 ```
-
-GUI 注册：
-
+GUI registration:
 ```text
 Frontend manager -> Register folder -> /path/to/my-vm-plugin
 ```
+If the GUI still shows resource:
 
-如果 GUI 仍显示为 resource：
+- Check if `can_load()` returns true for extensions.
+- Check whether the manifest path is registered in the plugin root directory.
+- Check if `module` can be imported.
+- Check whether the plugin id is consistent with the decompile selection.
+- Check whether the current registry of the GUI needs to be re-registered or restarted.
 
-- 检查 `can_load()` 是否对扩展名返回 true。
-- 检查 manifest 路径是否注册的是插件根目录。
-- 检查 `module` 能否 import。
-- 检查 plugin id 是否和 decompile 选择一致。
-- 检查 GUI 当前 registry 是否需要重新注册或重启。
+If the GUI can be decompiled but the Simulation tab has no target:
 
-如果 GUI 可以反编译但 Simulation tab 没有 target：
+- Confirm that the plugin exposes `simulation_adapter`, and the adapter's `frontend_id` is the same as
+  The plugin id is exactly the same.
+- Confirm that the adapter implements `resolve_function()`.
+- Confirm that `list_simulation_targets()` returns
+  A `SimulationTargetCandidate` tuple, not a `FunctionIR` or callable.
+- Confirm that each candidate's query can be uniquely resolved by `resolve_function()`.
+- Verify that the listed functions have been `lift()`ed into the current `ModuleIR`, including nested functions.
+- Verify that the GUI is using the same registry that contains the plugin.
 
-- 确认 plugin 暴露了 `simulation_adapter`，且 adapter 的 `frontend_id` 与
-  plugin id 完全一致。
-- 确认 adapter 实现了 `resolve_function()`。
-- 确认 `list_simulation_targets()` 返回的是
-  `SimulationTargetCandidate` 元组，而不是 `FunctionIR` 或 callable。
-- 确认每个 candidate 的 query 能被 `resolve_function()` 唯一解析。
-- 确认列出的函数已经被 `lift()` 放入当前 `ModuleIR`，包括 nested functions。
-- 确认 GUI 使用的是包含该 plugin 的同一个 registry。
+The CLI/GUI should not inspect or modify the frontend to determine whether
+simulation is supported. Input recognition is dynamically registered by the
+frontend registry, and simulation target discovery is determined by the
+corresponding adapter.
 
-CLI/GUI 不应通过修改扩展名判断是否支持模拟。输入识别仍由动态注册的
-frontend registry 决定，simulation target 发现也由对应 adapter 决定。
+If the GUI runs, but the runtime immediately fails or freezes:
 
-## 26. 常见错误表
+- Check the first `external-call` of the trace; its Detail is the name of the missing runtime function.
+- Check whether the runtime function signature is consistent with the Args order of the event; do not pop the stack based on the VM original
+  The order guess should be based on the generic IR `Call.args`.
+- Check whether the runtime writes bytes to `sys.stdout.buffer`; the GUI host may write stdout
+  Redirect to text capture object.
+- Check input sources for `READ` class operations; GUI Args only bind `FunctionIR.params`.
+- Check whether the runtime retains the heap/buffer from the previous run to the next run.
+- If target is `partial`, compare the reference implementation with the simulator's stdout, return value, or
+  external-call sequence; `completed` is not sufficient to prove semantic equivalence.
 
-| 错误 | 结果 | 正确做法 |
+## 26. Common Error Table
+
+| Error | Result | Correct approach |
 |---|---|---|
-| frontend 构造 `If`/`While`/AST | 破坏 core ownership | 只提交 effects/hints |
-| 只提交简单 opcode | 复杂样本丢上下文 | 所有可解码 opcode 都提交 |
-| unknown opcode 返回空 tuple | 误导性伪代码 | 用 `UnknownOpcode` 或 unsupported |
-| branch target 用 instruction index | CFG 错位 | 用原始 bytecode offset |
-| 条件跳转 effect 提前 `Pop` 条件 | 没有 `if/goto` | 用 `branch_stack_width` 消费 |
-| 没有 `materialized-condition` | 条件可能被线性化 | 条件栈 VM 提交该 hint |
-| 条件极性没标 | true/false 边反 | `detail="target-if-true"` |
-| 后向边仍只标 branch-target | loop 信息弱 | 后向边用 `loop-backedge` |
-| 把私有对象放进 operand | core/frontend 耦合 | 只用中立 value/text |
-| metadata 表达程序逻辑 | 恢复不可测试 | 用 `VMHint` |
-| backend 推断 loop/goto | 多 frontend 不一致 | core structuring 负责 |
-| GUI 自环边崩溃 | CFG 视图不可用 | 修正/过滤展示 metadata |
-| 用 subprocess 解析 | 平台和诊断不稳定 | 用库或本地 parser |
-| frontend 为模拟执行字节码 | simulator/frontend 双重语义 | frontend 只提供 adapter，simulator 执行 generic IR |
-| adapter 按名称随意选重载 | 运行了错误函数 | 使用稳定 query，歧义时 `NotHandled` |
-| adapter 返回 callable 或 decoder object | 执行边界泄漏 | 只返回 data-only value、`ResolvedFunction` 或 `NotHandled` |
-| GUI/CLI 自己解析类名或 Lua 名称 | host 与 frontend 语义分叉 | 只传 opaque query 给 adapter |
-| runtime.py 放进 simulator | core/host 耦合且无法审计 | 由独立 host-support package 加载受信任文件 |
-| 未处理外部调用返回空值 | 伪造成功结果 | 返回 `NotHandled`，让 simulator 结构化失败 |
-| trace 截断后停止或改变结果 | 观察行为改变执行语义 | 只截断事件，继续受限执行 |
+| frontend constructor `If`/`While`/AST | destroy core ownership | commit only effects/hints |
+| Only simple opcodes are submitted | Complex samples lose context | All decodable opcodes are submitted |
+| unknown opcode returns empty tuple | misleading pseudocode | use `UnknownOpcode` or unsupported |
+| branch target uses instruction index | CFG misalignment | uses original bytecode offset |
+| Conditional jump effect ahead of `Pop` condition | No `if/goto` | Use `branch_stack_width` to consume |
+| No `materialized-condition` | Conditions may be linearized | Condition stack VM submits this hint |
+| Conditional polarity is not marked | true/false side inversion | `detail="target-if-true"` |
+| Backward edges are still marked only with branch-target | loop information is weak | Use `loop-backedge` for backward edges |
+| Put private objects into operand | core/frontend coupling | Only use neutral value/text |
+| Metadata expresses program logic | Recovery is not testable | Use `VMHint` |
+| backend inference loop/goto | multiple frontend inconsistencies | core structuring responsible |
+| GUI crashes from loop edges | CFG view unavailable | Fix/filter display metadata |
+| Parse with subprocess | Platform and diagnostics are unstable | Use library or local parser |
+| frontend executes bytecode for simulation | simulator/frontend dual semantics | frontend only provides adapter, simulator executes generic IR |
+| Adapter randomly selects overloads by name | Runs wrong function | Uses stable query, `NotHandled` when ambiguous |
+| adapter returns callable or decoder object | Execution boundary leaks | Returns only data-only value, `ResolvedFunction` or `NotHandled` |
+| GUI/CLI resolves class names or Lua names by itself | Host and frontend semantics are bifurcated | Only passes opaque query to adapter |
+| runtime.py is put into the simulator | core/host is coupled and cannot be audited | trusted files are loaded by the independent host-support package |
+| Unhandled external calls return null | Fake success results | Return `NotHandled` to let the simulator fail structured |
+| Treat stdin as GUI Args | Runtime cannot receive input or function parameters are misplaced | Clear host input contract, such as environment variables or user-selected input files |
+| runtime writes `sys.stdout.buffer` | GUI stdout capture `AttributeError` | writes text stdout, bytes are explicitly decoded first |
+| Reuse the runtime state of the last run | The simulation is not repeatable and the results depend on the click sequence | Create/reset state for each run |
+| `partial + completed` treated as verified semantics | Error control flow may also reach Return | Compare with reference implementation or known path |
+| Trace stops or changes results after truncation | Observation behavior changes execution semantics | Only truncate events and continue restricted execution |
 
-## 27. 从零实现顺序
+## 27. Implement sequence from scratch
 
-推荐顺序：
+Recommended order:1. Create a directory and manifest.
+2. Write `model.py`.
+3. Write `decoder.py`, first pass `can_load/decode`.
+4. Write minimal `plugin.py`.
+5. Write `lifter.py`, covering the linear opcode first.
+6. Write a small sample to test binary operations and the order of calling parameters.
+7. Add branch target resolver.
+8. Add `VMRegionOpcodeClasses`.
+9. Add `VMStatefulCallbacks`.
+10. Add `branch_condition` and `branch_stack_width`.
+11. Add `target-if-true` and `materialized-condition` to the conditional jump.
+12. Add `loop-backedge` to the backward edge.
+13. Run the complex control flow sample and make sure there is at least `if/goto`.
+14. Add unknown/malformed test.
+15. If simulation is supported, implement target discovery and function resolution of `simulation.py`.
+16. Add simulator project for pure calculation functions, control flow, return values and parameter binding.
+17. Add minimal data-only adapter hooks for language-specific behavior, do not add interpreters.
+18. Add `ExternalEnvironment` test for external calls and test unhandled results.
+19. Execute the real artifact through CLI and confirm that the query, args, and return values are correct.
+20. Register the GUI and confirm that the resource and target can be found, and the trace is visible after Run.
+21. Check that the adapter and host do not have paths that execute frontend bytecode.
+22. Let’s see if we need core to enhance the advanced structure.
 
-1. 建目录和 manifest。
-2. 写 `model.py`。
-3. 写 `decoder.py`，先通过 `can_load/decode`。
-4. 写最小 `plugin.py`。
-5. 写 `lifter.py`，先覆盖线性 opcode。
-6. 写小样例测试二元运算和调用参数顺序。
-7. 加 branch target resolver。
-8. 加 `VMRegionOpcodeClasses`。
-9. 加 `VMStatefulCallbacks`。
-10. 加 `branch_condition` 和 `branch_stack_width`。
-11. 给条件跳转加 `target-if-true` 和 `materialized-condition`。
-12. 给后向边加 `loop-backedge`。
-13. 跑复杂控制流样本，确认至少有 `if/goto`。
-14. 补 unknown/malformed 测试。
-15. 如果支持模拟，实现 `simulation.py` 的 target discovery 和函数解析。
-16. 为纯计算函数、控制流、返回值和参数绑定增加 simulator project。
-17. 为语言特有行为增加最小 data-only adapter hook，不要增加解释器。
-18. 为外部调用增加 `ExternalEnvironment` 测试，并测试未处理结果。
-19. 通过 CLI 执行真实 artifact，确认 query、args、return values 正确。
-20. 注册 GUI，确认不是 resource、target 能发现、Run 后 trace 可见。
-21. 检查 adapter 和 host 没有执行 frontend bytecode 的路径。
-22. 再看是否需要 core 增强高级结构化。
+## 28. Completion criteria
 
-## 28. 完成标准
+A frontend is completed within the target support range, and at least satisfies:
 
-一个 frontend 在目标支持范围内完成，至少要满足：
+- decoder can stably parse target files.
+- Each decodable instruction generates a step.
+- `SourceRef` offset is correct.
+- The effect table covers all known opcodes.
+- unknown opcode is diagnostic.
+- Control flow target is correct.
+- Conditional jumps are not incorrectly linearized.
+- Complex control flow outputs at least low-level `if/goto`.
+- No misleading success status.
+- GUI can register, identify, decompile, and display CFG.
+- Test coverage decoder, effects, control hints, integration.
 
-- decoder 能稳定解析目标文件。
-- 每条可解码 instruction 都生成 step。
-- `SourceRef` offset 正确。
-- effect table 覆盖所有已知 opcode。
-- unknown opcode 可诊断。
-- 控制流 target 正确。
-- 条件跳转不被错误线性化。
-- 复杂控制流至少输出低层 `if/goto`。
-- 没有误导性的成功状态。
-- GUI 能注册、识别、反编译、显示 CFG。
-- 测试覆盖 decoder、effects、control hints、integration。
+Impersonation support is optional, and not supporting impersonation does not disqualify frontend from decompilation capabilities. if
+The frontend declares that it supports simulation and must also meet:
 
-模拟支持是可选的，不支持模拟不会使 frontend 反编译能力不合格。如果
-frontend 声明支持模拟，还必须满足：
+- `simulation_adapter` provides data-only target lookup and runtime facts.
+- All simulation targets can resolve the function of the current lifted `ModuleIR`.
+- The simulator executes generic IR, and the frontend does not execute bytecode and does not maintain the simulator frame/stack.
+- Tests cover target discovery, ambiguous queries, parameters, return values, and runtime facts of the target language.
+- Tests cover at least one control flow scenario and one external environment scenario.
+- Unresolved calls, unsupported IR, exceptions, limit violations and cancellations all have structured results.
+- CLI/GUI only consumes the public simulator API and does not implement language-specific search and execution logic.
+- `simulator_projects` with source code, generated artifacts and repeatable validation of expectations.
 
-- `simulation_adapter` 只提供 data-only target lookup 和 runtime facts。
-- 所有 simulation target 都能解析到当前 lifted `ModuleIR` 的函数。
-- simulator 执行 generic IR，frontend 不执行字节码、不维护模拟器 frame/stack。
-- 测试覆盖 target discovery、歧义查询、参数、返回值和目标语言的运行时事实。
-- 测试覆盖至少一个控制流场景和一个外部 environment 场景。
-- 无法解析的调用、unsupported IR、异常、超限和取消都有结构化结果。
-- CLI/GUI 只消费 public simulator API，不实现语言专有查找和执行逻辑。
-- `simulator_projects` 中有源代码、生成 artifact 和可重复的期望值验证。
+If these are met, but you still cannot output advanced `while/for/switch`, this is usually not a frontend defect, but the core's current structural capability boundary. Frontend cannot bypass core in order to display more beautifully.
 
-如果这些都满足，但仍不能输出高级 `while/for/switch`，这通常不是 frontend 缺陷，而是 core 当前结构化能力边界。Frontend 不能为了显示更漂亮而绕过 core。
+## 29. Choose your VM modeling path
 
-## 29. 选择你的 VM 建模路径
+Different VMs have different implementation entrances, but in the end they all submit the same thin IR.
 
-不同 VM 的实现入口不同，但最终都要提交同一种 thin IR。
+First determine which category the VM belongs to, and then choose a modeling strategy.
 
-先判断 VM 属于哪类，再选建模策略。
-
-| VM 类型 | 常见特征 | frontend 建模方式 | 控制流重点 |
+| VM types | Common characteristics | frontend modeling methods | Control flow focus |
 |---|---|---|---|
-| 纯栈机 | opcode 从 operand stack 取值 | `Push`、`Pop`、`Binary`、`CallStackArgs` | 栈上条件、栈上 target、`branch_stack_width` |
-| 寄存器 VM | opcode 显式读写寄存器/槽位 | 用 `LoadLocal`/`StoreLocal` 或 register 命名 locals | branch condition 多来自寄存器表达式 |
-| 累加器 VM | 隐式 accumulator | 把 accumulator 映射为稳定 local，例如 `acc` | 每条运算要更新 `acc` |
-| 三地址码 VM | `dst = op src1 src2` | `LoadLocal` + `Binary` + `StoreLocal`，或直接 `AssignValue` | target 通常是 immediate/relative |
-| typed stack VM | 栈值有类型 | effect 保持表达式，metadata 可保留类型 | merge 点类型一致性很重要 |
-| native-like bytecode | 有地址、跳表、间接跳转 | 保守 target recovery，未知间接跳转 partial | 不要猜 computed jump |
-| AST-ish bytecode | opcode 已接近语法节点 | 仍提交 thin facts，不构造 AST | 让 core 统一恢复结构 |
+| Pure stack machine | opcode takes value from operand stack | `Push`, `Pop`, `Binary`, `CallStackArgs` | Conditions on the stack, target on the stack, `branch_stack_width` |
+| Register VM | opcode explicitly reads and writes registers/slots | Use `LoadLocal`/`StoreLocal` or register to name locals | branch condition mostly comes from register expressions |
+| Accumulator VM | Implicit accumulator | Map accumulator to stable local, such as `acc` | Update `acc` for each operation |
+| Three address code VM | `dst = op src1 src2` | `LoadLocal` + `Binary` + `StoreLocal`, or directly `AssignValue` | target is usually immediate/relative |
+| typed stack VM | Stack values have types | effect retains expressions, metadata can retain types | merge point type consistency is important |
+| native-like bytecode | with address, jump table, indirect jump | conservative target recovery, unknown indirect jump partial | don't guess computed jump |
+| AST-ish bytecode | opcode is close to the syntax node | Still submit thin facts, do not construct AST | Let core restore the structure uniformly |
 
-如果 VM 不是栈机，不要强行套用栈机例子。目标是表达等价事实，而不是模拟文档里的 opcode 名。
+If the VM is not a stack machine, do not force the stack machine example. The goal is to express equivalent facts, not to emulate the opcode names in the document.
 
-## 30. API 契约速查
+## 30. API Contract Quick Check
 
-本节把常用对象的字段集中列出，便于写代码时对照。
+This section lists the fields of commonly used objects in a centralized manner to facilitate comparison when writing code.
 
 ### FrontendPlugin
 
-| 成员 | 类型 | 必需 | 说明 |
+| Members | Type | Required | Description |
 |---|---|---:|---|
-| `id` | `str` | 是 | 稳定 frontend id |
-| `display_name` | `str` | 是 | GUI 展示名 |
-| `supported_inputs` | `tuple[str, ...]` | 推荐 | 展示和选择辅助 |
-| `version_support` | `FrontendVersionSupport` | 推荐 | 支持版本说明 |
-| `can_load(data, filename)` | method | 是 | 快速判断输入是否可能属于该 frontend |
-| `decode(data, filename)` | method | 是 | 返回 `FrontendModule` 或抛 `FrontendDecodeError` |
-| `lift(module)` | method | 是 | 返回 `ModuleIR` |
+| `id` | `str` | yes | stable frontend id |
+| `display_name` | `str` | Yes | GUI display name |
+| `supported_inputs` | `tuple[str, ...]` | Recommended | Display and selection aids |
+| `version_support` | `FrontendVersionSupport` | Recommended | Support version notes |
+| `can_load(data, filename)` | method | Yes | Quickly determine whether the input may belong to the frontend |
+| `decode(data, filename)` | method | Yes | Return `FrontendModule` or throw `FrontendDecodeError` |
+| `lift(module)` | method | yes | returns `ModuleIR` |
 
-`can_load()` 不应抛普通解析错误。遇到“可能是本格式但内容损坏”的情况，可以返回 `True`，再由 `decode()` 给出精确错误。
+`can_load()` should not throw ordinary parsing errors. In the case of "it may be in this format but the content is damaged", you can return `True` and then use `decode()` to give the precise error.
 
 ### FrontendModule
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |---|---|---|
-| `frontend_id` | `str` | 必须等于 plugin id |
-| `payload` | `object` | frontend 私有 decoder 模型 |
-| `metadata` | `dict` | provenance、版本、diagnostics、统计信息 |
+| `frontend_id` | `str` | Must equal plugin id |
+| `payload` | `object` | frontend private decoder model |
+| `metadata` | `dict` | provenance, version, diagnostics, statistics |
 
-`payload` 不会被 core 解释。只有同一个 frontend 的 `lift()` 可以读取它。
+`payload` will not be interpreted by core. Only `lift()` of the same frontend can read it.
 
 ### VMBytecodeStep
 
-| 字段 | 类型 | 必需 | 说明 |
+| Field | Type | Required | Description |
 |---|---|---:|---|
-| `opcode` | `str` | 是 | 稳定 opcode 名 |
-| `source` | `SourceRef` | 是 | 原始来源 |
-| `decoded` | `VMDecodedInstruction | None` | 推荐 | GUI/CLI 展示 |
-| `raw` | `str` | 推荐 | 原始反汇编文本 |
-| `effects` | `tuple[Effect, ...] | None` | 是 | thin stack/value facts |
-| `hints` | `tuple[VMHint, ...]` | 推荐 | 控制流/调用/聚合等事实 |
+| `opcode` | `str` | yes | stable opcode name |
+| `source` | `SourceRef` | is | the original source |
+| `decoded` | `VMDecodedInstruction | None` | Recommended | GUI/CLI demonstration |
+| `raw` | `str` | Recommended | Raw disassembly text |
+| `effects` | `tuple[Effect, ...] | None` | Yes | thin stack/value facts |
+| `hints` | `tuple[VMHint, ...]` | Recommended | Control flow/call/aggregation facts |
 
-`effects` 的三种状态：
+Three states of `effects`:
 
-| 写法 | 含义 | 典型用途 |
+| Writing | Meaning | Typical uses |
 |---|---|---|
-| `()` | 明确无语义 | `NOP`、padding |
-| `(UnknownOpcode(...),)` | 已知指令边界但语义未知 | 保留 raw context |
-| `None` | 该 opcode 当前无法安全表达 | 让 core partial/unsupported |
+| `()` | Explicit and unsemantic | `NOP`, padding |
+| `(UnknownOpcode(...),)` | Instruction bounds are known but semantics are unknown | Keep raw context |
+| `None` | This opcode cannot currently be expressed safely | Let core partial/unsupported |
 
-不要用 `()` 表示“还没实现”。
+Don't use `()` to mean "not yet implemented".
 
 ### VMHint
 
-| 字段 | 类型 | 说明 |
+| Field | Type | Description |
 |---|---|---|
-| `kind` | `str` | hint 类型 |
-| `source` | `SourceRef` | hint 来源 |
+| `kind` | `str` | hint type |
+| `source` | `SourceRef` | hint source |
 | `target` | `int | None` | bytecode target offset |
-| `value` | `object | None` | case value、region dict、shape 信息 |
-| `label` | `str` | 展示标签 |
-| `detail` | `str | None` | 中立细节，例如 `target-if-true` |
-| `flow` | `str | None` | `conditional`、`unconditional`、`multiway` |
+| `value` | `object | None` | case value, region dict, shape information |
+| `label` | `str` | Display label |
+| `detail` | `str | None` | Neutral details, such as `target-if-true` |
+| `flow` | `str | None` | `conditional`, `unconditional`, `multiway` |
 
-常用字段组合：
+Common field combinations:
 
-| kind | 必填 | 可选 | 说明 |
+| kind | required | optional | description |
 |---|---|---|---|
-| `branch-target` | `target` | `flow`、`detail`、`label` | 前向或普通跳转 |
-| `loop-backedge` | `target` | `flow`、`detail`、`label` | 后向边 |
+| `branch-target` | `target` | `flow`, `detail`, `label` | Forward or normal jump |
+| `loop-backedge` | `target` | `flow`, `detail`, `label` | Backedge |
 | `case-target` | `target`, `value` | `label` | switch case |
 | `default-target` | `target` | `label` | switch default |
-| `fallthrough` | `target` | `label` | 显式 fallthrough fact |
-| `materialized-condition` | 无 | `detail`, `flow` | 条件已在栈/寄存器中物化 |
+| `fallthrough` | `target` | `label` | explicit fallthrough fact |
+| `materialized-condition` | None | `detail`, `flow` | Condition has been materialized on stack/register |
 | `exception-region` | `value` | `label` | try/protected range |
-| `call-shape` | `value` | `label` | 调用参数/返回形状 |
+| `call-shape` | `value` | `label` | Call parameters/return shape |
 | `aggregate-shape` | `value` | `label` | array/map/object shape |
 
 ### VMStatefulCallbacks
 
-| callback | 输入 | 返回 | 说明 |
+| callback | input | return | description |
 |---|---|---|---|
-| `initial_locals` | 无 | `dict[str, Expr]` | 函数入口 locals |
-| `lift_linear` | `start, end, locals, stack` | `VMLinearState | None` | 解释线性 slice |
-| `branch_condition` | `branch, stack_slice` | `Expr | None` | 从消费栈片段构造条件 |
-| `branch_stack_width` | `instruction` | `int` | branch 在 CFG 语义上消费的栈值数量 |
+| `initial_locals` | None | `dict[str, Expr]` | Function entry locals |
+| `lift_linear` | `start, end, locals, stack` | `VMLinearState | None` | Interpret linear slice |
+| `branch_condition` | `branch, stack_slice` | `Expr | None` | Construct condition from consumption stack slice |
+| `branch_stack_width` | `instruction` | `int` | The number of stack values consumed by branch in CFG semantics |
 
-`branch_stack_width` 不是“opcode operand 数”。它是 core 在分支边上应从 stack state 移除的值数。
+`branch_stack_width` is not an "opcode operand number". It is the number of core values that should be removed from the stack state on the branch edge.
 
-如果 branch target 是 immediate，不在栈上，width 通常只包含 condition。如果 condition 和 target 都在栈上，width 通常是 2。
+If the branch target is immediate and not on the stack, width usually only contains condition. If both condition and target are on the stack, width is usually 2.
 
 ### SimulationAdapter
 
-`SimulationAdapter` 是可选的 frontend 能力，不属于 core lifting API。
+`SimulationAdapter` is an optional frontend capability and is not part of the core lifting API.
 
-| 成员 | 输入 | 返回 | 说明 |
+| Members | Input | Return | Description |
 |---|---|---|---|
-| `frontend_id` | 无 | `str` | 必须等于 plugin id |
-| `resolve_function` | `query`, `decoded_module`, `lifted_module` | `ResolvedFunction` 或 `NotHandled` | frontend-specific 目标解析 |
-| `list_simulation_targets` | `decoded_module`, `lifted_module` | `tuple[SimulationTargetCandidate, ...]` 或 `NotHandled` | GUI/CLI 的 target discovery |
+| `frontend_id` | None | `str` | Must equal plugin id |
+| `resolve_function` | `query`, `decoded_module`, `lifted_module` | `ResolvedFunction` or `NotHandled` | frontend-specific target resolution |
+| `list_simulation_targets` | `decoded_module`, `lifted_module` | `tuple[SimulationTargetCandidate, ...]` or `NotHandled` | GUI/CLI target discovery |
 
-可选运行时 facts 使用同一个 data-only adapter，但不是执行入口：
+Optional runtime facts use the same data-only adapter, but not the execution entry point:
 
-| hook | 作用 |
+| hook | function |
 |---|---|
-| `resolve_global` | 解析全局名称为 `ResolvedFunction` 或 `IntrinsicCall` |
-| `resolve_call` | 解析动态调用请求 |
-| `resolve_indirect_call` | 解析受控的间接调用 |
-| `truthy` | 语言特有真假值 |
-| `binary_op` / `unary_op` | 语言特有运算 |
-| `get_attr` / `set_attr` | 成员访问 |
-| `get_item` / `set_item` | 索引访问 |
-| `iterate` | 迭代器值视图 |
-| `set_captured` | 捕获变量更新 |
+| `resolve_global` | Resolve global name as `ResolvedFunction` or `IntrinsicCall` |
+| `resolve_call` | Resolve dynamic call request |
+| `resolve_indirect_call` | Resolve controlled indirect calls |
+| `truthy` | Language-specific truth and false values |
+| `binary_op` / `unary_op` | Language-specific operations |
+| `get_attr` / `set_attr` | Member access |
+| `get_item` / `set_item` | Index access |
+| `iterate` | Iterator value view |
+| `set_captured` | Capture variable updates |
 
-以上 hook 缺省都应返回 `NotHandled`。返回值必须是 validated generic runtime
-value、`ResolvedFunction`、`IntrinsicCall` 或 `NotHandled`。不能返回 callable、
-frame、stack、module、decoder model 或其它执行对象。
+The above hooks should all return `NotHandled` by default. The return value must be validated generic runtime
+value, `ResolvedFunction`, `IntrinsicCall` or `NotHandled`. Cannot return callable,
+frame, stack, module, decoder model or other execution object.
 
 ### ExternalEnvironment
 
-`ExternalEnvironment` 由 CLI、GUI 或 embedding host 注入，不由 frontend
-自动创建：
+`ExternalEnvironment` is injected by CLI, GUI or embedding host, not by frontend
+Automatically created:
 
-| 类型 | 作用 |
+| Type | Function |
 |---|---|
-| `ExternalCallRequest` | 函数名、参数、关键字参数、caller 和 source 的数据请求 |
-| `ExternalCallResult` | returned、raised 或 not handled 的结构化结果 |
-| `NotHandled` | host 不负责该调用 |
-
-environment 不接收 `ModuleIR`、`FunctionIR`、frame、stack、adapter 或 runner。
-`runtime.py` 的加载属于 host-support package，且是受信任代码执行，不是
-simulator sandbox。
+| `ExternalCallRequest` | Data request for function name, parameters, keyword parameters, caller and source |
+| `ExternalCallResult` | A structured result that was returned, raised, or not handled |
+| `NotHandled` | The host is not responsible for the call |environment does not accept `ModuleIR`, `FunctionIR`, frame, stack, adapter or runner.
+The loading of `runtime.py` belongs to the host-support package and is a trusted code execution, not
+simulator sandbox.
 
 ## 31. Effect cookbook
 
-下面是常见 effect 的选择准则。
+The following are selection guidelines for common effects.
 
-| 目标语义 | 推荐 effect | 栈输入 | 栈输出 | 备注 |
+| Target semantics | Recommended effects | Stack input | Stack output | Remarks |
 |---|---|---|---|---|
-| 压常量 | `Push(Const(...))` | 0 | 1 | 常量值必须是稳定值 |
-| 弹弃值 | `Pop(count=n)` | n | 0 | 不要用于条件跳转提前消费 |
-| 复制栈值 | `Copy`/`DuplicateTop` | 视 effect | 视 effect | 用于 dup 类 opcode |
-| 交换顺序 | `Swap(depth=n)` | n | n | 常见于非默认操作数顺序 |
-| 二元运算 | `Binary(op=...)` | 2 | 1 | 先确认 left/right 顺序 |
-| 比较 | `Binary(op=\"==\")` 或 `Compare` | 2 | 1 | 输出条件表达式 |
-| 读 local | `LoadLocal(name=...)` | 0 | 1 | 寄存器可映射为 local |
-| 写 local | `StoreLocal(name=...)` | 1 | 0 | 用稳定 local 名 |
-| 调用 | `CallStackArgs`/`Invoke` | argc | returns | runtime API 用可读 callee |
-| 返回栈顶 | `ReturnTop` | 1 | 终止 | 函数返回值 |
-| 无值返回 | `ReturnVoid` | 0 | 终止 | halt/void return |
-| 未知 | `UnknownOpcode` | 未定 | unsupported | 保留 raw |
+| Pressure constant | `Push(Const(...))` | 0 | 1 | The constant value must be a stable value |
+| Pop-up value | `Pop(count=n)` | n | 0 | Do not use for conditional jump and early consumption |
+| Copy stack value | `Copy`/`DuplicateTop` | Visual effect | Visual effect | Used for dup class opcode |
+| Swap order | `Swap(depth=n)` | n | n | Common in non-default operand order |
+| Binary operation | `Binary(op=...)` | 2 | 1 | Confirm the left/right order first |
+| Compare | `Binary(op=\"==\")` or `Compare` | 2 | 1 | Output conditional expression |
+| Read local | `LoadLocal(name=...)` | 0 | 1 | Register mappable as local |
+| write local | `StoreLocal(name=...)` | 1 | 0 | use stable local name |
+| call | `CallStackArgs`/`Invoke` | argc | returns | runtime API readable callee |
+| Return to the top of the stack | `ReturnTop` | 1 | Terminate | Function return value |
+| Return without value | `ReturnVoid` | 0 | Terminate | halt/void return |
+| Unknown | `UnknownOpcode` | Undecided | unsupported | Reserved raw |
 
-选择 effect 时优先保持语义精确。无法精确表达时，不要写“看起来能跑”的近似 effect。
+Prioritize semantic precision when choosing an effect. When it cannot be expressed accurately, do not write an approximate effect of "it looks like it can run".
 
-## 32. 寄存器 VM 建模模板
+## 32. Register VM modeling template
 
-寄存器 VM 不需要把所有东西伪装成 operand stack。
+The register VM doesn't need to disguise everything as an operand stack.
 
-可以把寄存器映射为 core local：
-
+Registers can be mapped as core local:
 ```python
 def reg_name(index: int) -> str:
     return f"r{index}"
 ```
-
-三地址运算：
-
+Three address operations:
 ```text
 ADD dst, left, right
 ```
-
-可建模为：
-
+It can be modeled as:
 ```python
 return (
     LoadLocal(source=src, name=reg_name(left)),
@@ -2351,19 +2436,15 @@ return (
     StoreLocal(source=src, name=reg_name(dst)),
 )
 ```
-
-寄存器条件跳转：
-
+Register conditional jump:
 ```text
 JUMP_IF_ZERO r3, target
 ```
+If target is immediate, the effect does not need to keep target on the stack.
 
-如果 target 是 immediate，effect 不需要保留 target 在栈上。
+There are two safe ways to write.
 
-有两种安全写法。
-
-第一种：在该 branch instruction 的 effect 中把寄存器条件临时压到 core stack，然后让 `branch_stack_width` 消费 1 个条件值。这适合当前 core 的 stateful branch callback 模型：
-
+The first one: temporarily push the register condition to the core stack in the effect of the branch instruction, and then let `branch_stack_width` consume 1 condition value. This fits the current core's stateful branch callback model:
 ```python
 def effects_for_jump_if_zero(ins, src):
     return (LoadLocal(source=src, name=reg_name(ins.condition_reg)),)
@@ -2376,11 +2457,9 @@ def branch_condition(branch, stack):
 
 branch_stack_width=lambda ins: 1 if ins.opcode == "JUMP_IF_ZERO" else 0
 ```
+This way of writing is not an "early pop condition". It just materializes the register condition into an expression visible to the branch callback; what is actually removed from the stack state is `branch_stack_width`.
 
-这种写法不是“提前 pop 条件”。它只是把寄存器条件 materialize 成 branch callback 可见的表达式；真正从 stack state 移除的是 `branch_stack_width`。
-
-同时提交 target hint：
-
+Submit target hint at the same time:
 ```python
 VMHint(
     kind="branch-target",
@@ -2390,30 +2469,28 @@ VMHint(
     detail="target-if-true",
 )
 ```
+This type of VM usually does not need `materialized-condition`, because the condition is not the value that the preorder opcode has left on the operand stack, but the branch instruction itself reading the register.
 
-这类 VM 通常不需要 `materialized-condition`，因为条件不是前序 opcode 已经留在 operand stack 上的值，而是 branch instruction 自己读取寄存器。
-
-第二种：如果后续 core 扩展支持直接从 decoded operand 生成 branch condition，可以让 callback 读取 `branch.decoded.operands` 中的 register operand 并构造 `LoadLocal`/`BinaryOp`。在当前文档模板里优先使用第一种，因为它只依赖已有 effects/callbacks。
+Second: If subsequent core extensions support branch condition generation directly from decoded operand, callback can be used to read the register operand in `branch.decoded.operands` and construct `LoadLocal`/`BinaryOp`. The first one is preferred in the current document template because it only relies on existing effects/callbacks.
 
 ## 33. Binary decoder cookbook
 
-二进制 VM decoder 要先把容器和 instruction stream 分清楚。
+The binary VM decoder must first clearly distinguish the container and instruction stream.
 
-建议顺序：
+Suggested order:
 
-1. 检查 magic/header。
-2. 读取 version。
-3. 确定 endianness。
-4. 解析 section table 或 code offset。
-5. 解析 constant pool。
-6. 解析函数表或入口点。
-7. 解析 instruction stream。
-8. 解析 debug/local/symbol 信息。
-9. 校验 branch target 是否落在指令边界。
-10. 保存 raw bytes 或反汇编文本。
+1. Check magic/header.
+2. Read version.
+3. Determine endianness.
+4. Parse section table or code offset.
+5. Parse constant pool.
+6. Parse the function table or entry point.
+7. Parse the instruction stream.
+8. Parse debug/local/symbol information.
+9. Verify whether the branch target falls on the instruction boundary.
+10. Save raw bytes or disassembled text.
 
-固定宽度 instruction：
-
+Fixed width instruction:
 ```python
 offset = code_start
 while offset < code_end:
@@ -2422,9 +2499,7 @@ while offset < code_end:
     instructions.append(MyInstruction(offset=offset, opcode=opcode_name(opcode), size=4, operands=(operand,)))
     offset += 4
 ```
-
-变长 instruction：
-
+Variable length instruction:
 ```python
 offset = code_start
 while offset < code_end:
@@ -2447,49 +2522,43 @@ Absolute branch target：
 ```python
 target = code_base + absolute_offset
 ```
+Regardless of the target, the final value submitted to `VMHint.target` must use the same coordinate system as `SourceRef.offset`.
 
-无论哪种 target，最后提交给 `VMHint.target` 的值都必须和 `SourceRef.offset` 使用同一坐标系。
+## 34. Target recovery strategy
 
-## 34. Target recovery 策略
+There are six common Target sources.
 
-Target 来源常见有六种。
-
-| 来源 | 策略 | 失败时 |
+| Source | Strategy | On Failure |
 |---|---|---|
-| immediate absolute | 直接解析 | invalid target diagnostic |
+| immediate absolute | direct analysis | invalid target diagnostic |
 | immediate relative | `offset + size + delta` | invalid target diagnostic |
-| constant pool label | 查表解析 | unknown label unsupported |
-| stack constant | 局部常量传播 | 算不出就不猜 |
-| register constant | 数据流/fixpoint | 算不出就 partial |
-| jump table | `case-target/default-target` | 缺项就 partial |
+| constant pool label | table lookup analysis | unknown label unsupported |
+| stack constant | local constant propagation | don’t guess if you can’t calculate |
+| register constant | data flow/fixpoint | partial if not calculated |
+| jump table | `case-target/default-target` | Missing items are partial |
 
-简单线性常量传播只能覆盖无 join 或 join 不影响 target 的情况。
+Simple linear constant propagation can only cover the case where there is no join or the join does not affect the target.
 
-遇到分支 join、循环或寄存器 target 时，应使用保守数据流：
-
+When encountering branch joins, loops, or register targets, conservative data flow should be used:
 ```text
-每个 program point 保存 abstract state
-常量值为 int
-未知值为 Unknown
-不同常量 merge 后变 Unknown
-worklist 直到 fixpoint
-只提交确定为单一 int 且在 valid_offsets 中的 target
+each program point stores an abstract state
+constant values are int
+unknown values are Unknown
+merging different constants produces Unknown
+worklist until a fixpoint
+submit only targets known to be a single int and present in valid_offsets
 ```
+Don't submit the "most likely" target. A false target is worse than an unknown target because it produces misleading CFG.
 
-不要提交“最可能”的 target。错误 target 比 unknown target 更糟，因为它会产生误导性 CFG。
+## 35. Switch and jump table
 
-## 35. Switch 和 jump table
+Switch-like opcode should not pretend to be a series of ordinary conditional jumps.
 
-Switch-like opcode 不应伪装成一串普通条件跳转。
-
-如果 VM 明确提供多路分发：
-
+If the VM explicitly provides multicast distribution:
 ```text
 SWITCH selector, default, [(case0, target0), (case1, target1)]
 ```
-
-提交：
-
+submit:
 ```python
 hints = (
     VMHint(kind="default-target", source=src, target=default_target, flow="multiway"),
@@ -2497,22 +2566,20 @@ hints = (
     VMHint(kind="case-target", source=src, value=case1, target=target1, flow="multiway"),
 )
 ```
+`branch_stack_width` should override the selector and any on-stack target. If the selector comes from a register or immediate, don't count it as being pushed onto the stack.
 
-`branch_stack_width` 应覆盖 selector 和任何栈上 target。如果 selector 来自寄存器或 immediate，不要把它算进栈消费。
+Jump table common mistakes:
 
-Jump table 常见错误：
-
-- 忘记 default target。
-- case value 和 case index 混用。
-- table entry 是 relative offset，但按 absolute 提交。
-- 把无法解析的 computed jump 猜成 switch。
+- Forget the default target.
+- Mix case value and case index.
+- table entry is relative offset but submitted as absolute.
+- Guess unresolved computed jump as switch.
 
 ## 36. Exception region
 
-异常表是控制流事实，应该用 hint 表达。
+Exception tables are control flow facts and should be expressed using hints.
 
-典型信息：
-
+Typical information:
 ```text
 protected_start
 protected_end
@@ -2521,9 +2588,7 @@ exception_type
 stack_depth
 binding_name
 ```
-
-可提交：
-
+Can be submitted:
 ```python
 VMHint(
     kind="exception-region",
@@ -2536,117 +2601,115 @@ VMHint(
     },
 )
 ```
+Rules:
 
-规则：
+- `start/end/target` uses the same offset coordinate system.
+- `end` is the boundary defined by the VM format, usually the end of the half-open range.
+- The handler target must fall within the instruction boundary.
+- exception type can be a neutral string or a constant identifier.
+- Don't put try/catch AST nodes into the frontend.
 
-- `start/end/target` 使用同一 offset 坐标系。
-- `end` 是 VM 格式定义的边界，通常是半开区间末尾。
-- handler target 必须落在 instruction boundary。
-- exception type 可以是中立字符串或常量标识。
-- 不要把 try/catch AST 节点放进 frontend。
+If the VM has complex semantics such as finally, filter, fault, resume, etc., and existing hints cannot express them, priority should be given to supplementing VM-neutral fact or making core partial.
 
-如果 VM 有 finally、filter、fault、resume 等复杂语义，而现有 hint 不能表达，应优先补 VM-neutral fact 或让 core partial。
+## 37. Function discovery and calling convention
 
-## 37. 函数发现与调用约定
+Many frontend difficulties lie in function discovery, not in a single opcode.
 
-很多 frontend 的难点在函数发现，不在单条 opcode。
+Function sources may be:
 
-函数来源可能是：
+- Explicit function tables.
+- debug/symbol table.
+- Entry point + call target recursively discovered.
+- section metadata.
+- Fixed offset.
+- Flat programs wrapped into `main`.
 
-- 显式函数表。
-- debug/symbol table。
-- 入口点 + call target 递归发现。
-- section metadata。
-- 固定 offset。
-- 平坦程序包装成 `main`。
+Rules:
 
-规则：
+- Each function generates `VMFunctionSpec` independently.
+- A function being unsupported should not block other functions.
+- Use a stable synthetic name when the function name is missing, for example `sub_0040`.
+- `params` only puts certain parameters.
+- `local_names` only puts locals confirmed by VM/debug information.
+- When the call target is uncertain, the call can be conservatively expressed as an indirect call.
 
-- 每个函数独立生成 `VMFunctionSpec`。
-- 一个函数 unsupported 不应阻止其他函数。
-- 函数名没有时用稳定合成名，例如 `sub_0040`。
-- `params` 只放确定的参数。
-- `local_names` 只放 VM/debug 信息确认的 locals。
-- call target 不确定时，调用可以保守表达为 indirect call。
+The calling convention needs to be clear:
 
-调用约定需要明确：
-
-| 问题 | 示例 |
+| Question | Example |
 |---|---|
-| 参数来自哪里 | stack、register、locals、argument area |
-| 返回值放哪里 | stack、register、memory |
-| call 是否清栈 | caller-clean、callee-clean |
-| 是否可能抛异常 | exception edge |
-| 是否有 closure/upvalue | captured locals |
+| Where the parameters come from | stack, register, locals, argument area |
+| Where to put the return value | stack, register, memory |
+| whether call clears the stack | caller-clean, callee-clean |
+| Is it possible to throw an exception | exception edge |
+| Is there closure/upvalue | captured locals |
 
-如果调用约定不清楚，不要为了美观生成错误参数列表。优先保留低层调用形态。
+If the calling convention is unclear, don't generate an incorrect parameter list for the sake of aesthetics. Give priority to retaining low-level calling forms.
 
-### 37.1 模拟目标发现和查询约定
+### 37.1 Simulation target discovery and query conventions
 
-函数发现同样决定 simulation 是否可用。反编译阶段可以使用合成名称或保守
-的 indirect call；模拟阶段则必须能把用户选择的 target query 唯一映射到
-当前 lifted module 中的一个函数。
+Function discovery also determines whether simulation is available. The decompilation phase can use synthetic names or conservative
+indirect call; the simulation phase must be able to uniquely map the target query selected by the user to
+A function in the current lifted module.
 
-为每种 frontend 在 README 和测试中记录：
+Documented in the README and tests for each frontend:
 
-| 项目 | 必须明确的问题 |
+| Project | Issues that must be clarified |
 |---|---|
-| target label | GUI/CLI 显示给用户的稳定名称是什么 |
-| query | frontend 接收的 data-only 标识是什么 |
-| 唯一性 | 重载、同名 nested function、匿名函数如何消歧 |
-| 参数 | 参数名是否可靠，是否支持 keyword 参数 |
-| receiver/context | instance method、closure、upvalue 如何以 data-only context 表达 |
-| 外部调用 | 哪些调用由 adapter 解析，哪些交给 environment |
+| target label | What is the stable name displayed to the user by the GUI/CLI |
+| query | What is the data-only flag received by frontend |
+| Uniqueness | How to disambiguate overloading, nested function with the same name, and anonymous functions |
+| Parameters | Whether the parameter name is reliable and whether the keyword parameter is supported |
+| receiver/context | How to express instance method, closure and upvalue in data-only context |
+| External calls | Which calls are resolved by the adapter and which are handed over to the environment |
 
-推荐策略：
+Recommended strategy:
 
-- 名称全局唯一时，query 可以是字符串名称。
-- 同名方法存在时，query 应包括 owner 和 descriptor/signature。
-- 匿名函数应使用稳定的 source offset、function index 或 frontend-defined id，
-  不能使用 Python object identity。
-- instance receiver、closure context 或 member selection 只能作为
-  `ResolvedFunction.context` 的 data，不得是 callable 或 frontend executor。
-- adapter 无法可靠解析时返回 `NotHandled`；不要选第一个匹配项。
+- query can be a string name when the name is globally unique.
+- When a method with the same name exists, the query should include owner and descriptor/signature.
+- Anonymous functions should use stable source offset, function index or frontend-defined id,
+  Python object identity cannot be used.
+- instance receiver, closure context or member selection can only be used as
+  The data of `ResolvedFunction.context` must not be callable or frontend executor.
+- Return `NotHandled` when the adapter cannot be resolved reliably; do not select the first match.
 
-`list_simulation_targets()` 只列出当前 artifact 中可唯一解析的入口 target。
-它不应为了方便把每个 nested helper、合成 bridge 或无法满足参数约定的函数
-都暴露给用户。需要暴露时，label 必须说明其稳定身份。
+`list_simulation_targets()` only lists the uniquely resolvable entry targets in the current artifact.
+It should not make every nested helper, synthetic bridge, or function that cannot satisfy the argument convention a convenience
+are exposed to users. When exposed, the label must indicate its stable identity.
 
-## 38. Unsupported 决策矩阵
+## 38. Unsupported decision matrix
 
-| 情况 | frontend 行为 | 结果 |
+| situation | frontend behavior | result |
 |---|---|---|
-| 输入不是本格式 | `can_load=False` | 交给其他 frontend |
-| 看起来是本格式但 header 损坏 | `decode()` 抛 `FrontendDecodeError` | 用户看到 decode error |
-| opcode 边界无法确定 | `decode()` 抛 `FrontendDecodeError` | 防止错位解析 |
-| opcode 已知但未实现 effect | `UnknownOpcode` 或 `effects=None` | partial/unsupported |
-| branch target 无效 | 提交 diagnostic，不猜 target | partial/unsupported |
-| branch target 算不出 | 不提交 target hint | partial/unsupported 或线性片段 |
-| 栈深度不足 | 让 core diagnostic | partial/unsupported |
-| control flow 太复杂 | 正确 effects/hints + stateful callbacks | `if/goto` fallback |
-| core 能安全结构化 | 正确 facts | `if/while/switch` |
+| The input is not in this format | `can_load=False` | Leave it to other frontend |
+| It looks like this format but the header is damaged | `decode()` throws `FrontendDecodeError` | User sees decode error |
+| The opcode boundary cannot be determined | `decode()` throws `FrontendDecodeError` | Prevent misaligned parsing |
+| opcode known but not implemented effect | `UnknownOpcode` or `effects=None` | partial/unsupported |
+| branch target is invalid | Submit diagnostic, do not guess target | partial/unsupported |
+| branch target cannot be calculated | do not submit target hint | partial/unsupported or linear fragment |
+| Insufficient stack depth | Let core diagnostic | partial/unsupported |
+| control flow is too complex | correct effects/hints + stateful callbacks | `if/goto` fallback |
+| core can be safely structured | correct facts | `if/while/switch` |
 
-开发时要避免两种危险假成功：
+There are two dangers to avoid during development: false success:
 
-- 输出 `status ok`，但复杂控制流被线性化。
-- 输出高级结构，但条件极性或 target 错。
+- Output `status ok`, but complex control flow is linearized.
+- The high-level structure is output, but the condition polarity or target is wrong.
 
-这两种都比 explicit partial 更难排查。
+Both are more difficult to troubleshoot than explicit partial.
 
-## 39. 最小可运行外部插件清单
+## 39. Minimum runnable external plug-in list
 
-新作者应该先做一个 tiny VM，而不是直接上完整 VM。
+New authors should make a tiny VM first instead of moving directly to a full VM.
 
-最小功能：
+Minimal functionality:
 
-- 一个常量 opcode。
-- 一个二元运算 opcode。
-- 一个输出或返回 opcode。
-- 一个无条件跳转样例。
-- 一个条件跳转样例。
+- a constant opcode.
+- A binary operation opcode.
+- An output or return opcode.
+- An unconditional jump example.
+- A conditional jump example.
 
-文件清单：
-
+Document list:
 ```text
 tiny-vm-plugin/
 ├── unidecompiler-plugin.toml
@@ -2659,9 +2722,7 @@ tiny-vm-plugin/
 └── tests/
     └── test_integration.py
 ```
-
-如果 tiny VM 还要支持模拟，增加：
-
+If tiny VM also supports simulation, add:
 ```text
 tiny-vm-plugin/
 ├── tiny_vm_frontend/
@@ -2671,37 +2732,36 @@ tiny-vm-plugin/
     ├── test_simulation.py
     └── test_simulation_environment.py
 ```
-
-验收顺序：
+Acceptance order:
 
 1. `python -m py_compile tiny_vm_frontend/*.py`
-2. API 注册目录成功。
-3. 线性样本输出表达式。
-4. 条件跳转样本输出 `if` 或 `if/goto`。
-5. 后向跳转样本 CFG 有回边。
-6. GUI 能识别文件，不显示为 resource。
-7. GUI CFG view 不崩溃。
-8. 如果声明支持模拟，target discovery 能列出唯一函数。
-9. simulator 能执行至少一个纯计算函数并保留返回值。
-10. 未解析外部调用在提供 environment 时可处理，未提供时显式失败。
-11. adapter 没有 frontend bytecode interpreter 或 executable callback。
+2. The API registration directory is successful.
+3. Linear sample output expression.
+4. Conditional jump sample output `if` or `if/goto`.
+5. The backward jump sample CFG has back edges.
+6. The GUI can recognize the file and does not display it as a resource.
+7. GUI CFG view does not crash.
+8. If the declaration supports impersonation, target discovery can list unique functions.
+9. The simulator can execute at least one purely computational function and retain the return value.
+10. Unresolved external calls can be handled when environment is provided, and fail explicitly when not provided.
+11. The adapter has no frontend bytecode interpreter or executable callback.
 
-文档片段可以直接复制，但必须替换：
+Document fragments can be copied directly, but must be replaced:
 
-- frontend id。
-- opcode 名。
-- offset 坐标系。
-- operand 解码。
-- 栈顺序。
-- branch target 来源。
-- runtime call 名称。
-- simulation query 格式。
-- simulation adapter 的运行时 facts。
-- 外部 environment 需要处理的函数名和返回值协议。
+- frontend id.
+- opcode name.
+- offset coordinate system.
+- operand decoding.
+- Stack order.
+- branch target source.
+- runtime call name.
+- simulation query format.
+- Runtime facts for the simulation adapter.
+- The function name and return value protocol that the external environment needs to handle.
 
-### 39.1 完整最小插件示例
+### 39.1 Complete minimal plug-in example
 
-下面是一个闭合的 tiny VM 外部插件骨架。它支持：
+Below is a closed tiny VM external plugin skeleton. It supports:
 
 - `CONST n`
 - `ADD`
@@ -2710,10 +2770,9 @@ tiny-vm-plugin/
 - `JUMP_IF_ZERO target`
 - `NOP`
 
-这个例子是 immediate target + stack condition 模型。它不是某个现成 VM 的复刻，只是一个可复制的最小闭环。
+This example is the immediate target + stack condition model. It is not a clone of an off-the-shelf VM, just a replicable minimal closed loop.
 
-更准确地说：它只适用于“跳转目标是 immediate，条件值来自栈”的 toy VM。若你的 VM 使用寄存器条件、relative target 或 jump table，请把对应部分替换掉，不要直接照抄。
-
+To be more precise: it only applies to toy VMs where the "jump target is immediate and the condition value comes from the stack". If your VM uses register conditions, relative targets or jump tables, please replace the corresponding parts instead of copying them directly.
 ```text
 tiny_vm_plugin/
 ├── unidecompiler-plugin.toml
@@ -2851,14 +2910,11 @@ def decode_tiny_vm(data: bytes, filename: str | None = None) -> TinyProgram:
 
     return TinyProgram(filename=filename, version=version, functions=tuple(functions))
 ```
-
-一个最小输入样本：
-
+A minimal input sample:
 ```text
 54 56 4d 31 01 01 04 6d 61 69 6e 04 00 01 02 01 03 02 03
 ```
-
-这串字节的含义是：
+The meaning of this string of bytes is:
 
 - `TVM1` magic
 - version = `1`
@@ -2867,18 +2923,15 @@ def decode_tiny_vm(data: bytes, filename: str | None = None) -> TinyProgram:
 - instruction_count = `4`
 - instructions = `CONST 2`, `CONST 3`, `ADD`, `RETURN`
 
-这份样本的预期输出只需要理解成“线性计算并返回”，例如：
-
+The expected output of this sample only needs to be understood as "linear calculation and return", for example:
 ```text
 function main() {
     return 2 + 3
 }
 ```
+If the backend further performs constant folding, it may also be displayed as `return 5`. The concern here is whether the control flow and stack semantics are correct, not whether the final text retains the intermediate constant form.
 
-如果后端进一步做常量折叠，也可能显示成 `return 5`。这里关心的是控制流和栈语义是否正确，不是最终文本是否保留中间常量形式。
-
-`tiny_vm_frontend/plugin.py`：
-
+`tiny_vm_frontend/plugin.py`:
 ```python
 from __future__ import annotations
 
@@ -3019,9 +3072,7 @@ def make_stateful_callbacks(program: TinyProgram, function: TinyFunction):
         branch_stack_width=branch_stack_width,
     )
 ```
-
-这里的 `stopped_at` 只是记录线性解释停到哪一条 step，方便 core 继续恢复控制流；它不是“失败就报错”的信号本身。
-
+The `stopped_at` here just records which step the linear interpretation stops at, so that the core can continue to restore the control flow; it is not the signal itself of "reporting an error on failure".
 ```python
 def make_step(program: TinyProgram, instruction: TinyInstruction, targets: dict[int, int] | None = None) -> VMBytecodeStep:
     source = SourceRef(frontend=FRONTEND_ID, offset=instruction.offset)
@@ -3065,32 +3116,205 @@ def lift_program(program: TinyProgram, metadata):
         functions=tuple(lift_function(function, program) for function in program.functions),
     )
 ```
+The purpose of this appendix is not to teach you how to write Tiny VM, but to give you a minimal closed loop: decoder, plugin, effect table, control hints, stateful callbacks, and module assembly are all there. When you actually write your own frontend, you only replace the model and opcode semantics.
 
-这个 appendix 的目的不是教你写 Tiny VM，而是给你一个最小闭环：decoder、plugin、effect table、control hints、stateful callbacks、module assembly 都有了。真正写自己的 frontend 时，只替换模型和 opcode 语义。
+### 39.2 Add simulation to the minimal plug-in
 
-## 40. 什么时候需要改 core
+The tiny VM in the previous section already has a stable function name `main`, definite parameter/return conventions and executable
+generic IR, so simulation can be added without adding any new VM interpreter.
 
-Frontend 不能绕过 core，但有些 VM 确实需要 core 扩展。
+First add a line to the plugin class:
+```python
+from .simulation import TinyStackVmSimulationAdapter
 
-应该考虑改 core 的情况：
 
-- 多个 VM 都需要同一种新 effect。
-- 现有 hints 无法表达某类通用控制流事实。
-- low-level CFG 能保留语义，但 core 无法安全结构化常见形状。
-- backend 已有结构节点，但 core 没有恢复 pass。
+class TinyStackVmFrontendPlugin:
+    id = "tiny-stack-vm"
+    # Keep the remaining attributes and methods unchanged。
+    simulation_adapter = TinyStackVmSimulationAdapter
+```
+Added `tiny_vm_frontend/simulation.py`:
+```python
+"""Target lookup only; generic IR execution belongs to the shared simulator."""
 
-不应该改 frontend 的情况：
+from __future__ import annotations
 
-- 为了让一个样本显示成 `while` 而手写 AST。
-- 为了跳过 unsupported 而删除复杂 opcode。
-- 为了 GUI 好看而丢 control edge。
-- 为了当前输入可读而写业务特例。
+class TinyStackVmSimulationAdapter:
+    frontend_id = "tiny-stack-vm"
 
-如果不能改 core，正确底线是：
+    def resolve_function(self, query, decoded_module, lifted_module):
+        # Lazy import keeps normal decompilation independent of simulator install.
+        from unidecompiler_simulator import NotHandled, ResolvedFunction
 
+        if not isinstance(query, str):
+            return NotHandled
+        matches = tuple(
+            function
+            for function in self._walk(lifted_module.functions)
+            if function.name == query
+        )
+        if len(matches) != 1:
+            return NotHandled
+        return ResolvedFunction(matches[0], identifier=query)
+
+    def list_simulation_targets(self, decoded_module, lifted_module):
+        from unidecompiler_simulator import SimulationTargetCandidate
+
+        functions = tuple(self._walk(lifted_module.functions))
+        name_counts: dict[str, int] = {}
+        for function in functions:
+            name_counts[function.name] = name_counts.get(function.name, 0) + 1
+        return tuple(
+            SimulationTargetCandidate(function.name, function.name)
+            for function in functions
+            if name_counts[function.name] == 1
+        )
+
+    @staticmethod
+    def _walk(functions):
+        for function in functions:
+            yield function
+            yield from TinyStackVmSimulationAdapter._walk(function.nested_functions)
+```
+Added `tests/test_simulation.py`. It only uses the public registry/simulator API, so it can both
+Verify the external directory plug-in registration, and also verify that the function returned by the adapter indeed belongs to the current `ModuleIR`:
+```python
+from __future__ import annotations
+
+from pathlib import Path
+import unittest
+
+from unidecompiler.plugin_registry import FrontendRegistry
+from unidecompiler_simulator import SimulationEngine, SimulationStatus
+
+
+PLUGIN_DIRECTORY = Path(__file__).resolve().parents[1]
+SAMPLE = bytes.fromhex(
+    "54 56 4d 31 01 01 04 6d 61 69 6e 04 00 01 02 01 03 02 03"
+)
+
+
+class TinyVmSimulationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        registry = FrontendRegistry.discover()
+        registry.register_directory(PLUGIN_DIRECTORY)
+        self.simulator = SimulationEngine.from_registry(registry)
+
+    def test_lists_and_executes_main(self) -> None:
+        listing = self.simulator.list_artifact_targets(
+            SAMPLE,
+            "add.tvm",
+            frontend_id="tiny-stack-vm",
+        )
+        self.assertEqual(listing.frontend_id, "tiny-stack-vm")
+        self.assertIsNone(listing.diagnostic)
+        self.assertEqual(tuple(target.label for target in listing.targets), ("main",))
+
+        result = self.simulator.simulate_artifact(
+            SAMPLE,
+            "add.tvm",
+            listing.targets[0].query,
+            frontend_id="tiny-stack-vm",
+        )
+        self.assertIs(result.status, SimulationStatus.COMPLETED)
+        self.assertEqual(result.values, (5,))
+        self.assertIsNone(result.exception)
+        self.assertIsNone(result.diagnostic)
+        self.assertGreater(result.steps, 0)
+
+    def test_rejects_unknown_query(self) -> None:
+        result = self.simulator.simulate_artifact(
+            SAMPLE,
+            "add.tvm",
+            "missing",
+            frontend_id="tiny-stack-vm",
+        )
+        self.assertIs(result.status, SimulationStatus.INVALID_REQUEST)
+        self.assertIsNotNone(result.diagnostic)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+For VMs with external calls, write an additional environment test. The following example assumes that your generic
+IR generates `Call(Global("write_text"), ..., returns=0)`; the function name must be replaced with yours
+frontend actual generated name:
+```python
+from unidecompiler_simulator import (
+    ExternalCallResult,
+    ExternalCallStatus,
+    NotHandled,
+    SimulationStatus,
+)
+
+
+class RecordingEnvironment:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call(self, request):
+        self.calls.append((request.name, request.args))
+        if request.name != "write_text":
+            return NotHandled
+        return ExternalCallResult(
+            ExternalCallStatus.RETURNED,
+            values=(),
+            stdout=str(request.args[0]),
+        )
+
+
+environment = RecordingEnvironment()
+result = simulator.simulate_artifact(
+    artifact_data,
+    "writes.tvm",
+    "main",
+    frontend_id="tiny-stack-vm",
+    environment=environment,
+)
+assert result.status is SimulationStatus.COMPLETED
+assert environment.calls == [("write_text", ("hello",))]
+assert any(event.stdout == "hello" for event in result.events)
+```
+When making external calls with mutable state (buffer, heap, file descriptor), do not
+replace VM semantics with a local list inside `RecordingEnvironment`. Put the state in
+a controlled runtime object and test allocation, reads, writes, out-of-bounds access,
+input exhaustion, and reset-per-run behavior according to the template in Section 20.1.4.3.
+
+Final minimum acceptance order:
+```bash
+python -m py_compile tiny_vm_frontend/*.py
+python -m unittest discover -v -s tests
+```
+After passing, go to the GUI to register the plug-in directory, open the sample, and confirm on the Simulation page:
+
+1. Frontend displays `tiny-stack-vm`;
+2. `main` appears in the Target drop-down box;
+3. After clicking Run, the status is `completed` and the returned value is `5`;
+4. If the runtime has stdout, the corresponding text will appear in the Output column;
+5. The result of clicking Run again does not depend on the previous Run.
+
+## 40. When does core need to be changed?
+
+Frontend cannot bypass core, but some VMs do require core extensions.
+
+You should consider changing core:
+
+- Multiple VMs require the same new effect.
+- Existing hints cannot express certain kinds of general control flow facts.
+- low-level CFG preserves semantics, but core cannot safely structure common shapes.
+- The backend already has structure nodes, but the core has no recovery pass.
+
+Situations where frontend should not be changed:
+
+- Handwriting AST to make a sample appear as `while`.
+- Remove complex opcodes in order to skip unsupported.
+- Lose control edge for GUI to look good.
+- Write business exceptions so that the current input is readable.
+
+If core cannot be changed, the correct bottom line is:
 ```text
-保留完整 decoded instruction
-提交所有能确定的 effects/hints
-输出 partial 或低层 if/goto
-不要输出误导性线性伪代码
+retain the complete decoded instruction
+submit every effect/hint that can be determined
+emit partial or low-level if/goto
+do not emit misleading linear pseudocode
 ```

@@ -112,6 +112,33 @@ unhandled external calls, invalid requests, limits, and cancellation must never
 be silently converted into success or guessed behavior. Trace limits may
 truncate recorded events, but must not alter execution semantics.
 
+## GUI Plugin Architecture Contract
+
+GUI plugins are trusted, optional application extensions. They are not VM
+frontends, simulation adapters, backends, or core extensions. The dependency
+direction is strictly one-way:
+
+```txt
+GUI plugin -> unidecompiler-gui-sdk -> GUI plugin host -> public GUI/core/simulator APIs
+```
+
+The SDK remains a small, versioned, GUI-toolkit-neutral data contract. Plugins
+receive immutable document/function/AST/reference/selection/job snapshots and
+may register commands or declarative panels, request navigation, subscribe to
+host events, and submit asynchronous simulation jobs using an opaque,
+frontend-owned query. They must never receive decoded artifacts, frontends,
+`ModuleIR`, `FunctionIR`, simulation adapters, runners, frames, stacks, Qt
+widgets, or the Workbench.
+
+Plugins are read-only and cannot modify input data, IR, AST, pseudocode,
+frontend registrations, or simulation execution. The GUI host owns Qt,
+threading, document revisions, navigation, and job lifecycle. Plugin panels
+are data-only state, not plugin-provided widgets. Installation is GUI-host
+infrastructure separate from the VM frontend registry. Plugins are trusted
+in-process Python, are not sandboxed, and their dependencies are checked but
+never installed automatically. Core, simulator, frontends, and backends must
+never import the GUI SDK, plugin host, installer, or user plugins.
+
 ## Frontend Version Metadata
 
 Each frontend owns a small version-support declaration that says which VM
@@ -280,6 +307,8 @@ The test suite includes frontend-decoupling checks that enforce this design:
 - CLI and GUI integration tests consume only simulator results, preserve target
   selection, and expose completion, failure, cancellation, and trace-truncation
   outcomes visibly.
+- GUI plugin tests cover SDK isolation, manifest validation, safe archive
+  extraction, and enabled/disabled lifecycle behavior.
 
 Run:
 

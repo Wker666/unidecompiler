@@ -1,0 +1,10 @@
+[plugin]
+id = "example.workspace-inspector"
+name = "Workspace Inspector"
+version = "1.0.0"
+api = "1"
+entry = "workspace_inspector:register"
+description = "SDK-only example plugin for inspecting GUI documents and simulation targets."
+
+[python]
+requires = []

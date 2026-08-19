@@ -13,6 +13,7 @@ requires-python = ">=3.11"
 dependencies = [
     "unidecompiler-cli>=0.1.1,<0.2.0",
     "unidecompiler-gui>=0.1.1,<0.2.0",
+    "unidecompiler-gui-sdk>=0.1.0,<0.2.0",
     "unidecompiler-simulator>=0.1.1,<0.2.0",
     "unidecompiler-simulation-host-python>=0.1.1,<0.2.0",
     "unidecompiler-plugin-python-pyc>=0.1.1,<0.2.0",

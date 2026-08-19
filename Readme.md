@@ -44,6 +44,7 @@ lives under `packages/` and can be installed independently.
 - `unidecompiler`: generic IR, lifting, analysis, structuring, and backends.
 - `unidecompiler-cli`: optional command-line host.
 - `unidecompiler-gui`: read-only PySide6 workbench.
+- `unidecompiler-gui-sdk`: stable, Qt-neutral API for trusted GUI plugins.
 - `unidecompiler-simulator`: optional bounded executor for recovered generic IR.
 - `unidecompiler-simulation-host-python`: trusted Python runtime host for
   applications that provide unresolved functions.
@@ -104,10 +105,13 @@ Supported frontend families follow this model:
 - `packages/unidecompiler/`: embeddable core package, using a standard `src/` layout.
 - `packages/unidecompiler-cli/`: optional CLI host package.
 - `packages/unidecompiler-gui/`: read-only desktop workbench package.
+- `packages/unidecompiler-gui-sdk/`: versioned data contracts for GUI plugins.
 - `packages/unidecompiler-simulator/`: bounded generic IR execution library.
 - `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
 - `packages/unidecompiler-all/`: complete-installation meta-package.
+- `emojivm_frontend_case/`: complete custom-VM frontend and simulator example.
+- `unidecompiler-gui-test-plugin/`: Qt-free GUI SDK plugin example.
 - `opcode_projects/source/<project>`: source stress projects.
 - `opcode_projects/generate/<project>`: generated stress project outputs.
 - `simulator_projects/`: source fixtures and expected results for generic-IR
@@ -121,15 +125,12 @@ frontend adapter boundary.
 
 ## Installation And Use
 
-The `unidecompiler-all` meta-package will provide the complete CLI, GUI, and
-all frontend plugins with one command once it is published:
+The `unidecompiler-all` meta-package provides the complete CLI, GUI, GUI plugin
+SDK, and all frontend plugins with one command:
 
 ```sh
 python -m pip install unidecompiler-all
 ```
-
-Until that package is available on PyPI, install the components you need
-directly as shown below.
 
 Install a published command-line setup with the formats you need:
 
@@ -182,6 +183,96 @@ registered frontend, enter a JSON argument array, optionally choose a trusted
 `runtime.py`, and press Run to inspect the result and execution trace. The GUI
 does not implement language-specific target lookup or simulation semantics.
 
+The GUI plugin SDK is installed automatically with `unidecompiler-gui`. Plugin
+authors can install it directly when developing against the public, Qt-neutral
+API:
+
+```sh
+python -m pip install unidecompiler-gui-sdk
+```
+
+See `docs/GUI_PLUGIN_DEVELOPMENT.md` for the plugin manifest and API contract.
+
+### GUI SDK Plugins
+
+GUI SDK plugins are application-layer extensions, separate from VM frontend
+plugins. They run as trusted in-process Python code and use only immutable
+snapshots plus host requests. They cannot access Qt widgets, `ModuleIR`,
+`FunctionIR`, decoded bytecode, frontend adapters, simulator frames, or stacks.
+
+Create a plugin with a root `plugin.toml`:
+
+```toml
+[plugin]
+id = "example.workspace-inspector"
+name = "Workspace Inspector"
+version = "1.0.0"
+api = "1"
+entry = "workspace_inspector:register"
+
+[python]
+requires = []
+```
+
+Install the SDK for development and install the plugin directory from the GUI:
+
+```sh
+python -m pip install unidecompiler-gui-sdk
+```
+
+Use `context.commands` and `context.panels` to register declarative commands
+and read-only panels. Installation, update, enable/disable, and removal take
+effect after restarting the GUI. Plugin dependencies are checked but never
+installed automatically. The complete API and lifecycle are documented in
+`docs/GUI_PLUGIN_DEVELOPMENT.md`.
+
+### GUI Plugin Example
+
+The repository includes `unidecompiler-gui-test-plugin/`, a complete trusted
+GUI plugin that uses only `unidecompiler_gui_sdk`. Install that directory from
+`Plugins -> Manage plugins -> Install local folder`, then restart the GUI. It
+adds a read-only workspace panel and commands for refreshing document data and
+discovering simulation targets. The example does not import Qt, core internals,
+frontend decoders, or simulator implementation classes.
+
+### Custom VM Example
+
+`emojivm_frontend_case/` demonstrates how to add a custom VM without changing
+the core. It includes a VM format note, a sample artifact, a reference runner,
+a frontend plugin, and a trusted runtime environment:
+
+```text
+emojivm_frontend_case/
+├── chal.evm
+├── emojivm
+├── runtime.py
+└── unidecompiler-plugin-emojivm/
+```
+
+The frontend can be registered through the public registry API:
+
+```python
+from pathlib import Path
+from unidecompiler import DecompilerEngine
+
+case = Path("emojivm_frontend_case")
+engine = DecompilerEngine.discover()
+engine.register_frontend_directory(case / "unidecompiler-plugin-emojivm")
+result = engine.decompile_bytes(
+    (case / "chal.evm").read_bytes(),
+    filename="chal.evm",
+    frontend_id="emojivm",
+)
+print(result.status)
+print(result.pseudocode.text if result.pseudocode else "<no pseudocode>")
+```
+
+For generic-IR simulation, use the case's `runtime.py` through
+`PythonFileEnvironment`. The runtime is trusted host code and is not a
+sandbox. The case README contains the full registration, simulation, and
+reference-runner workflow. Its test files are local development material and
+are excluded from delivery.
+
 ## Development
 
 Repository cloning is required only for development. Create and activate a
@@ -190,6 +281,7 @@ editable mode:
 
 ```sh
 .venv/bin/python -m pip install build -e packages/unidecompiler \
+  -e packages/unidecompiler-gui-sdk \
   -e packages/unidecompiler-simulator \
   -e packages/unidecompiler-simulation-host-python \
   -e packages/unidecompiler-cli \

@@ -12,6 +12,8 @@ from typing import Any
 from unidecompiler import DecompileResult, DecompilerEngine, FrontendRegistrationError
 from unidecompiler.input_sources import InputEntry, iter_input_entries, load_input_entry
 from unidecompiler_gui.themes import Theme, builtin_themes, external_theme
+from unidecompiler_gui.plugin_host import PluginHost
+from unidecompiler_gui.plugin_install import GuiPluginStore, load_enabled_plugins
 from unidecompiler_simulator import (
     SimulationCancellation,
     SimulationEngine,
@@ -26,7 +28,7 @@ try:
     from PySide6.QtCore import QObject, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
     from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
     from PySide6.QtWidgets import (
-        QApplication, QDialog, QFileDialog, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+        QApplication, QDialog, QFileDialog, QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
         QComboBox, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, QSplitter, QSpinBox, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTabBar, QToolBar, QToolButton, QTreeWidget,
         QMenu, QTreeWidgetItem, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
     )
@@ -215,6 +217,111 @@ class FrontendManagerDialog(QDialog):
             return
         self.refresh()
         self.changed.emit()
+
+
+class PluginManagerDialog(QDialog):
+    """Persistent installer for trusted GUI plugins, separate from frontends."""
+
+    def __init__(self, store: GuiPluginStore, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._store = store
+        self.setWindowTitle("Plugins")
+        self.resize(820, 420)
+        layout = QVBoxLayout(self)
+        warning = QLabel("Plugins run trusted Python code in the GUI process. Review local and GitHub sources before installing.")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Plugin", "Source", "Ref", "Enabled", "Install path"])
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+        buttons = QHBoxLayout()
+        local = QPushButton("Install local folder")
+        local.clicked.connect(self._install_local)
+        github = QPushButton("Install GitHub")
+        github.clicked.connect(self._install_github)
+        update = QPushButton("Update selected")
+        update.clicked.connect(self._update)
+        toggle = QPushButton("Enable/disable selected")
+        toggle.clicked.connect(self._toggle)
+        remove = QPushButton("Uninstall selected")
+        remove.clicked.connect(self._remove)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        for button in (local, github, update, toggle, remove):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self.refresh()
+
+    def refresh(self) -> None:
+        records = self._store.list()
+        self.table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            for column, value in enumerate((record.id, record.source, record.ref or "", "yes" if record.enabled else "no", record.install_path)):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, record)
+                self.table.setItem(row, column, item)
+
+    def _install_local(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Install GUI plugin folder")
+        if not directory:
+            return
+        try:
+            self._store.install_local(Path(directory))
+        except Exception as error:
+            QMessageBox.critical(self, "Plugin installation failed", str(error))
+            return
+        self.refresh()
+        QMessageBox.information(self, "Restart required", "Plugin installation will take effect after restarting the GUI.")
+
+    def _install_github(self) -> None:
+        source, accepted = QInputDialog.getText(self, "Install GitHub plugin", "GitHub repository or URL")
+        if not accepted or not source.strip():
+            return
+        try:
+            self._store.install_github(source)
+        except Exception as error:
+            QMessageBox.critical(self, "Plugin installation failed", str(error))
+            return
+        self.refresh()
+        QMessageBox.information(self, "Restart required", "Plugin installation will take effect after restarting the GUI.")
+
+    def _selected_record(self):
+        item = self.table.item(self.table.currentRow(), 0)
+        return None if item is None else item.data(Qt.ItemDataRole.UserRole)
+
+    def _toggle(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        self._store.set_enabled(record.id, not record.enabled)
+        self.refresh()
+        QMessageBox.information(self, "Restart required", "Plugin changes will take effect after restarting the GUI.")
+
+    def _update(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        try:
+            self._store.update(record.id)
+        except Exception as error:
+            QMessageBox.critical(self, "Plugin update failed", str(error))
+            return
+        self.refresh()
+        QMessageBox.information(self, "Restart required", "Plugin update will take effect after restarting the GUI.")
+
+    def _remove(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        self._store.remove(record.id)
+        self.refresh()
+        QMessageBox.information(self, "Restart required", "Plugin removal will take effect after restarting the GUI.")
 
 
 class ControlFlowView(QGraphicsView):
@@ -435,6 +542,7 @@ class Workbench(QMainWindow):
         super().__init__()
         self.engine = engine or DecompilerEngine.discover()
         self.results: tuple[DecompileResult, ...] = ()
+        self._document_revisions: dict[str, int] = {}
         self._resource_data: dict[str, bytes] = {}
         self._displayed_result_path: str | None = None
         self._displayed_function_id: str | None = None
@@ -461,6 +569,8 @@ class Workbench(QMainWindow):
         self._restoring_history = False
         self._pinned_documents: set[str] = set()
         self.frontend_manager: FrontendManagerDialog | None = None
+        self.plugin_manager: PluginManagerDialog | None = None
+        self.plugin_store = GuiPluginStore()
         self._settings = QSettings("unidecompiler", "unidecompiler-gui")
         self._themes = builtin_themes()
         self._theme = next(theme for theme in self._themes if theme.id == "dark")
@@ -516,6 +626,9 @@ class Workbench(QMainWindow):
         windows_menu.addAction(self.diagnostics_action)
         frontends_action = QAction("Frontends", self, triggered=self.open_frontend_manager)
         view_menu.addAction(frontends_action)
+        self.plugins_menu = self.menuBar().addMenu("Plugins")
+        self.plugins_menu.addAction(QAction("Manage plugins", self, triggered=self.open_plugin_manager))
+        self.plugin_commands_menu = self.plugins_menu.addMenu("Commands")
         toolbar = QToolBar("Workspace", self)
         toolbar.setObjectName("workspaceToolbar")
         toolbar.setMovable(False)
@@ -874,6 +987,8 @@ class Workbench(QMainWindow):
         self.goto_panel.requested.connect(self._go_to_requested_line)
         self.goto_panel.close_requested.connect(self._hide_go_to_line_panel)
         self.goto_panel.hide()
+        self.plugin_host = PluginHost(self, self.plugin_commands_menu)
+        load_enabled_plugins(self.plugin_store, self.plugin_host)
         self._apply_theme(self._theme)
 
     def _update_frontend_status(self) -> None:
@@ -917,6 +1032,16 @@ class Workbench(QMainWindow):
         self.frontend_manager.finished.connect(self._frontend_manager_closed)
         self._update_frontend_mutation_enabled()
         self.frontend_manager.show()
+
+    def open_plugin_manager(self) -> None:
+        if self.plugin_manager is None:
+            self.plugin_manager = PluginManagerDialog(self.plugin_store, self)
+            self.plugin_manager.finished.connect(lambda _result: setattr(self, "plugin_manager", None))
+        else:
+            self.plugin_manager.refresh()
+        self.plugin_manager.show()
+        self.plugin_manager.raise_()
+        self.plugin_manager.activateWindow()
 
     def _frontend_manager_closed(self, _result: int) -> None:
         self.frontend_manager = None
@@ -1226,6 +1351,7 @@ class Workbench(QMainWindow):
             self._decompile_failed(f"{type(error).__name__}: {error}")
             return
         self.results = ()
+        self._document_revisions = {}
         self._resource_data = {}
         self._simulation_targets = {}
         self._simulation_result = None
@@ -1314,6 +1440,8 @@ class Workbench(QMainWindow):
                 self._resource_data[item.display_path] = data
         if results:
             self.results = (*self.results, *results)
+            for item in results:
+                self._document_revisions[item.display_path] = self._document_revisions.get(item.display_path, 0) + 1
             selected_path = None
             if self._open_completed_documents:
                 for item in results:
@@ -1324,6 +1452,8 @@ class Workbench(QMainWindow):
                         self._open_document_paths.append(item.display_path)
                 selected_path = results[0].display_path
             self._refresh(selected_path)
+            for item in results:
+                self.plugin_host.document_updated(item.display_path)
         suffix = " (cancelled)" if cancelled else ""
         self.statusBar().showMessage(f"Loaded {len(results)} artifact(s){suffix}")
 
@@ -2000,6 +2130,7 @@ class Workbench(QMainWindow):
             return
         if result.display_path in self._closed_document_paths:
             return
+        self.plugin_host.document_selected()
         root = selected[0]
         while root.parent() is not None:
             root = root.parent()

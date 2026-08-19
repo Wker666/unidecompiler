@@ -1,0 +1,3 @@
+[frontend]
+id = "emojivm"
+module = "emojivm_frontend.plugin:EmojiVMFrontendPlugin"

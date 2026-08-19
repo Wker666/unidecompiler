@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unidecompiler-gui-sdk"
+version = "0.1.0"
+description = "Stable read-only plugin API for unidecompiler-gui"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Wker", email = "1670133844@qq.com" }]
+requires-python = ">=3.11"
+
+[project.urls]
+Homepage = "https://github.com/Wker666/unidecompiler"
+Repository = "https://github.com/Wker666/unidecompiler"
+Issues = "https://github.com/Wker666/unidecompiler/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

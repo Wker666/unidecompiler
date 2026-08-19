@@ -1,0 +1,1 @@
+"""EmojiVM frontend for unidecompiler."""
