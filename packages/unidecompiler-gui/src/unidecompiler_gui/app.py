@@ -567,6 +567,7 @@ class Workbench(QMainWindow):
         self.ast_tree = QTreeWidget()
         self.ast_tree.setHeaderLabels(["AST"])
         self.ast_tree.itemSelectionChanged.connect(self._ast_selected)
+        self.ast_tree.itemDoubleClicked.connect(self._ast_activated)
         self.bytecode = QTableWidget(0, 4)
         self.bytecode.setHorizontalHeaderLabels(["Offset", "Opcode", "Operands", "Raw"])
         self.bytecode.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -580,6 +581,7 @@ class Workbench(QMainWindow):
         self.bytecode.setColumnWidth(1, 160)
         self.bytecode.setColumnWidth(2, 250)
         self.bytecode.itemSelectionChanged.connect(self._bytecode_selected)
+        self.bytecode.cellDoubleClicked.connect(self._bytecode_activated)
         self.references = QTableWidget(0, 4)
         self.references.setHorizontalHeaderLabels(["Kind", "Name", "Function", "Offset"])
         self.references.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2280,6 +2282,17 @@ class Workbench(QMainWindow):
             if isinstance(data, dict) and isinstance(result, DecompileResult):
                 self._focus_source(result, data["source"], data["function_id"])
 
+    def _bytecode_activated(self, row: int, _column: int) -> None:
+        item = self.bytecode.item(row, 0)
+        data = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        result = self._selected_result()
+        if not isinstance(data, dict) or not isinstance(result, DecompileResult):
+            return
+        self.detail_stack.setCurrentWidget(self.detail_tabs)
+        self.detail_tabs.setCurrentWidget(self.pseudocode)
+        self._focus_source(result, data["source"], data["function_id"])
+        self.pseudocode.centerCursor()
+
     def _ast_selected(self) -> None:
         selected = self.ast_tree.selectedItems()
         result = self._selected_result()
@@ -2288,6 +2301,20 @@ class Workbench(QMainWindow):
             data = selected[0].data(0, Qt.ItemDataRole.UserRole)
             if isinstance(data, dict) and data.get("source") is not None:
                 self._focus_source(result, data["source"], data.get("function_id"), select_ast=False)
+
+    def _ast_activated(self, item: QTreeWidgetItem, _column: int) -> None:
+        result = self._selected_result()
+        if not isinstance(result, DecompileResult):
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        function_id = data.get("function_id") if isinstance(data, dict) else None
+        source = data.get("source") if isinstance(data, dict) else None
+        if not isinstance(function_id, str) or source is None:
+            return
+        self.detail_stack.setCurrentWidget(self.detail_tabs)
+        self.detail_tabs.setCurrentWidget(self.pseudocode)
+        self._focus_source(result, source, function_id, select_ast=False)
+        self.pseudocode.centerCursor()
 
     def _reference_selected(self) -> None:
         item = self.references.currentItem()
@@ -2323,6 +2350,12 @@ class Workbench(QMainWindow):
         if item is None or not isinstance(result, DecompileResult):
             return
         reference = item.data(Qt.ItemDataRole.UserRole)
+        if getattr(reference, "source", None) is not None:
+            self.detail_stack.setCurrentWidget(self.detail_tabs)
+            self.detail_tabs.setCurrentWidget(self.pseudocode)
+            self._focus_source(result, reference.source, reference.function_id)
+            self.pseudocode.centerCursor()
+            return
         targets = self._call_targets(reference, result)
         if len(targets) == 1:
             self._navigate_to_function(targets[0][1], targets[0][0])
