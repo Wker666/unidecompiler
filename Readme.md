@@ -2,6 +2,29 @@
 
 A small universal bytecode decompiler experiment.
 
+## Quick start (PyPI)
+
+The current release is published on PyPI. For the complete read-only GUI,
+CLI, simulator, and all bundled frontend formats, install the meta-package:
+
+```sh
+python -m pip install --upgrade unidecompiler-all
+unidecompiler-gui
+```
+
+To use only the command-line host with selected formats:
+
+```sh
+python -m pip install --upgrade unidecompiler-cli \
+  unidecompiler-plugin-python-pyc \
+  unidecompiler-plugin-jvm-class
+unidecompiler --help
+```
+
+You do not need to clone this repository or build from source for normal use.
+The packages require Python 3.11 or newer. Clone the repository only for
+development, testing, or creating a custom VM frontend.
+
 The project is built around one hard architectural rule: VM frontends are thin
 submitters, and the core owns recovery.
 
@@ -110,7 +133,7 @@ Supported frontend families follow this model:
 - `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
 - `packages/unidecompiler-all/`: complete-installation meta-package.
-- `emojivm_frontend_case/`: complete custom-VM frontend and simulator example.
+- `unidecompiler-emojivm-frontend-case/`: complete custom-VM frontend analysis and simulator example.
 - `unidecompiler-gui-test-plugin/`: Qt-free GUI SDK plugin example.
 - `opcode_projects/source/<project>`: source stress projects.
 - `opcode_projects/generate/<project>`: generated stress project outputs.
@@ -244,12 +267,12 @@ frontend decoders, or simulator implementation classes.
 
 ### Custom VM Example
 
-`emojivm_frontend_case/` demonstrates how to add a custom VM without changing
+`unidecompiler-emojivm-frontend-case/` demonstrates how to add a custom VM without changing
 the core. It includes a VM format note, a sample artifact, a reference runner,
 a frontend plugin, and a trusted runtime environment:
 
 ```text
-emojivm_frontend_case/
+unidecompiler-emojivm-frontend-case/
 ├── chal.evm
 ├── emojivm
 ├── runtime.py
@@ -262,7 +285,7 @@ The frontend can be registered through the public registry API:
 from pathlib import Path
 from unidecompiler import DecompilerEngine
 
-case = Path("emojivm_frontend_case")
+case = Path("unidecompiler-emojivm-frontend-case")
 engine = DecompilerEngine.discover()
 engine.register_frontend_directory(case / "unidecompiler-plugin-emojivm")
 result = engine.decompile_bytes(

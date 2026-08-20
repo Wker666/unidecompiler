@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from unidecompiler.provenance import ByteRange
+
 
 INSTRUCTIONS = {
     "\U0001f233": ("nop", 1),
@@ -47,11 +49,13 @@ DIGITS = {
 @dataclass(frozen=True)
 class EmojiInstruction:
     offset: int
+    byte_offset: int
     opcode: str
     emoji: str
     size: int
     operands: tuple[object, ...] = ()
     raw: str = ""
+    artifact_range: ByteRange | None = None
 
 
 @dataclass(frozen=True)

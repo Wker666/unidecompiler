@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import PurePath
 
 from unidecompiler.plugins import FrontendDecodeError
+from unidecompiler.provenance import ByteRange
 
 from .model import DIGITS, INSTRUCTIONS, EmojiInstruction, EmojiVMProgram
 
@@ -31,41 +32,50 @@ def decode_emojivm(data: bytes, filename: str | None = None) -> EmojiVMProgram:
         raise EmojiVMDecodeError(f"EmojiVM source is not valid UTF-8: {error}") from error
 
     instructions: list[EmojiInstruction] = []
-    index = 0
-    while index < len(text):
-        char = text[index]
+    codepoint_index = 0
+    byte_index = 0
+    while codepoint_index < len(text):
+        char = text[codepoint_index]
+        char_bytes = char.encode("utf-8")
         if char.isspace():
-            index += 1
+            codepoint_index += 1
+            byte_index += len(char_bytes)
             continue
         decoded = INSTRUCTIONS.get(char)
         if decoded is None:
             raise EmojiVMDecodeError(
-                f"unknown EmojiVM character {char!r} at source offset {index}"
+                f"unknown EmojiVM character {char!r} at source offset {codepoint_index}"
             )
         opcode, size = decoded
         operands: tuple[object, ...] = ()
         raw = char
+        raw_bytes = len(char_bytes)
         if opcode == "push":
-            if index + 1 >= len(text):
-                raise EmojiVMDecodeError(f"PUSH at source offset {index} has no digit")
-            digit = DIGITS.get(text[index + 1])
+            if codepoint_index + 1 >= len(text):
+                raise EmojiVMDecodeError(f"PUSH at source offset {codepoint_index} has no digit")
+            digit_char = text[codepoint_index + 1]
+            digit = DIGITS.get(digit_char)
             if digit is None:
                 raise EmojiVMDecodeError(
-                    f"PUSH at source offset {index} is followed by a non-digit emoji"
+                    f"PUSH at source offset {codepoint_index} is followed by a non-digit emoji"
                 )
             operands = (digit,)
-            raw += text[index + 1]
+            raw += digit_char
+            raw_bytes += len(digit_char.encode("utf-8"))
         instructions.append(
             EmojiInstruction(
-                offset=index,
+                offset=codepoint_index,
+                byte_offset=byte_index,
                 opcode=opcode,
                 emoji=char,
                 size=size,
                 operands=operands,
                 raw=raw,
+                artifact_range=ByteRange(start=byte_index, size=raw_bytes),
             )
         )
-        index += size
+        codepoint_index += size
+        byte_index += raw_bytes
     if not instructions:
         raise EmojiVMDecodeError("EmojiVM source is empty")
     return EmojiVMProgram(filename=filename, source=text, instructions=tuple(instructions))

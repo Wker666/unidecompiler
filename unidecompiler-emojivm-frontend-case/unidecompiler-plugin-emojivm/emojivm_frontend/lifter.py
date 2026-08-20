@@ -138,6 +138,7 @@ def _step(
         source=source,
         operands=operands,
         raw=instruction.raw,
+        artifact_range=instruction.artifact_range,
     )
     hints: tuple[VMHint, ...] = ()
     if targets is not None and instruction.opcode in CONTROL:

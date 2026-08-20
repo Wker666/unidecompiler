@@ -1,3 +1,3 @@
 """Desktop host for the public :mod:`unidecompiler` engine API."""
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"

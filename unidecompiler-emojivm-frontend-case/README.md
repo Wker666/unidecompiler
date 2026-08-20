@@ -6,7 +6,7 @@
 目录内容：
 
 ```text
-emojivm_frontend_case/
+unidecompiler-emojivm-frontend-case/
 ├── README.md
 ├── EMOJIVM.md
 ├── chal.evm
@@ -21,12 +21,15 @@ emojivm_frontend_case/
 `runtime.py` 是 generic-IR simulator 使用的受信任 host 环境，插件目录则
 负责识别、解码和 lifting。它们的职责不能混用。
 
+这个案例现在还会把每条 EmojiVM 指令映射到原始 UTF-8 字节范围，
+这样 GUI 的 bytecode/hex 联动可以直接定位到对应源码片段。
+
 ## 1. 准备工作
 
 先进入本目录的父目录，并使用已经安装 `unidecompiler` 的虚拟环境：
 
 ```bash
-cd /path/to/emojivm_frontend_case
+cd /path/to/unidecompiler-emojivm-frontend-case
 source /path/to/your/.venv/bin/activate
 ```
 
@@ -89,7 +92,7 @@ from pathlib import Path
 
 from unidecompiler.plugin_registry import FrontendRegistry
 
-case_dir = Path("emojivm_frontend_case").resolve()
+case_dir = Path("unidecompiler-emojivm-frontend-case").resolve()
 registry = FrontendRegistry.discover()
 plugin = registry.register_directory(case_dir / "unidecompiler-plugin-emojivm")
 print(plugin.id, plugin.display_name, plugin.supported_inputs)
@@ -136,7 +139,7 @@ print(result.diagnostics)
 from pathlib import Path
 from unidecompiler import DecompilerEngine
 
-case_dir = Path("emojivm_frontend_case")
+case_dir = Path("unidecompiler-emojivm-frontend-case")
 engine = DecompilerEngine.discover()
 engine.register_frontend_directory(case_dir / "unidecompiler-plugin-emojivm")
 print([plugin.id for plugin in engine.registry.list()])

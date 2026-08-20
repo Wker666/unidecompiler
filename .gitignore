@@ -22,4 +22,4 @@ packages/*/dist/
 /tests/
 /scripts/
 examples/
-emojivm_frontend_case/**/tests/
+unidecompiler-emojivm-frontend-case/**/tests/
