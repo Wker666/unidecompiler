@@ -88,6 +88,8 @@ def _render_tree(request: TemplateRequest, destination: Path) -> None:
         ),
     }
     for source, relative in _walk_assets(source_root):
+        if "__pycache__" in relative.parts or source.name.endswith((".pyc", ".pyo")):
+            continue
         if relative.parts and relative.parts[0] == "simulation" and not request.include_simulation:
             continue
         if relative.parts and relative.parts[0] == "simulation":
@@ -97,7 +99,15 @@ def _render_tree(request: TemplateRequest, destination: Path) -> None:
             target.mkdir(parents=True, exist_ok=True)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_replace(source.read_text(encoding="utf-8"), values), encoding="utf-8")
+        content = source.read_bytes()
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            # Template assets may include images or other deliberate binary
+            # files. They are copied unchanged and never treated as tokens.
+            target.write_bytes(content)
+        else:
+            target.write_text(_replace(text, values), encoding="utf-8")
 
 
 def _walk_assets(root):
