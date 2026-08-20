@@ -1,7 +1,7 @@
 """Virtualized, read-only hexadecimal viewer for arbitrary binary inputs."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFontDatabase, QPainter
 from PySide6.QtWidgets import QAbstractScrollArea
 
@@ -10,6 +10,7 @@ from unidecompiler.provenance import ByteRange
 
 class HexView(QAbstractScrollArea):
     bytes_per_row = 16
+    offset_activated = Signal(int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -44,6 +45,26 @@ class HexView(QAbstractScrollArea):
         self._line_height = max(1, metrics.height() + 3)
         self._char_width = max(1, metrics.horizontalAdvance("0"))
         self._update_scrollbar()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            offset = self._offset_at(event.position().toPoint())
+            if offset is not None:
+                self.offset_activated.emit(offset)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def _offset_at(self, point) -> int | None:
+        row = self.verticalScrollBar().value() + point.y() // self._line_height
+        index = (point.x() - 86) // (self._char_width * 3)
+        if not 0 <= index < self.bytes_per_row:
+            return None
+        byte_x = 86 + index * self._char_width * 3
+        if not byte_x <= point.x() < byte_x + self._char_width * 2:
+            return None
+        offset = row * self.bytes_per_row + index
+        return offset if offset < len(self._data) else None
 
     def _update_scrollbar(self) -> None:
         rows = (len(self._data) + self.bytes_per_row - 1) // self.bytes_per_row

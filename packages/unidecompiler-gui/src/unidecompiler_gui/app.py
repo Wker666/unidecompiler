@@ -829,6 +829,7 @@ class Workbench(QMainWindow):
         self.structure_tree.itemSelectionChanged.connect(self._structure_selected)
         self.structure_tree.itemDoubleClicked.connect(self._structure_activated)
         self.hex_view = HexView()
+        self.hex_view.offset_activated.connect(self._hex_offset_activated)
         self.structure_details = QPlainTextEdit()
         self.structure_details.setReadOnly(True)
         self.structure_details.setMaximumHeight(96)
@@ -1031,10 +1032,10 @@ class Workbench(QMainWindow):
         self.detail_tabs = QTabWidget()
         self.detail_tabs.addTab(self.pseudocode, "Pseudocode")
         self.detail_tabs.addTab(analysis_panel, "AST / Bytecode")
+        self.detail_tabs.addTab(self.structure_panel, "Structure / Hex")
         self.detail_tabs.addTab(references_panel, "References / Calls")
         self.detail_tabs.addTab(browse_panel, "Browser")
         self.detail_tabs.addTab(control_flow_panel, "CFG")
-        self.detail_tabs.addTab(self.structure_panel, "Structure / Hex")
         self.detail_tabs.addTab(self.simulation_panel, "Simulation")
         self.detail_tabs.currentChanged.connect(self._simulation_tab_changed)
         self.detail_tabs.setCurrentWidget(self.pseudocode)
@@ -2453,7 +2454,11 @@ class Workbench(QMainWindow):
             if node.byte_ranges:
                 offset = ", ".join(f"0x{item.start:X}+{item.size}" for item in node.byte_ranges)
             item = QTreeWidgetItem([node.label, offset or "unmapped"])
-            item.setData(0, Qt.ItemDataRole.UserRole, (node.source, node.byte_ranges, node.kind))
+            item.setData(
+                0,
+                Qt.ItemDataRole.UserRole,
+                (node.source, node.function_id, node.byte_ranges, node.kind),
+            )
             if parent is None:
                 self.structure_tree.addTopLevelItem(item)
             else:
@@ -2469,9 +2474,9 @@ class Workbench(QMainWindow):
         if not selected:
             return
         data = selected[0].data(0, Qt.ItemDataRole.UserRole)
-        if not isinstance(data, tuple) or len(data) != 3:
+        if not isinstance(data, tuple) or len(data) != 4:
             return
-        source, ranges, kind = data
+        source, function_id, ranges, kind = data
         source_offset = getattr(source, "offset", None)
         lines = [f"Kind: {kind}"]
         if source is not None:
@@ -2483,18 +2488,51 @@ class Workbench(QMainWindow):
             lines.append("Artifact ranges: unavailable (logical VM offset only)")
             self.hex_view.highlight_ranges(())
         self.structure_details.setPlainText("\n".join(lines))
+        result = self._selected_result()
+        if not isinstance(result, DecompileResult) or source is None:
+            return
+        instruction = self._instruction_for_source(result, source, function_id)
+        if instruction is not None:
+            self._focus_source(
+                result,
+                source,
+                instruction.function_id,
+                select_structure=False,
+            )
 
     def _structure_activated(self, item: QTreeWidgetItem, _column: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         result = self._selected_result()
         if not isinstance(data, tuple) or not isinstance(result, DecompileResult):
             return
-        source = data[0]
+        source, function_id = data[0], data[1]
         if source is None:
             return
-        candidates = [row for row in result.instructions if _same_source(row.source, source)]
+        candidates = [
+            row
+            for row in result.instructions
+            if _same_source(row.source, source)
+            and (function_id is None or row.function_id == function_id)
+        ]
         if candidates:
             self._focus_source(result, source, candidates[0].function_id)
+
+    def _hex_offset_activated(self, offset: int) -> None:
+        """Navigate through public instruction provenance only."""
+        result = self._selected_result()
+        if not isinstance(result, DecompileResult):
+            return
+        matches = [
+            instruction
+            for instruction in result.instructions
+            if instruction.byte_range is not None
+            and instruction.byte_range.start <= offset < instruction.byte_range.end
+        ]
+        if not matches:
+            self.statusBar().showMessage("No associated bytecode at this artifact offset")
+            return
+        instruction = min(matches, key=lambda item: item.byte_range.size if item.byte_range is not None else 0)
+        self._focus_source(result, instruction.source, instruction.function_id)
 
     def _populate_references(self, result: DecompileResult, function_id: str | None) -> None:
         references = [
@@ -2633,9 +2671,6 @@ class Workbench(QMainWindow):
             result = self._selected_result()
             if isinstance(data, dict) and isinstance(result, DecompileResult):
                 self._focus_source(result, data["source"], data["function_id"])
-                instruction = next((row for row in result.instructions if _same_source(row.source, data["source"]) and row.function_id == data["function_id"]), None)
-                if instruction is not None and instruction.byte_range is not None:
-                    self.hex_view.highlight_ranges((instruction.byte_range,))
 
     def _bytecode_activated(self, row: int, _column: int) -> None:
         item = self.bytecode.item(row, 0)
@@ -2741,6 +2776,7 @@ class Workbench(QMainWindow):
         function_id: str | None,
         *,
         select_ast: bool = True,
+        select_structure: bool = True,
     ) -> None:
         if source is None or function_id is None:
             self.statusBar().showMessage("No associated bytecode")
@@ -2792,6 +2828,11 @@ class Workbench(QMainWindow):
                 finally:
                     self.pseudocode.blockSignals(False)
                 self.pseudocode.centerCursor()
+        instruction = self._instruction_for_source(result, source, function_id)
+        if instruction is not None:
+            self.hex_view.highlight_ranges(
+                () if instruction.byte_range is None else (instruction.byte_range,)
+            )
         if select_ast:
             ast_item = self._find_ast_item(source, function_id)
             if ast_item is not None:
@@ -2803,24 +2844,104 @@ class Workbench(QMainWindow):
                     self.ast_tree.blockSignals(False)
             else:
                 self.statusBar().showMessage("No exact AST node")
+        if select_structure:
+            structure_item = self._find_structure_item(
+                source,
+                instruction.byte_range if instruction is not None else None,
+                function_id,
+            )
+            if structure_item is not None:
+                self.structure_tree.blockSignals(True)
+                try:
+                    self.structure_tree.setCurrentItem(structure_item)
+                    self.structure_tree.scrollToItem(structure_item)
+                finally:
+                    self.structure_tree.blockSignals(False)
+
+    def _instruction_for_source(
+        self,
+        result: DecompileResult,
+        source: object,
+        function_id: str | None = None,
+    ) -> object | None:
+        return next(
+            (
+                row
+                for row in result.instructions
+                if _same_source(row.source, source)
+                and (function_id is None or row.function_id == function_id)
+            ),
+            None,
+        )
 
     def _find_ast_item(self, source: object, function_id: str) -> QTreeWidgetItem | None:
+        exact: list[QTreeWidgetItem] = []
+        nearby: list[tuple[int, QTreeWidgetItem]] = []
+        source_offset = getattr(source, "offset", None)
+        source_frontend = getattr(source, "frontend", None)
+
         def visit(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
             data = item.data(0, Qt.ItemDataRole.UserRole)
             if isinstance(data, dict) and data.get("function_id") == function_id:
                 if _same_source(data.get("source"), source):
-                    return item
+                    exact.append(item)
+                candidate = data.get("source")
+                candidate_offset = getattr(candidate, "offset", None)
+                if (
+                    getattr(candidate, "frontend", None) == source_frontend
+                    and isinstance(candidate_offset, int)
+                    and isinstance(source_offset, int)
+                ):
+                    nearby.append((abs(candidate_offset - source_offset), item))
             for index in range(item.childCount()):
-                found = visit(item.child(index))
-                if found is not None:
-                    return found
+                visit(item.child(index))
             return None
 
         for index in range(self.ast_tree.topLevelItemCount()):
-            found = visit(self.ast_tree.topLevelItem(index))
-            if found is not None:
-                return found
-        return None
+            visit(self.ast_tree.topLevelItem(index))
+        if exact:
+            return exact[0]
+        return min(nearby, key=lambda item: item[0])[1] if nearby else None
+
+    def _find_structure_item(
+        self,
+        source: object,
+        byte_range: object | None,
+        function_id: str | None,
+    ) -> QTreeWidgetItem | None:
+        matches: list[QTreeWidgetItem] = []
+        nearby: list[tuple[int, QTreeWidgetItem]] = []
+        source_offset = getattr(source, "offset", None)
+        source_frontend = getattr(source, "frontend", None)
+
+        def visit(item: QTreeWidgetItem) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if (
+                isinstance(data, tuple)
+                and len(data) == 4
+                and data[1] == function_id
+                and _same_source(data[0], source)
+            ):
+                if byte_range is not None and byte_range in data[2]:
+                    matches.insert(0, item)
+                else:
+                    matches.append(item)
+            if isinstance(data, tuple) and len(data) == 4 and data[1] == function_id:
+                candidate_offset = getattr(data[0], "offset", None)
+                if (
+                    getattr(data[0], "frontend", None) == source_frontend
+                    and isinstance(candidate_offset, int)
+                    and isinstance(source_offset, int)
+                ):
+                    nearby.append((abs(candidate_offset - source_offset), item))
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        for index in range(self.structure_tree.topLevelItemCount()):
+            visit(self.structure_tree.topLevelItem(index))
+        if matches:
+            return matches[0]
+        return min(nearby, key=lambda item: item[0])[1] if nearby else None
 
     def _selected_result(self) -> DecompileResult | None:
         selected = self.input_tree.selectedItems()

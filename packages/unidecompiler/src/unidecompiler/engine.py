@@ -7,7 +7,7 @@ from typing import Iterable
 
 from unidecompiler.backends.pseudocode import GenericPseudocodeBackend
 from unidecompiler.analysis import BytecodeControlFlowInstruction, BrowseIndex, FunctionControlFlow, SymbolIndex, build_browse_index, build_control_flow_index, build_symbol_index
-from unidecompiler.core.ast import ModuleDecl
+from unidecompiler.core.ast import FunctionDecl, ModuleDecl
 from unidecompiler.core.astify import module_to_ast
 from unidecompiler.core.diagnostics import Diagnostic
 from unidecompiler.core.ir import ModuleIR, SourceRef
@@ -61,6 +61,7 @@ class StructureNode:
     label: str
     kind: str
     source: SourceRef | None = None
+    function_id: str | None = None
     byte_ranges: tuple[ByteRange, ...] = ()
     children: tuple["StructureNode", ...] = ()
 
@@ -198,7 +199,7 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
         tuple((function.id, ir) for function, ir in zip(functions, _walk(module.functions), strict=True)),
         tuple(control_instructions),
     )
-    structure = _build_structure(ast, tuple(instructions))
+    structure = _build_structure(ast, tuple(instructions), tuple(functions))
     return DecompileResult(
         display_path=display_path,
         status="ok",
@@ -223,41 +224,71 @@ def _walk(functions):
         yield from _walk(function.nested_functions)
 
 
-def _build_structure(ast: ModuleDecl, instructions: tuple[BytecodeInstruction, ...]) -> BytecodeStructure:
-    ranges_by_source: dict[SourceRef, list[ByteRange]] = {}
+def _build_structure(
+    ast: ModuleDecl,
+    instructions: tuple[BytecodeInstruction, ...],
+    functions: tuple[FunctionResult, ...],
+) -> BytecodeStructure:
+    ranges_by_source: dict[tuple[str, SourceRef], list[ByteRange]] = {}
     for instruction in instructions:
         if instruction.byte_range is not None:
-            ranges_by_source.setdefault(instruction.source, []).append(instruction.byte_range)
+            ranges_by_source.setdefault((instruction.function_id, instruction.source), []).append(instruction.byte_range)
 
-    def visit(value: object, path: str) -> StructureNode | None:
+    ast_functions = tuple(_walk_ast_functions(ast.functions))
+    function_ids_by_ast = {
+        id(function): result.id
+        for function, result in zip(ast_functions, functions)
+    }
+
+    def visit(value: object, path: str, function_id: str | None = None) -> StructureNode | None:
         if not is_dataclass(value):
             return None
+        if isinstance(value, FunctionDecl):
+            function_id = function_ids_by_ast.get(id(value), function_id)
         source = getattr(value, "source", None)
         source = source if isinstance(source, SourceRef) else None
         children: list[StructureNode] = []
         for field in fields(value):
             child_value = getattr(value, field.name)
             if is_dataclass(child_value):
-                child = visit(child_value, f"{path}.{field.name}")
+                child = visit(child_value, f"{path}.{field.name}", function_id)
                 if child is not None:
                     children.append(child)
             elif isinstance(child_value, tuple):
                 for index, item in enumerate(child_value):
-                    child = visit(item, f"{path}.{field.name}[{index}]")
+                    child = visit(item, f"{path}.{field.name}[{index}]", function_id)
                     if child is not None:
                         children.append(child)
-        ranges = tuple(dict.fromkeys(ranges_by_source.get(source, ()))) if source is not None else ()
+        ranges = (
+            tuple(dict.fromkeys(ranges_by_source.get((function_id, source), ())))
+            if source is not None and function_id is not None
+            else ()
+        )
         if not ranges:
             ranges = tuple(dict.fromkeys(item for child in children for item in child.byte_ranges))
         label = type(value).__name__
         name = getattr(value, "name", None)
         if isinstance(name, str) and name:
             label = f"{label}: {name}"
-        return StructureNode(path, label, type(value).__name__, source, ranges, tuple(children))
+        return StructureNode(
+            id=path,
+            label=label,
+            kind=type(value).__name__,
+            source=source,
+            function_id=function_id,
+            byte_ranges=ranges,
+            children=tuple(children),
+        )
 
     root = visit(ast, "module")
     assert root is not None
     return BytecodeStructure(root)
+
+
+def _walk_ast_functions(functions: tuple[FunctionDecl, ...]):
+    for function in functions:
+        yield function
+        yield from _walk_ast_functions(function.nested_functions)
 
 
 def _source_map(
