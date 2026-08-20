@@ -183,6 +183,13 @@ registered frontend, enter a JSON argument array, optionally choose a trusted
 `runtime.py`, and press Run to inspect the result and execution trace. The GUI
 does not implement language-specific target lookup or simulation semantics.
 
+The GUI also provides a read-only `Structure / Hex` view. When a frontend can
+prove an instruction's exact absolute byte range in the opened artifact, the
+core exposes that neutral `ByteRange` provenance and the GUI highlights the
+corresponding bytes. Logical VM offsets are kept separate from artifact byte
+offsets; when a range cannot be proven, the GUI deliberately does not guess.
+This view never edits, re-encodes, or executes the original bytes.
+
 The GUI plugin SDK is installed automatically with `unidecompiler-gui`. Plugin
 authors can install it directly when developing against the public, Qt-neutral
 API:

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from unidecompiler.core.ir import SourceRef
+from unidecompiler.provenance import ByteRange
 
 
 VMOperandRole = Literal[
@@ -36,3 +37,4 @@ class VMDecodedInstruction:
     source: SourceRef
     operands: tuple[VMOperand, ...] = ()
     raw: str = ""
+    artifact_range: ByteRange | None = None

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-plugin-jvm-class"
-version = "0.1.1"
+version = "0.1.2"
 description = "JVM class-file frontend plugin for unidecompiler"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Wker", email = "1670133844@qq.com" }]
 requires-python = ">=3.11"
-dependencies = ["unidecompiler>=0.1.1,<0.2.0", "jawa>=2.2.0,<3"]
+dependencies = ["unidecompiler>=0.1.2,<0.2.0", "jawa>=2.2.0,<3"]
 
 [project.urls]
 Homepage = "https://github.com/Wker666/unidecompiler"

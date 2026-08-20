@@ -30,6 +30,7 @@ from unidecompiler.core.vm_function import VMFunctionSpec, lift_steps, lift_vm_s
 from unidecompiler.core.vm_hints import VMHint
 from unidecompiler.core.vm_module import assemble_vm_module
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
+from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import (
     VMLinearState,
     VMRegionOpcodeClasses,
@@ -551,6 +552,7 @@ def _dotnet_decoded_instruction(instruction: DotNetInstruction, source: SourceRe
         source=source,
         operands=operands,
         raw=_dotnet_raw_instruction_line(instruction),
+        artifact_range=(None if instruction.artifact_offset is None or instruction.size is None else ByteRange(instruction.artifact_offset, instruction.size)),
     )
 
 

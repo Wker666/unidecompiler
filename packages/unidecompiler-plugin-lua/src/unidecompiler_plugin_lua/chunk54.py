@@ -198,6 +198,7 @@ def _read_code(reader: _Reader) -> tuple[LuaInstructionListing, ...]:
     count = reader.varint()
     instructions: list[LuaInstructionListing] = []
     for pc in range(1, count + 1):
+        artifact_offset = reader.offset
         raw = reader.unpack("I")
         opcode = _OPCODES[raw & 0x7F]
         instructions.append(
@@ -206,6 +207,8 @@ def _read_code(reader: _Reader) -> tuple[LuaInstructionListing, ...]:
                 line=None,
                 opcode=opcode,
                 operands=_decode_operands(opcode, raw),
+                artifact_offset=artifact_offset,
+                size=4,
             )
         )
     return tuple(instructions)

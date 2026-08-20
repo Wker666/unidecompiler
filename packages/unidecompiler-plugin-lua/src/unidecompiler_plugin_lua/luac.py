@@ -54,6 +54,8 @@ class LuaInstructionListing:
     opcode: str
     operands: tuple[str, ...]
     comment: str | None = None
+    artifact_offset: int | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)

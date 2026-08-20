@@ -24,6 +24,7 @@ from unidecompiler.core.vm_function import VMFunctionSpec, lift_steps, lift_vm_s
 from unidecompiler.core.vm_hints import VMHint
 from unidecompiler.core.vm_module import assemble_vm_module
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
+from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import VMRegionOpcodeClasses, VMStatefulCallbacks, build_hint_region_profile
 from unidecompiler_plugin_wasm.module import WasmFunctionListing, WasmInstruction, WasmModule
 
@@ -544,6 +545,7 @@ def _wasm_decoded_instruction(instruction: WasmInstruction, source: SourceRef) -
         source=source,
         operands=tuple(VMOperand(role=_wasm_operand_role(instruction.opcode), value=operand, text=operand) for operand in instruction.operands),
         raw=_wasm_raw_instruction_line(instruction),
+        artifact_range=ByteRange(instruction.offset, instruction.size),
     )
 
 

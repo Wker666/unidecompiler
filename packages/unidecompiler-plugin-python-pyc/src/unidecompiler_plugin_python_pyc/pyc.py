@@ -24,6 +24,8 @@ class PycInstruction:
     argval: object
     argrepr: str
     starts_line: int | None
+    artifact_offset: int | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class PycCodeObject:
     instructions: tuple[PycInstruction, ...]
     exception_regions: tuple[PycExceptionRegion, ...]
     children: tuple["PycCodeObject", ...]
+    artifact_code_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,17 +88,19 @@ def decode_pyc(data: bytes, filename: str | None = None) -> PycModule:
     return PycModule(
         magic=data[:4],
         flags=flags,
-        code=_decode_code_object(code),
+        code=_decode_code_object(code, _marshal_code_offsets(data, code)),
         filename=filename,
     )
 
 
-def _decode_code_object(code: types.CodeType) -> PycCodeObject:
+def _decode_code_object(code: types.CodeType, code_offsets: dict[int, int]) -> PycCodeObject:
     children = tuple(
-        _decode_code_object(const)
+        _decode_code_object(const, code_offsets)
         for const in code.co_consts
         if isinstance(const, types.CodeType)
     )
+    instructions = tuple(dis.get_instructions(code))
+    code_start = code_offsets.get(id(code))
     return PycCodeObject(
         name=code.co_name,
         argcount=code.co_argcount,
@@ -119,8 +124,10 @@ def _decode_code_object(code: types.CodeType) -> PycCodeObject:
                 argval=instruction.argval,
                 argrepr=instruction.argrepr,
                 starts_line=instruction.starts_line,
+                artifact_offset=None if code_start is None else code_start + instruction.offset,
+                size=None if code_start is None else _instruction_size(instructions, index, len(code.co_code)),
             )
-            for instruction in dis.get_instructions(code)
+            for index, instruction in enumerate(instructions)
         ),
         exception_regions=tuple(
             PycExceptionRegion(
@@ -133,4 +140,58 @@ def _decode_code_object(code: types.CodeType) -> PycCodeObject:
             for entry in dis.Bytecode(code).exception_entries
         ),
         children=children,
+        artifact_code_offset=code_start,
     )
+
+
+def _instruction_size(instructions: tuple[dis.Instruction, ...], index: int, code_size: int) -> int:
+    next_offset = instructions[index + 1].offset if index + 1 < len(instructions) else code_size
+    return next_offset - instructions[index].offset
+
+
+def _marshal_code_offsets(data: bytes, root: types.CodeType) -> dict[int, int]:
+    """Find only unambiguous marshal byte-string records for ``co_code`` values.
+
+    CPython serializes code bytes as a marshal ``TYPE_STRING`` record.  The
+    frontend verifies both that record's tag and its length, then accepts a
+    location only when that code byte sequence has exactly one candidate.  A
+    repeated or otherwise ambiguous value is deliberately left unmapped.
+    """
+    code_objects = tuple(_walk_code_objects(root))
+    candidates: dict[bytes, list[int]] = {}
+    for code in code_objects:
+        payload = code.co_code
+        if payload in candidates:
+            continue
+        candidates[payload] = _marshal_string_payload_offsets(data, payload)
+    assigned: set[int] = set()
+    offsets: dict[int, int] = {}
+    for code in code_objects:
+        matches = [offset for offset in candidates[code.co_code] if offset not in assigned]
+        if len(matches) == 1:
+            offsets[id(code)] = matches[0]
+            assigned.add(matches[0])
+    return offsets
+
+
+def _walk_code_objects(code: types.CodeType):
+    yield code
+    for value in code.co_consts:
+        if isinstance(value, types.CodeType):
+            yield from _walk_code_objects(value)
+
+
+def _marshal_string_payload_offsets(data: bytes, payload: bytes) -> list[int]:
+    if not payload:
+        return []
+    result: list[int] = []
+    size = len(payload)
+    for header in range(PYC_MIN_HEADER_SIZE, len(data) - size - 4):
+        if (data[header] & 0x7F) != ord("s"):
+            continue
+        if int.from_bytes(data[header + 1 : header + 5], "little", signed=True) != size:
+            continue
+        start = header + 5
+        if data[start : start + size] == payload:
+            result.append(start)
+    return result

@@ -21,6 +21,7 @@ class WasmInstruction:
     offset: int
     opcode: str
     operands: tuple[str, ...] = ()
+    size: int = 1
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,7 @@ def _decode_instruction_stream(code: bytes, base_offset: int) -> tuple[WasmInstr
                     offset=base_offset + offset,
                     opcode=instruction[0],
                     operands=instruction[1],
+                    size=length,
                 )
             )
             offset += length
@@ -240,6 +242,7 @@ def _decode_instruction_stream(code: bytes, base_offset: int) -> tuple[WasmInstr
                     offset=base_offset + offset,
                     opcode=post_mvp_opcode,
                     operands=operands,
+                    size=length,
                 )
             )
             offset += length
@@ -256,6 +259,7 @@ def _decode_instruction_stream(code: bytes, base_offset: int) -> tuple[WasmInstr
                 offset=base_offset + offset,
                 opcode=_normalize_opcode(instruction.op.mnemonic),
                 operands=operands,
+                size=instruction.len,
             )
         )
         offset += instruction.len

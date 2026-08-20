@@ -53,6 +53,7 @@ from unidecompiler.core.vm_function import (
 from unidecompiler.core.vm_bytecode import VMBytecodeStep
 from unidecompiler.core.vm_hints import VMHint
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
+from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import (
     VMLinearState,
     VMRegionOpcodeClasses,
@@ -665,6 +666,7 @@ def _jvm_decoded_instruction(instruction: JavaInstruction, source: SourceRef) ->
         source=source,
         operands=operands,
         raw=_jvm_raw_instruction_line(instruction),
+        artifact_range=(None if instruction.artifact_offset is None or instruction.size is None else ByteRange(instruction.artifact_offset, instruction.size)),
     )
 
 

@@ -26,6 +26,8 @@ class DotNetInstruction:
     arg_count: int | None = None
     returns_void: bool | None = None
     is_static: bool | None = None
+    artifact_offset: int | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -132,7 +134,7 @@ def _method_listing(pe, row_index: int, row) -> DotNetMethodListing:
         param_count=_signature_param_count(row.Signature),
         max_stack=None if body is None else body.max_stack,
         code_size=0 if body is None else len(body.code),
-        instructions=() if body is None else _decode_il(pe, body.code),
+        instructions=() if body is None else _decode_il(pe, body.code, body.artifact_offset),
     )
 
 
@@ -140,6 +142,7 @@ def _method_listing(pe, row_index: int, row) -> DotNetMethodListing:
 class _MethodBody:
     max_stack: int
     code: bytes
+    artifact_offset: int | None
 
 
 def _read_method_body(pe, rva: int) -> _MethodBody | None:
@@ -150,7 +153,7 @@ def _read_method_body(pe, rva: int) -> _MethodBody | None:
     kind = first & 0x3
     if kind == 0x2:
         code_size = first >> 2
-        return _MethodBody(max_stack=8, code=pe.get_data(rva + 1, code_size))
+        return _MethodBody(max_stack=8, code=pe.get_data(rva + 1, code_size), artifact_offset=_artifact_offset(pe, rva + 1))
     if kind == 0x3:
         header = pe.get_data(rva, 12)
         if len(header) < 12:
@@ -159,7 +162,7 @@ def _read_method_body(pe, rva: int) -> _MethodBody | None:
         header_size = (_flags_size >> 12) * 4
         if header_size < 12:
             return None
-        return _MethodBody(max_stack=max_stack, code=pe.get_data(rva + header_size, code_size))
+        return _MethodBody(max_stack=max_stack, code=pe.get_data(rva + header_size, code_size), artifact_offset=_artifact_offset(pe, rva + header_size))
     return None
 
 
@@ -428,7 +431,14 @@ _TWO_BYTE_OPCODES = {
 }
 
 
-def _decode_il(pe, code: bytes) -> tuple[DotNetInstruction, ...]:
+def _artifact_offset(pe, rva: int) -> int | None:
+    try:
+        return int(pe.get_offset_from_rva(rva))
+    except Exception:
+        return None
+
+
+def _decode_il(pe, code: bytes, artifact_offset: int | None = None) -> tuple[DotNetInstruction, ...]:
     instructions: list[DotNetInstruction] = []
     offset = 0
     while offset < len(code):
@@ -454,6 +464,8 @@ def _decode_il(pe, code: bytes) -> tuple[DotNetInstruction, ...]:
                 arg_count=operand.arg_count,
                 returns_void=operand.returns_void,
                 is_static=operand.is_static,
+                artifact_offset=None if artifact_offset is None else artifact_offset + start,
+                size=offset - start,
             )
         )
     return tuple(instructions)

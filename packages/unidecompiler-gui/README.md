@@ -23,6 +23,16 @@ plugins through `DecompilerEngine` and does not modify input artifacts or save
 workspace state. Its optional Simulation tab uses the separate generic IR
 simulator and can load a trusted Python runtime file for unresolved functions.
 
+## Structure and Hex analysis
+
+`Structure / Hex` is a read-only, IR-first provenance view. It shows the
+generic recovered structure beside a virtualized hexadecimal view of the
+original input. Selecting a structure node highlights every exact artifact byte
+range known for its source instructions. When a frontend only has a logical VM
+offset, the GUI shows that offset and deliberately does not guess a file byte
+location. The view is analysis-only: it does not edit bytes, re-encode opcodes,
+or execute frontend bytecode.
+
 ## Extension templates
 
 Use `Tools -> Export extension template` to create a self-contained starter

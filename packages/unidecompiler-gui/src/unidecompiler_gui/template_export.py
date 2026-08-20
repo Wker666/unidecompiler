@@ -83,8 +83,8 @@ def _render_tree(request: TemplateRequest, destination: Path) -> None:
         "__FIRST_SUFFIX__": request.suffixes[0] if request.suffixes else ".vm",
         "__VERSIONS__": repr(request.versions),
         "__DEPENDENCIES__": _toml_array(
-            ("unidecompiler>=0.1.1,<0.2.0", "unidecompiler-simulator>=0.1.1,<0.2.0")
-            if request.include_simulation else ("unidecompiler>=0.1.1,<0.2.0",)
+            ("unidecompiler>=0.1.2,<0.2.0", "unidecompiler-simulator>=0.1.1,<0.2.0")
+            if request.include_simulation else ("unidecompiler>=0.1.2,<0.2.0",)
         ),
     }
     for source, relative in _walk_assets(source_root):

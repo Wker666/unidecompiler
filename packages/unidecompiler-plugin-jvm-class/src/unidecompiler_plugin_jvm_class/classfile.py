@@ -19,6 +19,8 @@ class JavaInstruction:
     offset: int
     opcode: str
     operands: str = ""
+    artifact_offset: int | None = None
+    size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,12 +109,16 @@ class JawaClassFileDecoder:
         except Exception as error:  # pragma: no cover - jawa owns parse details.
             raise ClassDecodeError(f"jawa failed to decode class: {error}") from error
         class_name = _jawa_utf8(parsed.this.name)
+        try:
+            code_ranges = _class_code_ranges(data)
+        except ClassDecodeError:
+            code_ranges = ({},) * len(tuple(parsed.methods))
         return JavaClassFile(
             minor_version=parsed.version.minor,
             major_version=parsed.version.major,
             class_name=class_name,
             is_annotation=bool(parsed.access_flags.acc_annotation),
-            methods=tuple(_jawa_method_listing(parsed, method) for method in parsed.methods),
+            methods=tuple(_jawa_method_listing(parsed, method, code_ranges[index]) for index, method in enumerate(parsed.methods)),
             filename=filename,
             decoder_id=self.id,
         )
@@ -152,7 +158,7 @@ def _jawa_class_file_type():
     return ClassFile
 
 
-def _jawa_method_listing(class_file, method) -> JavaMethodListing:
+def _jawa_method_listing(class_file, method, ranges: dict[int, tuple[int, int]] | None = None) -> JavaMethodListing:
     raw_name = _jawa_utf8(method.name) or "<method>"
     class_name = _jawa_utf8(class_file.this.name)
     name = class_name.rsplit("/", 1)[-1] if raw_name == "<init>" and class_name else raw_name
@@ -160,7 +166,7 @@ def _jawa_method_listing(class_file, method) -> JavaMethodListing:
     instructions: tuple[JavaInstruction, ...] = ()
     if code is not None:
         instructions = tuple(
-            _jawa_instruction(class_file, instruction) for instruction in code.disassemble()
+            _jawa_instruction(class_file, instruction, ranges or {}) for instruction in code.disassemble()
         )
     return JavaMethodListing(
         name=name,
@@ -249,7 +255,10 @@ def _jawa_constant_value(class_file, index: int) -> object:
     return f"#{index}"
 
 
-def _jawa_instruction(class_file, instruction) -> JavaInstruction:
+def _jawa_instruction(class_file, instruction, ranges: dict[int, tuple[int, int]]) -> JavaInstruction:
+    artifact_range = ranges.get(instruction.pos)
+    artifact_offset = None if artifact_range is None else artifact_range[0]
+    size = None if artifact_range is None else artifact_range[1]
     if instruction.mnemonic == "lookupswitch":
         operands = _jawa_lookupswitch_operands(instruction)
         if operands is not None:
@@ -257,6 +266,8 @@ def _jawa_instruction(class_file, instruction) -> JavaInstruction:
                 offset=instruction.pos,
                 opcode=instruction.mnemonic,
                 operands=operands,
+                artifact_offset=artifact_offset,
+                size=size,
             )
     operands = tuple(
         rendered
@@ -269,7 +280,164 @@ def _jawa_instruction(class_file, instruction) -> JavaInstruction:
         offset=instruction.pos,
         opcode=instruction.mnemonic,
         operands=", ".join(operands),
+        artifact_offset=artifact_offset,
+        size=size,
     )
+
+
+def _class_code_ranges(data: bytes) -> tuple[dict[int, tuple[int, int]], ...]:
+    """Locate JVM Code attributes without exposing parser state outside this frontend."""
+    reader = _ClassReader(data)
+    if reader.read_u4() != int.from_bytes(CLASS_MAGIC, "big"):
+        raise ClassDecodeError("missing class magic")
+    reader.skip(4)  # minor and major version
+    constants = reader.read_constants()
+    reader.skip(6)  # access flags, this class, super class
+    reader.skip(reader.read_u2() * 2)  # interfaces
+    reader.skip_members(constants)  # fields
+    result: list[dict[int, tuple[int, int]]] = []
+    method_count = reader.read_u2()
+    for _ in range(method_count):
+        reader.skip(6)  # access flags, name index, descriptor index
+        attributes = reader.read_u2()
+        ranges: dict[int, tuple[int, int]] = {}
+        for _ in range(attributes):
+            name_index = reader.read_u2()
+            size = reader.read_u4()
+            start = reader.offset
+            if constants.get(name_index) == "Code" and size >= 8:
+                reader.skip(4)  # max_stack and max_locals
+                code_size = reader.read_u4()
+                code_start = reader.offset
+                if code_size <= size - 8 and code_start + code_size <= len(data):
+                    ranges = _jvm_instruction_ranges(data[code_start : code_start + code_size], code_start)
+            reader.seek(start + size)
+        result.append(ranges)
+    return tuple(result)
+
+
+def _jvm_instruction_ranges(code: bytes, artifact_start: int) -> dict[int, tuple[int, int]]:
+    """Return exact Code-attribute instruction ranges from JVM bytecode lengths."""
+    offsets: list[int] = []
+    cursor = 0
+    while cursor < len(code):
+        offsets.append(cursor)
+        cursor += _jvm_instruction_size(code, cursor)
+    if cursor != len(code):
+        raise ClassDecodeError("invalid JVM instruction length in Code attribute")
+    return {
+        offset: (artifact_start + offset, (offsets[index + 1] if index + 1 < len(offsets) else len(code)) - offset)
+        for index, offset in enumerate(offsets)
+    }
+
+
+def _jvm_instruction_size(code: bytes, offset: int) -> int:
+    opcode = code[offset]
+    fixed = _JVM_FIXED_OPERAND_SIZES.get(opcode)
+    if fixed is not None:
+        size = 1 + fixed
+    elif opcode == 0xAA:  # tableswitch
+        base = offset + 1
+        padding = (4 - base % 4) % 4
+        cursor = base + padding
+        if cursor + 12 > len(code):
+            raise ClassDecodeError("truncated tableswitch")
+        low = int.from_bytes(code[cursor + 4 : cursor + 8], "big", signed=True)
+        high = int.from_bytes(code[cursor + 8 : cursor + 12], "big", signed=True)
+        size = 1 + padding + 12 + (high - low + 1) * 4
+    elif opcode == 0xAB:  # lookupswitch
+        base = offset + 1
+        padding = (4 - base % 4) % 4
+        cursor = base + padding
+        if cursor + 8 > len(code):
+            raise ClassDecodeError("truncated lookupswitch")
+        pairs = int.from_bytes(code[cursor + 4 : cursor + 8], "big", signed=True)
+        size = 1 + padding + 8 + pairs * 8
+    elif opcode == 0xC4:  # wide
+        if offset + 1 >= len(code):
+            raise ClassDecodeError("truncated wide instruction")
+        size = 6 if code[offset + 1] == 0x84 else 4
+    else:
+        raise ClassDecodeError(f"unknown JVM opcode 0x{opcode:02x}")
+    if size <= 0 or offset + size > len(code):
+        raise ClassDecodeError("truncated JVM instruction")
+    return size
+
+
+class _ClassReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.offset = 0
+
+    def read_u2(self) -> int:
+        value = int.from_bytes(self.read(2), "big")
+        return value
+
+    def read_u4(self) -> int:
+        value = int.from_bytes(self.read(4), "big")
+        return value
+
+    def read(self, size: int) -> bytes:
+        if size < 0 or self.offset + size > len(self.data):
+            raise ClassDecodeError("truncated class file")
+        value = self.data[self.offset : self.offset + size]
+        self.offset += size
+        return value
+
+    def skip(self, size: int) -> None:
+        self.read(size)
+
+    def seek(self, offset: int) -> None:
+        if offset < self.offset or offset > len(self.data):
+            raise ClassDecodeError("invalid class attribute length")
+        self.offset = offset
+
+    def read_constants(self) -> dict[int, str]:
+        count = self.read_u2()
+        values: dict[int, str] = {}
+        index = 1
+        while index < count:
+            tag = self.read(1)[0]
+            if tag == 1:
+                length = self.read_u2()
+                values[index] = self.read(length).decode("utf-8", "replace")
+            elif tag in {3, 4}:
+                self.skip(4)
+            elif tag in {5, 6}:
+                self.skip(8)
+                index += 1
+            elif tag in {7, 8, 16, 19, 20}:
+                self.skip(2)
+            elif tag in {9, 10, 11, 12, 17, 18}:
+                self.skip(4)
+            elif tag == 15:
+                self.skip(3)
+            else:
+                raise ClassDecodeError(f"unknown class constant tag {tag}")
+            index += 1
+        return values
+
+    def skip_members(self, constants: dict[int, str]) -> None:
+        for _ in range(self.read_u2()):
+            self.skip(6)
+            for _ in range(self.read_u2()):
+                self.skip(2)
+                self.skip(self.read_u4())
+
+
+_JVM_FIXED_OPERAND_SIZES = {opcode: 0 for opcode in range(256)}
+for _opcode in (0x10, 0x12, 0x15, 0x16, 0x17, 0x18, 0x19, 0x36, 0x37, 0x38, 0x39, 0x3A, 0xA9, 0xBC):
+    _JVM_FIXED_OPERAND_SIZES[_opcode] = 1
+for _opcode in (0x11, 0x13, 0x14, 0x84, *range(0x99, 0xA9), 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xBB, 0xBD, 0xC0, 0xC1, 0xC6, 0xC7):
+    _JVM_FIXED_OPERAND_SIZES[_opcode] = 2
+for _opcode in (0xB9, 0xBA):
+    _JVM_FIXED_OPERAND_SIZES[_opcode] = 4
+for _opcode in (0xC5,):
+    _JVM_FIXED_OPERAND_SIZES[_opcode] = 3
+for _opcode in (0xC8, 0xC9):
+    _JVM_FIXED_OPERAND_SIZES[_opcode] = 4
+for _opcode in (0xAA, 0xAB, 0xC4):
+    _JVM_FIXED_OPERAND_SIZES.pop(_opcode)
 
 
 def _jawa_lookupswitch_operands(instruction) -> str | None:

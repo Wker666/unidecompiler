@@ -16,6 +16,7 @@ from unidecompiler_gui.themes import Theme, builtin_themes, external_theme
 from unidecompiler_gui.plugin_host import PluginHost
 from unidecompiler_gui.plugin_install import GuiPluginStore, load_enabled_plugins
 from unidecompiler_gui.frontend_store import FrontendRestoreFailure, FrontendStore
+from unidecompiler_gui.hex_view import HexView
 from unidecompiler_simulator import (
     SimulationCancellation,
     SimulationEngine,
@@ -595,7 +596,7 @@ class DecompileWorker(QObject):
                     self.completed.emit(tuple(results), True)
                     return
                 result = self._engine.decompile_artifact(artifact)
-                results.append((result, artifact.data if result.status == "resource" else None))
+                results.append((result, artifact.data))
         except Exception as error:
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
@@ -669,6 +670,7 @@ class Workbench(QMainWindow):
         self.results: tuple[DecompileResult, ...] = ()
         self._document_revisions: dict[str, int] = {}
         self._resource_data: dict[str, bytes] = {}
+        self._artifact_data: dict[str, bytes] = {}
         self._displayed_result_path: str | None = None
         self._displayed_function_id: str | None = None
         self._displayed_resource_path: str | None = None
@@ -798,14 +800,12 @@ class Workbench(QMainWindow):
         self.pseudocode.function_activated.connect(self._activate_function)
         self.resource_text = QPlainTextEdit()
         self.resource_text.setReadOnly(True)
-        self.resource_binary = QPlainTextEdit()
-        self.resource_binary.setReadOnly(True)
+        self.resource_binary = HexView()
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self.resource_text.setFont(fixed_font)
-        self.resource_binary.setFont(fixed_font)
         self.resource_tabs = QTabWidget()
         self.resource_tabs.addTab(self.resource_text, "Text")
-        self.resource_tabs.addTab(self.resource_binary, "Binary")
+        self.resource_tabs.addTab(self.resource_binary, "Hex")
         self.ast_tree = QTreeWidget()
         self.ast_tree.setHeaderLabels(["AST"])
         self.ast_tree.itemSelectionChanged.connect(self._ast_selected)
@@ -824,6 +824,22 @@ class Workbench(QMainWindow):
         self.bytecode.setColumnWidth(2, 250)
         self.bytecode.itemSelectionChanged.connect(self._bytecode_selected)
         self.bytecode.cellDoubleClicked.connect(self._bytecode_activated)
+        self.structure_tree = QTreeWidget()
+        self.structure_tree.setHeaderLabels(["Generic IR structure", "Source"])
+        self.structure_tree.itemSelectionChanged.connect(self._structure_selected)
+        self.structure_tree.itemDoubleClicked.connect(self._structure_activated)
+        self.hex_view = HexView()
+        self.structure_details = QPlainTextEdit()
+        self.structure_details.setReadOnly(True)
+        self.structure_details.setMaximumHeight(96)
+        structure_left = QSplitter(Qt.Orientation.Vertical)
+        structure_left.addWidget(self.structure_tree)
+        structure_left.addWidget(self.structure_details)
+        structure_left.setSizes([360, 100])
+        self.structure_panel = QSplitter(Qt.Orientation.Horizontal)
+        self.structure_panel.addWidget(structure_left)
+        self.structure_panel.addWidget(self.hex_view)
+        self.structure_panel.setSizes([400, 700])
         self.references = QTableWidget(0, 4)
         self.references.setHorizontalHeaderLabels(["Kind", "Name", "Function", "Offset"])
         self.references.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1018,6 +1034,7 @@ class Workbench(QMainWindow):
         self.detail_tabs.addTab(references_panel, "References / Calls")
         self.detail_tabs.addTab(browse_panel, "Browser")
         self.detail_tabs.addTab(control_flow_panel, "CFG")
+        self.detail_tabs.addTab(self.structure_panel, "Structure / Hex")
         self.detail_tabs.addTab(self.simulation_panel, "Simulation")
         self.detail_tabs.currentChanged.connect(self._simulation_tab_changed)
         self.detail_tabs.setCurrentWidget(self.pseudocode)
@@ -1495,6 +1512,7 @@ class Workbench(QMainWindow):
         self.results = ()
         self._document_revisions = {}
         self._resource_data = {}
+        self._artifact_data = {}
         self._simulation_targets = {}
         self._simulation_result = None
         self._simulation_result_path = ""
@@ -1578,8 +1596,10 @@ class Workbench(QMainWindow):
         ) if isinstance(result, tuple) else ()
         results = tuple(item[0] for item in completed)
         for item, data in completed:
-            if item.status == "resource" and isinstance(data, bytes):
-                self._resource_data[item.display_path] = data
+            if isinstance(data, bytes):
+                self._artifact_data[item.display_path] = data
+                if item.status == "resource":
+                    self._resource_data[item.display_path] = data
         if results:
             self.results = (*self.results, *results)
             for item in results:
@@ -2301,6 +2321,7 @@ class Workbench(QMainWindow):
         if result_changed:
             self.pseudocode.setPlainText("" if result.pseudocode is None else result.pseudocode.text)
             self._populate_ast(result.ast, result)
+            self._populate_structure(result)
             self._displayed_result_path = result.display_path
         if function_changed:
             self._populate_bytecode(result, function_id)
@@ -2331,7 +2352,7 @@ class Workbench(QMainWindow):
         data = self._resource_data.get(result.display_path)
         if data is None:
             self.resource_text.setPlainText("Resource data is unavailable.")
-            self.resource_binary.clear()
+            self.resource_binary.set_data(b"")
             self._displayed_resource_path = result.display_path
             return
         text = _decode_resource_text(data)
@@ -2341,7 +2362,7 @@ class Workbench(QMainWindow):
         else:
             self.resource_text.setPlainText(text)
             self.resource_tabs.setCurrentWidget(self.resource_text)
-        self.resource_binary.setPlainText(_hex_dump(data))
+        self.resource_binary.set_data(data)
         self._displayed_resource_path = result.display_path
 
     def _activate_function(self, name: str) -> None:
@@ -2416,6 +2437,64 @@ class Workbench(QMainWindow):
             ids_by_name = {function.name: function.id for function in result.functions}
             self.ast_tree.addTopLevelItem(_ast_item(ast, ids_by_name))
             self.ast_tree.expandToDepth(2)
+
+    def _populate_structure(self, result: DecompileResult) -> None:
+        self.structure_tree.clear()
+        self.structure_details.clear()
+        self.hex_view.set_data(self._artifact_data.get(result.display_path, b""))
+        structure = result.structure
+        if structure is None:
+            return
+
+        def add(parent: QTreeWidgetItem | None, node) -> None:
+            offset = ""
+            if node.source is not None and node.source.offset is not None:
+                offset = f"VM {node.source.offset}"
+            if node.byte_ranges:
+                offset = ", ".join(f"0x{item.start:X}+{item.size}" for item in node.byte_ranges)
+            item = QTreeWidgetItem([node.label, offset or "unmapped"])
+            item.setData(0, Qt.ItemDataRole.UserRole, (node.source, node.byte_ranges, node.kind))
+            if parent is None:
+                self.structure_tree.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            for child in node.children:
+                add(item, child)
+
+        add(None, structure.root)
+        self.structure_tree.expandToDepth(2)
+
+    def _structure_selected(self) -> None:
+        selected = self.structure_tree.selectedItems()
+        if not selected:
+            return
+        data = selected[0].data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple) or len(data) != 3:
+            return
+        source, ranges, kind = data
+        source_offset = getattr(source, "offset", None)
+        lines = [f"Kind: {kind}"]
+        if source is not None:
+            lines.append(f"VM offset: {source_offset if source_offset is not None else 'unavailable'}")
+        if ranges:
+            lines.append("Artifact ranges: " + ", ".join(f"0x{item.start:X}..0x{item.end - 1:X}" for item in ranges))
+            self.hex_view.highlight_ranges(ranges)
+        else:
+            lines.append("Artifact ranges: unavailable (logical VM offset only)")
+            self.hex_view.highlight_ranges(())
+        self.structure_details.setPlainText("\n".join(lines))
+
+    def _structure_activated(self, item: QTreeWidgetItem, _column: int) -> None:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        result = self._selected_result()
+        if not isinstance(data, tuple) or not isinstance(result, DecompileResult):
+            return
+        source = data[0]
+        if source is None:
+            return
+        candidates = [row for row in result.instructions if _same_source(row.source, source)]
+        if candidates:
+            self._focus_source(result, source, candidates[0].function_id)
 
     def _populate_references(self, result: DecompileResult, function_id: str | None) -> None:
         references = [
@@ -2554,6 +2633,9 @@ class Workbench(QMainWindow):
             result = self._selected_result()
             if isinstance(data, dict) and isinstance(result, DecompileResult):
                 self._focus_source(result, data["source"], data["function_id"])
+                instruction = next((row for row in result.instructions if _same_source(row.source, data["source"]) and row.function_id == data["function_id"]), None)
+                if instruction is not None and instruction.byte_range is not None:
+                    self.hex_view.highlight_ranges((instruction.byte_range,))
 
     def _bytecode_activated(self, row: int, _column: int) -> None:
         item = self.bytecode.item(row, 0)

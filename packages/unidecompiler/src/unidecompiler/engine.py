@@ -1,7 +1,7 @@
 """Public, frontend-neutral facade for application hosts."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +15,7 @@ from unidecompiler.core.reporting import ModuleReport, build_module_report
 from unidecompiler.input_sources import InputArtifact, expand_input_path
 from unidecompiler.plugin_registry import FrontendRegistry, FrontendSelectionError
 from unidecompiler.plugins import FrontendDecodeError
+from unidecompiler.provenance import ByteRange
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class BytecodeInstruction:
     operands: tuple[str, ...]
     raw: str
     source: SourceRef
+    byte_range: ByteRange | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,23 @@ class PseudocodeDocument:
 
 
 @dataclass(frozen=True)
+class StructureNode:
+    """A read-only generic AST node with artifact provenance when available."""
+
+    id: str
+    label: str
+    kind: str
+    source: SourceRef | None = None
+    byte_ranges: tuple[ByteRange, ...] = ()
+    children: tuple["StructureNode", ...] = ()
+
+
+@dataclass(frozen=True)
+class BytecodeStructure:
+    root: StructureNode
+
+
+@dataclass(frozen=True)
 class DecompileResult:
     display_path: str
     status: str
@@ -66,6 +85,7 @@ class DecompileResult:
     symbols: SymbolIndex = SymbolIndex()
     control_flow: tuple[FunctionControlFlow, ...] = ()
     browse: BrowseIndex = BrowseIndex()
+    structure: BytecodeStructure | None = None
 
 
 class DecompilerEngine:
@@ -104,7 +124,7 @@ class DecompilerEngine:
         except Exception as error:
             return _empty(display_path, "error", frontend.id, "frontend.decode-error", _error(error), "error")
         try:
-            return _present(display_path, frontend.id, frontend.lift(decoded), decoded.metadata)
+            return _present(display_path, frontend.id, frontend.lift(decoded), decoded.metadata, len(data))
         except Exception as error:
             return _empty(display_path, "error", frontend.id, "core.lift-error", _error(error), "error")
 
@@ -121,7 +141,7 @@ class DecompilerEngine:
         return self.decompile_bytes(artifact.data, artifact.display_path, frontend_id)
 
 
-def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: dict) -> DecompileResult:
+def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: dict, artifact_size: int) -> DecompileResult:
     ast = module_to_ast(module)
     emitted = GenericPseudocodeBackend().emit(module)
     diagnostics = _metadata_diagnostics(metadata, frontend_id)
@@ -139,7 +159,16 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
             diagnostics.append(Diagnostic(f"recovery.{status}", function.metadata.get("unsupported_reason", "Partial recovery"), "warning", frontend_id, function_id, None if source is None else source.offset, source, raw))
         function_control: list[BytecodeControlFlowInstruction] = []
         for row in rows:
-            instructions.append(BytecodeInstruction(function_id, row["offset"], row["opcode"], tuple(value["text"] for value in row["operands"]), row["raw"], row["source"]))
+            byte_range = row.get("artifact_range")
+            if not isinstance(byte_range, ByteRange):
+                byte_range = None
+            elif byte_range.end > artifact_size:
+                diagnostics.append(Diagnostic(
+                    "provenance.byte-range", "instruction byte range is outside the input artifact", "warning",
+                    frontend_id, function_id, row["offset"], row["source"], (),
+                ))
+                byte_range = None
+            instructions.append(BytecodeInstruction(function_id, row["offset"], row["opcode"], tuple(value["text"] for value in row["operands"]), row["raw"], row["source"], byte_range))
             offset = row.get("offset")
             source_ref = row.get("source")
             control = tuple(row.get("control", ()))
@@ -169,6 +198,7 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
         tuple((function.id, ir) for function, ir in zip(functions, _walk(module.functions), strict=True)),
         tuple(control_instructions),
     )
+    structure = _build_structure(ast, tuple(instructions))
     return DecompileResult(
         display_path=display_path,
         status="ok",
@@ -183,6 +213,7 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
         symbols=index,
         control_flow=control_flow,
         browse=browse,
+        structure=structure,
     )
 
 
@@ -190,6 +221,43 @@ def _walk(functions):
     for function in functions:
         yield function
         yield from _walk(function.nested_functions)
+
+
+def _build_structure(ast: ModuleDecl, instructions: tuple[BytecodeInstruction, ...]) -> BytecodeStructure:
+    ranges_by_source: dict[SourceRef, list[ByteRange]] = {}
+    for instruction in instructions:
+        if instruction.byte_range is not None:
+            ranges_by_source.setdefault(instruction.source, []).append(instruction.byte_range)
+
+    def visit(value: object, path: str) -> StructureNode | None:
+        if not is_dataclass(value):
+            return None
+        source = getattr(value, "source", None)
+        source = source if isinstance(source, SourceRef) else None
+        children: list[StructureNode] = []
+        for field in fields(value):
+            child_value = getattr(value, field.name)
+            if is_dataclass(child_value):
+                child = visit(child_value, f"{path}.{field.name}")
+                if child is not None:
+                    children.append(child)
+            elif isinstance(child_value, tuple):
+                for index, item in enumerate(child_value):
+                    child = visit(item, f"{path}.{field.name}[{index}]")
+                    if child is not None:
+                        children.append(child)
+        ranges = tuple(dict.fromkeys(ranges_by_source.get(source, ()))) if source is not None else ()
+        if not ranges:
+            ranges = tuple(dict.fromkeys(item for child in children for item in child.byte_ranges))
+        label = type(value).__name__
+        name = getattr(value, "name", None)
+        if isinstance(name, str) and name:
+            label = f"{label}: {name}"
+        return StructureNode(path, label, type(value).__name__, source, ranges, tuple(children))
+
+    root = visit(ast, "module")
+    assert root is not None
+    return BytecodeStructure(root)
 
 
 def _source_map(

@@ -13,7 +13,7 @@ If you want your frontend to support optional simulation, you must also read Sec
 If you are writing frontend for the first time, read it in this order:
 
 - Day 1: Sessions 0, 2, 3, 4, 5, 7, 8, 11, 12, 13.
-- Day 2: Sections 14, 15, 16, 17, 18, 19, 20, 20.1.
+- Day 2: Sections 14, 15, 16, 17, 18, 19, 20, 20.0, 20.1.
 - Day 3: Sections 23, 23.1, 24, 25, 27, 28.
 - Day 4: Sections 29, 30, 31, 32, 33, 34, 35, 36, 37.
 - Finally: Section 39, using the complete minimal plugin as a reference.
@@ -33,6 +33,7 @@ If your VM is not a stack machine, read Section 29 first, and then decide which 
 | effect | What does this instruction do to the stack, variables, calls, and returns |
 | hint | This directive tells the core's control flow/aggregation/exception facts |
 | SourceRef | The original location from which this fact came |
+| ByteRange | An exact absolute byte range in the original input artifact, used only for read-only provenance and Hex navigation |
 | target | original offset to jump to |
 | profile | the opcode classification table core uses to recover the CFG |
 | stateful callbacks | core's interface to call back frontend under complex control flow |
@@ -50,7 +51,7 @@ core assembles these facts back into structure
 If you want to start writing your first frontend now, just do these 7 steps:
 
 1. First select a very small VM and only keep 3 to 5 opcodes.
-2. Write `model.py` and keep only `offset`, `opcode`, `size`, `operands` and `raw`.
+2. Write `model.py` and keep VM offset, opcode, VM size, operands, raw text, plus `artifact_offset`/`artifact_size` whenever the binary parser can prove them.
 3. Write `decoder.py` and make `can_load()` and `decode()` stable first.
 4. Write `plugin.py`, which is only responsible for registration and `FrontendModule`.
 5. Write `lifter.py`, first support `CONST`, `ADD`, `RETURN`.
@@ -58,6 +59,38 @@ If you want to start writing your first frontend now, just do these 7 steps:
 7. Run the verification scripts in Sections 23 to 25 to confirm that both the GUI and CFG are normal.
 
 If you want to see the results as quickly as possible, just copy the small plug-in example in Section 39.1, and replace the opcode name and operand decoding with your VM semantics.
+
+## 0.4 Standalone implementation recipe
+
+This document is intended to be sufficient to implement a frontend without
+reading framework source. Use this ordered checklist as the contract:
+
+1. Create the package and manifest from Sections 2 and 3.
+2. Implement exactly the plugin facade in Section 4 and the private decoder
+   model in Section 5.
+3. Choose one VM offset coordinate in Section 6. All `SourceRef.offset`,
+   instruction sizes, and `VMHint.target` values for a function use that
+   coordinate.
+4. Emit only the public thin-IR objects in Sections 7, 8, 12, and 15. Do not
+   build core IR nodes, CFG blocks, AST, or pseudocode structures.
+5. Use the complete step/function/module templates in Sections 17 to 19. They
+   are the only frontend-to-core entry points needed for ordinary VMs.
+6. If the parser can prove original-file byte positions, add the optional
+   provenance contract in Section 20.0. It is unrelated to VM control-flow
+   coordinates.
+7. If simulation is useful, add only the data-only adapter in Section 20.1;
+   do not add an interpreter. Otherwise omit it completely.
+8. Follow the test matrix in Sections 23 and 24, then register and troubleshoot
+   using Section 25. Completion is defined by Section 28.
+
+When a needed bytecode fact cannot be represented by the public objects in this
+document, do not work around it with frontend recovery logic. Record the
+minimal cross-VM concept required and extend thin IR/core as described in
+Section 40. That preserves the mandatory decoupling:
+
+```text
+frontend -> core generic IR <- simulator <- CLI / GUI
+```
 
 ## 0. First clarify the boundaries of frontend
 
@@ -67,6 +100,7 @@ Frontend can do:
 - Parse files, functions, instructions, constants, and debugging information.
 - Generate `VMBytecodeStep` for each instruction.
 - Fill in `decoded`, `raw`, `effects`, `hints` for step.
+- When the decoder knows an instruction's exact location in the original artifact, attach a `ByteRange` to the decoded instruction.
 - Provide `VMRegionOpcodeClasses`.
 - Provide `VMStatefulCallbacks`, allowing core to save VM stack and local state across basic blocks.
 - Submit neutral facts such as branch target, loop backedge, case target, exception region, etc.
@@ -79,6 +113,7 @@ Frontend cannot do:
 - Remediate control flow at the backend/pseudocode layer.
 - Enter hard-coded recovery rules for a sample, fixture or business.
 - Insert private decoder objects into core-visible operands, hints, or metadata to express program logic.
+- Guess an artifact byte position from a VM offset, instruction index, method RVA, program counter, or a search for matching opcode bytes.
 - Write VM bytecode interpreter, opcode executor or frontend-specific for simulation
   frame/stack machine.
 - Implement your own function lookup, overload selection, or language runtime semantics in the GUI, CLI, or simulator.
@@ -254,6 +289,9 @@ class MyInstruction:
     operands: tuple[Any, ...] = ()
     raw: str = ""
     line: int | None = None
+    # Optional. Absolute offsets in the complete input artifact, not VM PCs.
+    artifact_offset: int | None = None
+    artifact_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -303,12 +341,20 @@ Don't ignore characters loosely just to make the sample "easier to parse". Front
 Decoder must be retained:
 
 - Original bytecode offset.
+- VM instruction size, in the same coordinate system as the bytecode offset.
+- Exact artifact byte offset and artifact byte size whenever the decoder can prove them.
 - opcode name.
 - operand original value.
 - raw disassembled text.
 - Function boundaries.
 - Available locals, parameter names, constant names, and debug lines.
 - malformed input in wrong position.
+
+`artifact_offset` and `artifact_size` are not replacements for `offset` and
+`size`. A method-relative JVM PC, a Python `co_code` offset, a Lua PC, a WASM
+code-section offset, and a PE RVA are all different coordinate systems. Keep
+the VM coordinate system for effects and `VMHint.target`; use artifact fields
+only to identify bytes in the complete input file.
 
 Error handling:
 
@@ -381,6 +427,7 @@ metadata={
 `VMDecodedInstruction` is a GUI/CLI displayable neutral disassembly line with no execution semantics.
 ```python
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
+from unidecompiler.provenance import ByteRange
 
 decoded = VMDecodedInstruction(
     opcode=instruction.opcode,
@@ -390,6 +437,11 @@ decoded = VMDecodedInstruction(
         VMOperand(role="target", value=120, text="0x78"),
     ),
     raw=instruction.raw,
+    artifact_range=(
+        None
+        if instruction.artifact_offset is None or instruction.artifact_size is None
+        else ByteRange(instruction.artifact_offset, instruction.artifact_size)
+    ),
 )
 ```
 Commonly used `VMOperand.role`:
@@ -413,6 +465,12 @@ Rules:
 - Don't put decoder private objects into operand.
 - branch target uses `role="target"`.
 - Opcode passes empty tuple when there is no operand.
+- `artifact_range` is an optional exact source fact. It must be a `ByteRange`
+  with a non-negative absolute file start and a positive encoded byte size.
+- Omit `artifact_range` when the location is unknown, derived only from a VM
+  PC, ambiguous, synthetic, or not in the current input artifact.
+- `artifact_range` has no execution semantics. It must not change effects,
+  hints, branch targets, function lookup, simulation, or recovery behavior.
 
 ## 8. Effect: Describe stack and value behavior
 
@@ -1134,6 +1192,7 @@ from unidecompiler.core.vm_bytecode import VMBytecodeStep
 from unidecompiler.core.vm_hints import VMHint
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
 from unidecompiler.core.ir import SourceRef
+from unidecompiler.provenance import ByteRange
 
 
 CONTROL = frozenset({"JUMP", "JUMP_IF_TRUE", "JUMP_IF_FALSE"})
@@ -1164,6 +1223,13 @@ def control_target_for_hint(instruction, targets: dict[int, int] | None) -> int 
     if targets is None:
         return None
     return targets.get(instruction.offset)
+
+
+def artifact_range_for(instruction) -> ByteRange | None:
+    # The decoder has already proved these fields refer to the opened artifact.
+    if instruction.artifact_offset is None or instruction.artifact_size is None:
+        return None
+    return ByteRange(instruction.artifact_offset, instruction.artifact_size)
 
 
 def control_hints(instruction, source, targets: dict[int, int] | None) -> tuple[VMHint, ...]:
@@ -1206,6 +1272,7 @@ def make_step(program, instruction, targets: dict[int, int] | None = None) -> VM
         source=source,
         operands=instruction_operands(instruction),
         raw=instruction.raw,
+        artifact_range=artifact_range_for(instruction),
     )
 
     return VMBytecodeStep(
@@ -1289,6 +1356,14 @@ Each display line should:
 - `raw`
 - `source`
 - `control`
+- `byte_range` when, and only when, the frontend supplied an exact
+  `VMDecodedInstruction.artifact_range`
+
+`bytecode_instructions` is a public projection. Its `byte_range` field is a
+`ByteRange | None`; it is not the frontend-private `MyInstruction` object and
+does not expose parser state. A GUI may select a disassembly row, AST node, or
+structure node and navigate to zero, one, or several projected ranges. A
+missing range is normal: show the logical VM offset and do not highlight bytes.
 
 If the GUI control flow view crashes, first check:
 
@@ -1298,6 +1373,241 @@ If the GUI control flow view crashes, first check:
 - Whether multiple conflicting targets are submitted for the same conditional jump.
 
 If the core's internal CFG is correct, but there is a self-loop of the same block in the GUI display metadata, you can filter and display only the control hint in the metadata. Don't change the core CFG, and don't lose hints required for real recovery.
+
+## 20.0 Exact artifact byte provenance and Structure / Hex
+
+The GUI has a read-only `Structure / Hex` view. It displays recovered generic
+structure beside the original input bytes. This view is not a second
+disassembler, an editor, a VM interpreter, or a frontend-private debugger.
+
+The only frontend contribution is an optional, data-only fact on each decoded
+instruction:
+
+```python
+from unidecompiler.provenance import ByteRange
+
+VMDecodedInstruction(
+    opcode=instruction.opcode,
+    source=source,
+    operands=operands,
+    raw=instruction.raw,
+    artifact_range=ByteRange(
+        start=instruction.artifact_offset,
+        size=instruction.artifact_size,
+    ),
+)
+```
+
+The dependency direction is mandatory:
+
+```text
+frontend parser -> ByteRange / VMDecodedInstruction -> core public result -> GUI Structure / Hex
+```
+
+The frontend must not import the GUI, create Qt widgets, construct a structure
+tree, choose highlight colors, read GUI state, or assume a GUI is present. Core
+only validates and projects neutral provenance. GUI only renders public
+`BytecodeInstruction.byte_range` and recovered generic structure. The simulator
+does not import, consume, or depend on artifact provenance.
+
+### 20.0.1 Two offset systems that must never be mixed
+
+Every binary frontend normally has at least two positions:
+
+| Field | Meaning | Used by | Example |
+|---|---|---|---|
+| `SourceRef.offset` | VM instruction position in the VM's own control-flow coordinate system | effects, hints, CFG, pseudocode navigation | JVM `Code` PC 12; Python `co_code` offset 24 |
+| `ByteRange.start` | absolute byte position in the complete opened artifact | Hex navigation and read-only provenance | byte `0x3A8` in `Example.class` |
+| `ByteRange.size` | exact count of encoded artifact bytes belonging to that instruction | Hex highlight | JVM instruction length 3 |
+
+`VMHint.target` must always use the same coordinate system as
+`SourceRef.offset`, never `ByteRange.start`.
+
+This is a valid JVM instruction:
+
+```python
+source = SourceRef(frontend="jvm-class", offset=12)
+decoded = VMDecodedInstruction(
+    opcode="invokestatic",
+    source=source,
+    operands=(VMOperand(role="member", value="Example.add:(II)I", text="Example.add"),),
+    raw="12: invokestatic Example.add:(II)I",
+    artifact_range=ByteRange(0x3A8, 3),
+)
+hint = VMHint(kind="branch-target", source=source, target=28)
+```
+
+The branch target is `28`, not `0x3A8`. `0x3A8` only identifies bytes in the
+classfile. Replacing targets with artifact positions corrupts CFG recovery.
+
+### 20.0.2 When `artifact_range` is required, optional, or forbidden
+
+Provide it when all of the following are true:
+
+1. The decoder knows the instruction's actual byte start in the complete input
+   artifact.
+2. The decoder knows its encoded length.
+3. `start >= 0`, `size > 0`, and `start + size <= len(input_data)`.
+4. The range is for the exact opened artifact, not a reconstructed stream,
+   temporary buffer, textual listing, decompressed child without a stable file
+   position, or another file.
+
+Omit it when any condition is false. Omission is a correct and intentional
+result. The GUI displays the logical VM offset and does not highlight arbitrary
+bytes.
+
+Never derive a range by:
+
+- treating instruction index as a byte offset;
+- treating a method-local PC, Lua PC, Python `co_code` offset, or PE RVA as a
+  whole-file byte offset without conversion;
+- searching the artifact for an opcode byte sequence and choosing the first
+  match;
+- estimating a fixed width for a variable-length instruction;
+- mapping decoded text produced by an external disassembler back to the binary;
+- re-serializing a decoded model and assuming its layout matches the input;
+- assigning a range to a synthetic instruction that did not occur in the input.
+
+If a format contains repeated byte strings or shared/indirect data, accept a
+range only when the parser can prove the specific record belongs to the current
+instruction. Ambiguous candidates must remain unmapped.
+
+### 20.0.3 Decoder model template
+
+Keep exact binary coordinates in the frontend-private model. The core never
+reads this model.
+
+```python
+@dataclass(frozen=True)
+class MyInstruction:
+    # VM coordinate system: used by SourceRef and jump targets.
+    offset: int
+    size: int
+    opcode: str
+    operands: tuple[object, ...]
+    raw: str
+
+    # Artifact coordinate system: used only for ByteRange.
+    artifact_offset: int | None
+    artifact_size: int | None
+```
+
+Then build a step without exposing the private model:
+
+```python
+def make_step(instruction: MyInstruction) -> VMBytecodeStep:
+    source = SourceRef(frontend=FRONTEND_ID, offset=instruction.offset)
+    artifact_range = None
+    if instruction.artifact_offset is not None and instruction.artifact_size is not None:
+        artifact_range = ByteRange(instruction.artifact_offset, instruction.artifact_size)
+    decoded = VMDecodedInstruction(
+        opcode=instruction.opcode,
+        source=source,
+        operands=tuple(to_operand(value) for value in instruction.operands),
+        raw=instruction.raw,
+        artifact_range=artifact_range,
+    )
+    return VMBytecodeStep(
+        opcode=decoded.opcode,
+        source=source,
+        effects=effects_for(instruction, source),
+        raw=decoded.raw,
+        decoded=decoded,
+        hints=hints_for(instruction, source),
+    )
+```
+
+Do not put `artifact_offset`, parser handles, reader objects, bytes buffers, or
+decoder objects into `VMOperand.value`, `VMHint.value`, `SourceRef.detail`, or
+`FrontendModule.metadata` to make this work.
+
+### 20.0.4 Format-specific recovery patterns
+
+Use the parser that already owns the binary format. Do not move these rules to
+core or GUI.
+
+| Format shape | VM offset | Exact artifact range strategy |
+|---|---|---|
+| Flat fixed-width bytecode | instruction byte offset | decoder records current reader offset and fixed width |
+| Flat variable-width bytecode | instruction byte offset | record reader offset before decode; use validated decoded length |
+| JVM classfile | `Code` attribute PC | parse class attributes, locate the specific `Code` byte array, then add PC to its artifact start |
+| .NET PE/CLI | method IL offset | convert method code RVA to PE file offset, then add IL offset and decoded IL size |
+| WASM | module/code stream offset | retain the module byte offset before instruction decode and its consumed LEB/opcode length |
+| Lua binary chunk | function PC | retain the reader offset before reading the instruction word; only do this for parser paths that see the original chunk bytes |
+| Python `.pyc` | `co_code` offset | retain the verified marshal bytes record for the exact `co_code` object, then add disassembly offset; leave repeated/ambiguous records unmapped |
+| External textual disassembly | listing PC/index | normally no reliable artifact range; omit it unless the decoder independently parses the original binary layout |
+
+For container formats, a nested function's VM PC is usually not enough. The
+frontend must retain the container location of the function's code region. For
+example, JVM `Code` starts after class headers and attributes; Python code bytes
+are inside marshal records; .NET IL starts after a method body header. All of
+those conversions remain frontend-private parsing facts.
+
+### 20.0.5 Multi-source recovered structure
+
+The GUI structure tree is generic-IR-first. A recovered statement can depend on
+many original instructions:
+
+```text
+load callee + load arguments + invoke + store result -> one CallExpr/Assign
+condition + branch + backedge + body                -> one loop structure
+```
+
+Therefore one selected structure node may list and highlight multiple disjoint
+`ByteRange` values. This is expected provenance, not duplicated instructions.
+The GUI may aggregate ranges from child nodes. A frontend does not create that
+tree and does not decide which generic AST node owns an instruction.
+
+### 20.0.6 Failure, validation, and compatibility
+
+`ByteRange` validates non-negative starts and positive sizes. Before returning
+the public result, core also rejects a range outside the opened artifact and
+reports a provenance diagnostic. A malformed provenance value must never make
+the decompiler silently choose another range.
+
+For frontend code:
+
+```python
+def exact_range(data: bytes, start: int | None, size: int | None) -> ByteRange | None:
+    if start is None or size is None:
+        return None
+    if start < 0 or size <= 0 or start + size > len(data):
+        return None
+    return ByteRange(start, size)
+```
+
+Use an equivalent helper in the frontend parser. It is valid to add a decoder
+diagnostic for malformed input; do not turn a missing optional range into a
+lift failure for an otherwise valid artifact.
+
+Existing frontends remain compatible because `artifact_range` defaults to
+`None`. New frontends should provide exact ranges whenever their decoder already
+has the required facts. A frontend must never claim Structure/Hex support by
+manufacturing ranges.
+
+### 20.0.7 Required provenance tests
+
+Add these tests for every frontend that provides ranges:
+
+1. Decode a real generated artifact, not only a manually built instruction.
+2. Assert at least one intended instruction has a non-`None` range.
+3. Assert `0 <= start < end <= len(original_data)`.
+4. Assert the range length equals the parser's consumed instruction length.
+5. Assert the bytes at that range are the exact bytes consumed for that
+   instruction. For a nested/container VM, compare against the correct method,
+   function, `Code`, or `co_code` region, not just a same-looking byte pattern.
+6. Assert VM branch targets still use VM offsets and are not artifact offsets.
+7. Test a malformed/truncated artifact: no out-of-bounds range may be emitted.
+8. Test an ambiguous or synthetic instruction path: its range must be `None`.
+9. Decompile through `DecompilerEngine` and assert the matching public
+   `BytecodeInstruction.byte_range` survives projection.
+10. Exercise GUI Structure/Hex navigation when the GUI package is available:
+    select an instruction or structure node and verify only the supplied exact
+    range is highlighted.
+
+Do not test this feature by inspecting frontend-private parser objects from
+GUI tests. Frontend tests validate the parser facts; engine tests validate the
+public projection; GUI tests validate rendering and navigation.
 
 ## 20.1 Optional simulation support
 
@@ -2060,6 +2370,20 @@ Integration:
 - Failure of one function does not affect other functions.
 - The GUI can open the sample without displaying it as a resource.
 
+Artifact provenance (only when this frontend emits `artifact_range`):
+
+- A generated real artifact projects at least one exact range to public
+  `BytecodeInstruction.byte_range`.
+- Every public range is in bounds, has positive size, and corresponds to the
+  exact original encoded instruction bytes.
+- A VM PC, instruction index, RVA, or code-region-relative offset is never
+  exposed as an absolute artifact range without a proven conversion.
+- Truncated, ambiguous, reconstructed, external-text-disassembly, and
+  synthetic-instruction paths emit `None`, never a guessed range.
+- Branch targets remain VM offsets when a byte range is present.
+- GUI tests select a public bytecode/structure item and verify that only the
+  exact supplied ranges are highlighted.
+
 If the frontend is declared to support simulation, it must also be added:
 
 Target discovery：
@@ -2134,6 +2458,21 @@ If the GUI still shows resource:
 - Check whether the plugin id is consistent with the decompile selection.
 - Check whether the current registry of the GUI needs to be re-registered or restarted.
 
+If the GUI's `Structure / Hex` page shows a logical offset but no highlight:
+
+- This is expected when `VMDecodedInstruction.artifact_range` is `None`; it
+  does not mean that decompilation failed.
+- Check that the parser retained a whole-artifact offset and exact encoded
+  length, then created `ByteRange(start, size)` in `make_step()`.
+- Check that `start >= 0`, `size > 0`, and `start + size <= len(input_data)`.
+- Do not substitute a VM PC, function-relative code offset, RVA, instruction
+  index, or text-listing line number for `ByteRange.start`.
+- Do not search for an opcode byte pattern after decoding. Repeated byte
+  strings make the result ambiguous; leave it unmapped instead.
+- Verify the GUI opened the same original bytes that the frontend parsed. A
+  range from a decompressed child, temporary buffer, or another artifact is
+  intentionally invalid for this view.
+
 If the GUI can be decompiled but the Simulation tab has no target:
 
 - Confirm that the plugin exposes `simulation_adapter`, and the adapter's `frontend_id` is the same as
@@ -2190,6 +2529,9 @@ If the GUI runs, but the runtime immediately fails or freezes:
 | Reuse the runtime state of the last run | The simulation is not repeatable and the results depend on the click sequence | Create/reset state for each run |
 | `partial + completed` treated as verified semantics | Error control flow may also reach Return | Compare with reference implementation or known path |
 | Trace stops or changes results after truncation | Observation behavior changes execution semantics | Only truncate events and continue restricted execution |
+| Use a VM PC/RVA/index as `ByteRange.start` | Hex selects unrelated file bytes | Retain and validate the exact whole-artifact byte position in the decoder |
+| Search for matching opcode bytes to create a range | Repeated bytes produce misleading navigation | Emit `None` unless the parser proves the particular encoded instruction |
+| Put parser objects or byte buffers in operands/metadata for Hex | GUI/core depend on frontend internals | Use only public `ByteRange`; retain parser state privately |
 
 ## 27. Implement sequence from scratch
 
@@ -2207,14 +2549,16 @@ Recommended order:1. Create a directory and manifest.
 12. Add `loop-backedge` to the backward edge.
 13. Run the complex control flow sample and make sure there is at least `if/goto`.
 14. Add unknown/malformed test.
-15. If simulation is supported, implement target discovery and function resolution of `simulation.py`.
-16. Add simulator project for pure calculation functions, control flow, return values and parameter binding.
-17. Add minimal data-only adapter hooks for language-specific behavior, do not add interpreters.
-18. Add `ExternalEnvironment` test for external calls and test unhandled results.
-19. Execute the real artifact through CLI and confirm that the query, args, and return values are correct.
-20. Register the GUI and confirm that the resource and target can be found, and the trace is visible after Run.
-21. Check that the adapter and host do not have paths that execute frontend bytecode.
-22. Let’s see if we need core to enhance the advanced structure.
+15. When exact original byte locations are available, retain them in the
+    private model and implement the optional Section 20.0 provenance tests.
+16. If simulation is supported, implement target discovery and function resolution of `simulation.py`.
+17. Add simulator project for pure calculation functions, control flow, return values and parameter binding.
+18. Add minimal data-only adapter hooks for language-specific behavior, do not add interpreters.
+19. Add `ExternalEnvironment` test for external calls and test unhandled results.
+20. Execute the real artifact through CLI and confirm that the query, args, and return values are correct.
+21. Register the GUI and confirm that the resource and target can be found, the trace is visible after Run, and exact byte highlights work when supported.
+22. Check that the adapter and host do not have paths that execute frontend bytecode.
+23. Decide whether an unrepresentable shared VM fact requires a core thin-IR extension.
 
 ## 28. Completion criteria
 
@@ -2230,6 +2574,10 @@ A frontend is completed within the target support range, and at least satisfies:
 - Complex control flow outputs at least low-level `if/goto`.
 - No misleading success status.
 - GUI can register, identify, decompile, and display CFG.
+- When exact original-file ranges are available, the frontend emits validated
+  `artifact_range` values and the public `BytecodeInstruction.byte_range`
+  projection supports Structure/Hex navigation. When they are not provable,
+  the frontend deliberately emits `None` rather than a guessed mapping.
 - Test coverage decoder, effects, control hints, integration.
 
 Impersonation support is optional, and not supporting impersonation does not disqualify frontend from decompilation capabilities. if
@@ -2312,6 +2660,31 @@ Three states of `effects`:
 | `None` | This opcode cannot currently be expressed safely | Let core partial/unsupported |
 
 Don't use `()` to mean "not yet implemented".
+
+### VMDecodedInstruction, VMOperand, and ByteRange
+
+These are the complete public display/provenance facts a frontend places on a
+step. They do not encode recovery decisions or executable behavior.
+
+| Object/field | Type | Required | Contract |
+|---|---|---:|---|
+| `VMDecodedInstruction.opcode` | `str` | yes | Stable decoded opcode name |
+| `VMDecodedInstruction.source` | `SourceRef` | yes | Same frontend and VM coordinate as the step |
+| `VMDecodedInstruction.operands` | `tuple[VMOperand, ...]` | no | Neutral displayable operand facts |
+| `VMDecodedInstruction.raw` | `str` | no | Raw/disassembled display text |
+| `VMDecodedInstruction.artifact_range` | `ByteRange | None` | no | Exact byte location in the opened artifact |
+| `VMOperand.role` | public operand role | yes | `constant`, `local`, `global`, `register`, `target`, `attribute`, `member`, `immediate`, or `raw` |
+| `VMOperand.value` | serializable neutral value | yes | Never a parser model, reader, callback, or Qt object |
+| `VMOperand.text` | `str` | no | Display text |
+| `ByteRange.start` | `int` | yes | Absolute byte offset in the complete original artifact, `>= 0` |
+| `ByteRange.size` | `int` | yes | Exact positive encoded byte count, `> 0` |
+| `ByteRange.end` | `int` | derived | `start + size` |
+
+`ByteRange` constructor validation checks only `start >= 0` and `size > 0`.
+The frontend must also ensure `end <= len(input_data)` before attaching it.
+Core projects the value to the public `BytecodeInstruction.byte_range`; this is
+what GUI Structure/Hex consumes. `ByteRange` never replaces `SourceRef.offset`
+and never supplies a branch target.
 
 ### VMHint
 
@@ -2490,13 +2863,57 @@ Suggested order:
 9. Verify whether the branch target falls on the instruction boundary.
 10. Save raw bytes or disassembled text.
 
-Fixed width instruction:
+Keep VM and artifact coordinates independently in a container-aware parser.
+For a flat bytecode file they happen to be identical. For a code region inside
+a container, `code_vm_base` and `code_artifact_base` are different values:
+
+```python
+# `code_vm_base` is the coordinate documented by the VM for branch targets.
+# `code_artifact_base` is the absolute position of the first code byte in data.
+vm_offset = code_vm_base
+artifact_offset = code_artifact_base
+while artifact_offset < code_artifact_end:
+    start_vm = vm_offset
+    start_artifact = artifact_offset
+    opcode = data[artifact_offset]
+    size, operands = decode_operands(data, artifact_offset, opcode)
+    if size <= 0 or artifact_offset + size > code_artifact_end:
+        raise FrontendDecodeError(f"truncated instruction at artifact byte {artifact_offset:#x}")
+    instructions.append(
+        MyInstruction(
+            offset=start_vm,
+            opcode=opcode_name(opcode),
+            size=size,
+            operands=operands,
+            artifact_offset=start_artifact,
+            artifact_size=size,
+        )
+    )
+    vm_offset += size  # Use the VM's documented instruction-width rule instead if different.
+    artifact_offset += size
+```
+
+For VMs whose PC is an instruction index or word index, increment `vm_offset`
+according to that VM while `artifact_offset` always advances in actual bytes.
+Never calculate one from the other outside a parser rule that proves the
+conversion.
+
+Fixed width flat instruction:
 ```python
 offset = code_start
 while offset < code_end:
     opcode = data[offset]
     operand = int.from_bytes(data[offset + 1:offset + 4], byteorder)
-    instructions.append(MyInstruction(offset=offset, opcode=opcode_name(opcode), size=4, operands=(operand,)))
+    instructions.append(
+        MyInstruction(
+            offset=offset,
+            opcode=opcode_name(opcode),
+            size=4,
+            operands=(operand,),
+            artifact_offset=offset,
+            artifact_size=4,
+        )
+    )
     offset += 4
 ```
 Variable length instruction:
@@ -2507,7 +2924,16 @@ while offset < code_end:
     size, operands = decode_operands(data, offset, opcode)
     if size <= 0 or offset + size > code_end:
         raise FrontendDecodeError(f"truncated instruction at {offset:#x}")
-    instructions.append(MyInstruction(offset=offset, opcode=opcode_name(opcode), size=size, operands=operands))
+    instructions.append(
+        MyInstruction(
+            offset=offset,
+            opcode=opcode_name(opcode),
+            size=size,
+            operands=operands,
+            artifact_offset=offset,
+            artifact_size=size,
+        )
+    )
     offset += size
 ```
 

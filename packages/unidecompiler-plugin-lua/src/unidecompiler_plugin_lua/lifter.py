@@ -32,6 +32,7 @@ from unidecompiler.core.vm_function import (
 from unidecompiler.core.vm_bytecode import VMBytecodeStep
 from unidecompiler.core.vm_hints import VMHint
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
+from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import (
     VMLinearState,
     VMRegionOpcodeClasses,
@@ -1105,6 +1106,7 @@ def _lua_decoded_instruction(instruction, source: SourceRef) -> VMDecodedInstruc
         source=source,
         operands=tuple(VMOperand(role=_lua_operand_role(operand), value=operand, text=operand) for operand in instruction.operands),
         raw=f"{instruction.pc}: {instruction.opcode} {' '.join(instruction.operands)}".strip(),
+        artifact_range=(None if instruction.artifact_offset is None or instruction.size is None else ByteRange(instruction.artifact_offset, instruction.size)),
     )
 
 

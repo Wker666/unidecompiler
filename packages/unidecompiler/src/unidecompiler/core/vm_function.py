@@ -172,6 +172,7 @@ def _generic_instruction(step: VMBytecodeStep) -> dict[str, Any]:
         "opcode": step.opcode,
         "operands": operands,
         "raw": step.raw or ("" if decoded is None else decoded.raw),
+        "artifact_range": None if decoded is None else decoded.artifact_range,
         "source": step.source,
         "control": tuple(
             {"kind": hint.kind, "target": hint.target, "flow": hint.flow}

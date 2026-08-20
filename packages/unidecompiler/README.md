@@ -8,6 +8,11 @@ frontend plugin packages.
 Frontend plugins decode VM-specific formats and submit neutral bytecode facts;
 they do not perform source-structure recovery.
 
+The core may also carry optional `ByteRange` provenance for exact, absolute
+locations in the original input artifact. This is read-only presentation data
+for hosts such as the GUI; it has no execution, control-flow, or recovery
+semantics and is omitted whenever the decoder cannot prove the range.
+
 ## Install
 
 Install the core library directly from PyPI. Cloning this repository is not
