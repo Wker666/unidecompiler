@@ -14,6 +14,7 @@ from unidecompiler.core.ast import (
     CapturedVarRef,
     CollectionProjectionExpr,
     ConstExpr,
+    UndefinedLiteralExpr,
     ExprStmt,
     ForEachStmt,
     ForRangeStmt,
@@ -22,6 +23,7 @@ from unidecompiler.core.ast import (
     GetItemExpr,
     GlobalRef,
     GotoStmt,
+    OnExceptionGotoStmt,
     IndirectCallExpr,
     IfGotoStmt,
     IfStmt,
@@ -264,6 +266,8 @@ def _emit_stmt(
         return [f"  {statement.name}:"], declared
     if isinstance(statement, GotoStmt):
         return [f"    goto {statement.target}"], declared
+    if isinstance(statement, OnExceptionGotoStmt):
+        return [f"    on exception goto {statement.target}"], declared
     if isinstance(statement, IfGotoStmt):
         condition = _emit_expr(_resolve_expr(statement.condition, inline_values))
         return [f"    if ({condition}) goto {statement.true_target} else goto {statement.false_target}"], declared
@@ -542,6 +546,8 @@ def _emit_expr(expr: AstExpr) -> str:
         if expr.value is None:
             return "null"
         return repr(expr.value)
+    if isinstance(expr, UndefinedLiteralExpr):
+        return "undefined"
     if isinstance(expr, BinaryExpr):
         return f"{_emit_binary_operand(expr.left, expr.op, side='left')} {expr.op} {_emit_binary_operand(expr.right, expr.op, side='right')}"
     if isinstance(expr, UnaryExpr):
@@ -591,7 +597,8 @@ def _emit_expr(expr: AstExpr) -> str:
         return "{" + ", ".join(parts) + "}"
     if isinstance(expr, NewObjectExpr):
         args = ", ".join(_emit_expr(arg) for arg in expr.args)
-        return f"new {expr.type_name}({args})"
+        constructor = expr.type_name if expr.constructor is None else _emit_access_base(expr.constructor)
+        return f"new {constructor}({args})"
     return "<expr>"
 
 
@@ -825,6 +832,11 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
             source=expr.source,
             type=expr.type,
             type_name=expr.type_name,
+            constructor=(
+                None
+                if expr.constructor is None
+                else _resolve_expr(expr.constructor, inline_values)
+            ),
             args=tuple(_resolve_expr(arg, inline_values) for arg in expr.args),
         )
     return expr
@@ -884,7 +896,7 @@ def _should_inline_assignment(
 
 
 def _is_safe_inline_expr(expr: AstExpr) -> bool:
-    if isinstance(expr, ConstExpr):
+    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr)):
         return True
     if isinstance(expr, UnaryExpr):
         return _is_safe_inline_expr(expr.value)

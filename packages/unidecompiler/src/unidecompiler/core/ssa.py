@@ -129,6 +129,7 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
                 id=block.id,
                 statements=tuple(phi_statements + list(block.statements)),
                 terminator=block.terminator,
+                exception_target=block.exception_target,
             )
         )
     return FunctionIR(
@@ -138,6 +139,7 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
         nested_functions=function.nested_functions,
         source=function.source,
         recovery_kind=function.recovery_kind,
+        control_provenance=function.control_provenance,
         metadata={**function.metadata, "ssa_phi_blocks": _phi_metadata(placements)},
     )
 
@@ -186,6 +188,7 @@ def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
                     id=block.id,
                     statements=tuple(statements),
                     terminator=terminator,
+                    exception_target=block.exception_target,
                 ),
             ),
             nested_functions=tuple(
@@ -194,6 +197,7 @@ def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
             ),
             source=function.source,
             recovery_kind=function.recovery_kind,
+            control_provenance=function.control_provenance,
             metadata={**function.metadata, "ssa_status": "straight-line"},
         )
     )
@@ -438,6 +442,11 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
             source=expr.source,
             type=expr.type,
             type_name=expr.type_name,
+            constructor=(
+                None
+                if expr.constructor is None
+                else _rewrite_expr(expr.constructor, current)
+            ),
             args=tuple(_rewrite_expr(arg, current) for arg in expr.args),
         )
     if isinstance(expr, Phi):
@@ -567,7 +576,10 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
     if isinstance(expr, ArrayLiteral):
         return tuple(name for item in expr.items for name in _expr_used_names(item))
     if isinstance(expr, NewObject):
-        return tuple(name for arg in expr.args for name in _expr_used_names(arg))
+        return (
+            *(() if expr.constructor is None else _expr_used_names(expr.constructor)),
+            *(name for arg in expr.args for name in _expr_used_names(arg)),
+        )
     if isinstance(expr, Phi):
         return tuple(name for _, value in expr.incoming for name in _expr_used_names(value))
     return ()

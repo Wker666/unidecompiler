@@ -41,6 +41,15 @@ def build_cfg(function: FunctionIR) -> CFG:
     diagnostics: list[str] = []
 
     for index, block in enumerate(function.blocks):
+        if block.exception_target is not None:
+            _add_edge(
+                edges,
+                diagnostics,
+                blocks,
+                block.id,
+                block.exception_target,
+                "exception",
+            )
         terminator = block.terminator
         if isinstance(terminator, Branch):
             _add_edge(edges, diagnostics, blocks, block.id, terminator.true_target, "true")

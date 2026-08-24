@@ -47,6 +47,11 @@ class Const(Expr):
 
 
 @dataclass(frozen=True)
+class UndefinedLiteral(Expr):
+    """A language-level undefined/uninitialized value distinct from null."""
+
+
+@dataclass(frozen=True)
 class UnaryOp(Expr):
     op: str = ""
     value: Expr = field(default_factory=Expr)
@@ -147,6 +152,7 @@ class MapLiteral(Expr):
 @dataclass(frozen=True)
 class NewObject(Expr):
     type_name: str = "unknown"
+    constructor: Expr | None = None
     args: tuple[Expr, ...] = ()
 
 
@@ -335,6 +341,7 @@ class BasicBlock:
     id: BlockId
     statements: tuple[Stmt, ...] = ()
     terminator: Terminator | None = None
+    exception_target: BlockId | None = None
 
 
 @dataclass(frozen=True)
@@ -345,6 +352,7 @@ class FunctionIR:
     nested_functions: tuple["FunctionIR", ...] = ()
     source: SourceRef | None = None
     recovery_kind: str | None = None
+    control_provenance: tuple[SourceRef, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

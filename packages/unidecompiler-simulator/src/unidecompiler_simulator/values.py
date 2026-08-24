@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+@dataclass(frozen=True)
+class UndefinedValue:
+    """Runtime value for an undefined/uninitialized literal."""
+
+
+UNDEFINED = UndefinedValue()
+
+
 @dataclass
 class ObjectValue:
     """A host-independent object used by the default in-memory runtime."""
@@ -30,7 +38,7 @@ class SliceValue:
 def validate_runtime_value(value: Any, *, _seen: set[int] | None = None) -> None:
     """Reject host objects and executable values at the simulator boundary."""
 
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+    if value is None or isinstance(value, (UndefinedValue, bool, int, float, str, bytes)):
         return
     if isinstance(value, SliceValue):
         for item in (value.start, value.stop, value.step):
@@ -85,6 +93,8 @@ def snapshot_value(value: Any, *, _seen: set[int] | None = None) -> Any:
         _seen.add(identity)
     else:
         identity = None
+    if isinstance(value, UndefinedValue):
+        return value
     if isinstance(value, ObjectValue):
         result = ObjectValue(value.type_name, {key: snapshot_value(item, _seen=_seen) for key, item in value.fields.items()})
         _seen.remove(identity)

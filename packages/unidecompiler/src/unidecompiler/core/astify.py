@@ -10,6 +10,7 @@ from unidecompiler.core.ast import (
     CapturedVarRef,
     CollectionProjectionExpr,
     ConstExpr,
+    UndefinedLiteralExpr,
     ExprStmt,
     ForRangeStmt,
     FunctionDecl,
@@ -17,6 +18,7 @@ from unidecompiler.core.ast import (
     GetItemExpr,
     GlobalRef,
     GotoStmt,
+    OnExceptionGotoStmt,
     IndirectCallExpr,
     BreakStmt,
     IfGotoStmt,
@@ -60,6 +62,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     CollectionProjection,
     Const,
+    UndefinedLiteral,
     Continue,
     Expr,
     ForEach,
@@ -225,6 +228,8 @@ def _low_level_block_to_ast(block) -> tuple[object, ...]:
     statements: list[object] = [LabelStmt(name=block.id)]
     for statement in block.statements:
         statements.append(_statement_to_ast(statement))
+    if block.exception_target is not None:
+        statements.append(OnExceptionGotoStmt(target=block.exception_target))
     if block.terminator is not None:
         statements.append(_terminator_to_ast(block.terminator))
     return tuple(statements)
@@ -385,6 +390,8 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return VarRef(source=expr.source, type=expr.type, name=_logical_name(expr.name))
     if isinstance(expr, Const):
         return ConstExpr(source=expr.source, type=expr.type, value=expr.value)
+    if isinstance(expr, UndefinedLiteral):
+        return UndefinedLiteralExpr(source=expr.source, type=expr.type)
     if isinstance(expr, UnaryOp):
         return UnaryExpr(
             source=expr.source,
@@ -511,6 +518,7 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
             source=expr.source,
             type=expr.type,
             type_name=expr.type_name,
+            constructor=None if expr.constructor is None else _expr_to_ast(expr.constructor),
             args=tuple(_expr_to_ast(arg) for arg in expr.args),
         )
     return UnsupportedStmt(message=f"unsupported expr: {type(expr).__name__}")

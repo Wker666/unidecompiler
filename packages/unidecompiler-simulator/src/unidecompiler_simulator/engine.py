@@ -20,6 +20,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     CollectionProjection,
     Const,
+    UndefinedLiteral,
     Continue,
     Expr,
     ExprStmt,
@@ -70,6 +71,7 @@ from unidecompiler_simulator.adapters import (
     adapter_for,
     call_adapter,
 )
+from unidecompiler_simulator.values import UNDEFINED
 from unidecompiler_simulator.environment import (
     ExternalCallRequest,
     ExternalCallStatus,
@@ -670,6 +672,8 @@ class _Runner:
         if isinstance(expr, Const):
             validate_runtime_value(expr.value)
             return expr.value
+        if isinstance(expr, UndefinedLiteral):
+            return UNDEFINED
         if isinstance(expr, Global):
             result = self._adapter_value("resolve_global", expr.name, frame.context)
             if result is NotHandled:

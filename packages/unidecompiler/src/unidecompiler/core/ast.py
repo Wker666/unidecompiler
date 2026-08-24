@@ -23,6 +23,11 @@ class ConstExpr(AstExpr):
 
 
 @dataclass(frozen=True)
+class UndefinedLiteralExpr(AstExpr):
+    pass
+
+
+@dataclass(frozen=True)
 class UnaryExpr(AstExpr):
     op: str = ""
     value: AstExpr = field(default_factory=AstExpr)
@@ -112,6 +117,7 @@ class MapLiteralExpr(AstExpr):
 @dataclass(frozen=True)
 class NewObjectExpr(AstExpr):
     type_name: str = "unknown"
+    constructor: AstExpr | None = None
     args: tuple[AstExpr, ...] = ()
 
 
@@ -211,6 +217,11 @@ class LabelStmt(AstStmt):
 
 @dataclass(frozen=True)
 class GotoStmt(AstStmt):
+    target: str = ""
+
+
+@dataclass(frozen=True)
+class OnExceptionGotoStmt(AstStmt):
     target: str = ""
 
 

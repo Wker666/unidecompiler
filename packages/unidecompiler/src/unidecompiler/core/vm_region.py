@@ -198,6 +198,8 @@ class VMControlPrefixResult:
 class VMControlCFGResult:
     blocks: tuple[tuple[str, tuple[Stmt, ...], Terminator | None], ...]
     diagnostics: tuple[str, ...] = ()
+    exception_targets: tuple[tuple[str, str], ...] = ()
+    control_provenance: tuple[SourceRef, ...] = ()
 
 
 def lift_stateful_control_prefix(
@@ -232,23 +234,38 @@ def lift_stateful_low_level_cfg(
     if not leaders:
         return None
     sorted_leaders = sorted(leaders)
-    leader_names = {index: f"block_{profile.offset(instructions[index])}" for index in sorted_leaders}
     leader_positions = {leader: position for position, leader in enumerate(sorted_leaders)}
     diagnostics: list[str] = []
-    incoming: dict[int, VMLinearState] = {sorted_leaders[0]: VMLinearState(locals=callbacks.initial_locals(), stack=())}
+    StateKey = tuple[int, tuple[int, ...]]
+
+    def block_name(key: StateKey) -> str:
+        index, handlers = key
+        base = f"block_{profile.offset(instructions[index])}"
+        if not handlers:
+            return base
+        suffix = "_".join(str(profile.offset(instructions[item])) for item in handlers)
+        return f"{base}__handlers_{suffix}"
+
+    entry_key: StateKey = (sorted_leaders[0], ())
+    incoming: dict[StateKey, VMLinearState] = {
+        entry_key: VMLinearState(locals=callbacks.initial_locals(), stack=())
+    }
     # Keep the concrete CFG predecessors alongside each merged VM state.
     # ``Phi`` nodes are edge-labelled values; using the old anonymous
     # ``existing`` label for the first path loses information that later core
     # structurers need to materialize a merge safely.
-    incoming_predecessors: dict[int, tuple[str, ...]] = {sorted_leaders[0]: ()}
-    lifted_blocks: dict[int, VMLinearState] = {}
-    terminators: dict[int, Terminator | None] = {}
-    worklist = [sorted_leaders[0]]
+    incoming_predecessors: dict[StateKey, tuple[str, ...]] = {entry_key: ()}
+    lifted_blocks: dict[StateKey, VMLinearState] = {}
+    terminators: dict[StateKey, Terminator | None] = {}
+    exception_targets: dict[StateKey, StateKey] = {}
+    consumed_control_sources: set[SourceRef] = set()
+    worklist = [entry_key]
 
     while worklist:
-        start = worklist.pop(0)
+        key = worklist.pop(0)
+        start, handler_stack = key
         position = leader_positions[start]
-        in_state = incoming[start]
+        in_state = incoming[key]
         end = sorted_leaders[position + 1] if position + 1 < len(sorted_leaders) else len(instructions)
         control_index = end - 1 if end > start and profile.is_control(instructions[end - 1]) else None
         linear_end = control_index if control_index is not None else end
@@ -273,12 +290,26 @@ def lift_stateful_low_level_cfg(
                 terminator=lifted.terminator,
                 stopped_at=lifted.stopped_at,
             )
-        lifted_blocks[start] = lifted
+        lifted_blocks[key] = lifted
+        active_handler = handler_stack[-1] if handler_stack else None
+        outgoing_handlers = _apply_exception_handler_hints(
+            instructions,
+            start,
+            linear_end,
+            handler_stack,
+            profile,
+            diagnostics,
+            consumed_control_sources,
+        )
         terminator: Terminator | None = lifted.terminator
         if terminator is None and control_index is not None:
             lifted = _apply_control_instruction_effects(lifted, instructions[control_index])
-            lifted_blocks[start] = lifted
+            lifted_blocks[key] = lifted
             terminator = lifted.terminator
+        contextual_names = {
+            index: block_name((index, outgoing_handlers))
+            for index in sorted_leaders
+        }
         if terminator is None and control_index is not None:
             terminator = _low_level_terminator(
                 instructions,
@@ -286,22 +317,22 @@ def lift_stateful_low_level_cfg(
                 lifted,
                 profile,
                 callbacks,
-                leader_names,
+                contextual_names,
             )
+        if control_index is not None and terminator is not None:
+            consumed_control_sources.add(instructions[control_index].source)
         block_raises = _statements_end_with_raise(lifted.statements)
         if terminator is None and not block_raises and position + 1 < len(sorted_leaders):
             terminator = Jump(
                 source=SourceRef(frontend=profile.frontend, offset=profile.offset(instructions[end - 1])),
-                target=leader_names[sorted_leaders[position + 1]],
+                target=contextual_names[sorted_leaders[position + 1]],
             )
         if terminator is None and not block_raises and position + 1 >= len(sorted_leaders) and lifted.stack:
             terminator = Return(
                 source=SourceRef(frontend=profile.frontend, offset=profile.offset(instructions[end - 1])),
                 values=lifted.stack,
             )
-        terminators[start] = terminator
-        if block_raises:
-            continue
+        terminators[key] = terminator
         outgoing = lifted
         if control_index is not None and (
             profile.is_conditional_jump(instructions[control_index])
@@ -316,47 +347,89 @@ def lift_stateful_low_level_cfg(
                     terminator=lifted.terminator,
                     stopped_at=lifted.stopped_at,
                 )
-        successors = _low_level_successors(terminator, leader_names, sorted_leaders, position)
+        successors = () if block_raises else _low_level_successors(
+            terminator, contextual_names, sorted_leaders, position
+        )
         if successors:
             outgoing = _materialize_cross_block_stack(outgoing, profile, instructions[start])
-            lifted_blocks[start] = outgoing
+            lifted_blocks[key] = outgoing
         for successor in successors:
+            successor_key: StateKey = (successor, outgoing_handlers)
             successor_outgoing = _low_level_successor_state(
                 outgoing,
                 terminator,
                 successor,
-                leader_names,
+                contextual_names,
                 profile,
                 instructions[control_index] if control_index is not None else None,
                 instructions[successor],
             )
-            current = incoming.get(successor)
-            predecessor = leader_names[start]
+            current = incoming.get(successor_key)
+            predecessor = block_name(key)
             merged = _merge_low_level_incoming(
                 current,
                 successor_outgoing,
                 predecessor,
                 profile,
                 instructions[successor],
-                current_predecessors=incoming_predecessors.get(successor, ()),
+                current_predecessors=incoming_predecessors.get(successor_key, ()),
             )
             if merged is None:
                 continue
-            previous_predecessors = incoming_predecessors.get(successor, ())
+            previous_predecessors = incoming_predecessors.get(successor_key, ())
             if predecessor not in previous_predecessors:
-                incoming_predecessors[successor] = (*previous_predecessors, predecessor)
+                incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
             if merged != current:
-                incoming[successor] = merged
-                if successor not in worklist:
-                    worklist.append(successor)
+                incoming[successor_key] = merged
+                if successor_key not in worklist:
+                    worklist.append(successor_key)
+
+        if active_handler is not None and active_handler in leader_positions:
+            successor = active_handler
+            successor_key = (successor, handler_stack[:-1])
+            exception_targets[key] = successor_key
+            current = incoming.get(successor_key)
+            predecessor = block_name(key)
+            merged = _merge_low_level_incoming(
+                current,
+                outgoing,
+                predecessor,
+                profile,
+                instructions[successor],
+                current_predecessors=incoming_predecessors.get(successor_key, ()),
+            )
+            if merged is not None:
+                previous_predecessors = incoming_predecessors.get(successor_key, ())
+                if predecessor not in previous_predecessors:
+                    incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
+                if merged != current:
+                    incoming[successor_key] = merged
+                    if successor_key not in worklist:
+                        worklist.append(successor_key)
 
     blocks: list[tuple[str, tuple[Stmt, ...], Terminator | None]] = []
-    for start in sorted_leaders:
-        lifted = lifted_blocks.get(start)
-        if lifted is None:
-            continue
-        blocks.append((leader_names[start], tuple(lifted.statements), terminators.get(start)))
-    return VMControlCFGResult(blocks=tuple(blocks), diagnostics=tuple(diagnostics))
+    ordered_keys = sorted(
+        lifted_blocks,
+        key=lambda item: (item[0], tuple(profile.offset(instructions[index]) for index in item[1])),
+    )
+    for key in ordered_keys:
+        lifted = lifted_blocks[key]
+        blocks.append((block_name(key), tuple(lifted.statements), terminators.get(key)))
+    return VMControlCFGResult(
+        blocks=tuple(blocks),
+        diagnostics=tuple(diagnostics),
+        exception_targets=tuple(
+            (block_name(source), block_name(target))
+            for source, target in exception_targets.items()
+            if source in lifted_blocks and target in lifted_blocks
+        ),
+        control_provenance=tuple(
+            sorted(
+                consumed_control_sources,
+                key=lambda source: (-1 if source.offset is None else source.offset),
+            )
+        ),
+    )
 
 
 def _lift_stateful_control_range(
@@ -450,6 +523,19 @@ def _cfg_leaders(
     leaders = {0}
     for index, instruction in enumerate(instructions):
         for hint in tuple(getattr(instruction, "hints", ()) or ()):
+            if hint.kind == "exception-handler" and hint.target is not None:
+                target_index = _instruction_index_by_offset(
+                    instructions, hint.target, profile
+                )
+                if target_index is not None:
+                    leaders.add(target_index)
+                if index + 1 < len(instructions):
+                    leaders.add(index + 1)
+                continue
+            if hint.kind == "exception-handler-pop":
+                if index + 1 < len(instructions):
+                    leaders.add(index + 1)
+                continue
             if hint.kind != "exception-region" or not isinstance(hint.value, dict):
                 continue
             for offset in (hint.value.get("start"), hint.value.get("end"), hint.value.get("target")):
@@ -471,6 +557,40 @@ def _cfg_leaders(
         if index + 1 < len(instructions):
             leaders.add(index + 1)
     return leaders
+
+
+def _apply_exception_handler_hints(
+    instructions: tuple[InstructionT, ...],
+    start: int,
+    end: int,
+    handlers: tuple[int, ...],
+    profile: VMRegionProfile[InstructionT],
+    diagnostics: list[str],
+    consumed_sources: set[SourceRef],
+) -> tuple[int, ...]:
+    """Apply neutral handler-stack facts along one split low-level block."""
+
+    stack = list(handlers)
+    for index in range(start, end):
+        instruction = instructions[index]
+        for hint in tuple(getattr(instruction, "hints", ()) or ()):
+            if hint.kind == "exception-handler" and hint.target is not None:
+                consumed_sources.add(hint.source)
+                target_index = _instruction_index_by_offset(
+                    instructions, hint.target, profile
+                )
+                if target_index is None:
+                    diagnostics.append(
+                        f"exception handler at {profile.offset(instruction)} "
+                        f"points to missing offset {hint.target}"
+                    )
+                    continue
+                stack.append(target_index)
+            elif hint.kind == "exception-handler-pop":
+                consumed_sources.add(hint.source)
+                if stack:
+                    stack.pop()
+    return tuple(stack)
 
 
 def _first_terminal_effect_index(
@@ -534,6 +654,27 @@ def _low_level_terminator(
     source = SourceRef(frontend=profile.frontend, offset=profile.offset(instruction))
     fallthrough_name = leader_names.get(index + 1) if index + 1 < len(instructions) else None
     multi_targets = tuple(dict.fromkeys(_profile_target_offsets(instruction, profile)))
+    if len(multi_targets) > 1 and profile.is_conditional_jump(instruction):
+        width = callbacks.branch_stack_width(instruction)
+        if len(state.stack) < width:
+            return None
+        condition = callbacks.branch_condition(instruction, state.stack[-width:])
+        if condition is None:
+            return None
+        true_offset = _hint_target_with_detail(instruction, "target-if-true")
+        false_offset = _hint_target_with_detail(instruction, "target-if-false")
+        if true_offset is None or false_offset is None:
+            return None
+        true_index = _instruction_index_by_offset(instructions, true_offset, profile)
+        false_index = _instruction_index_by_offset(instructions, false_offset, profile)
+        true_name = leader_names.get(true_index) if true_index is not None else None
+        false_name = leader_names.get(false_index) if false_index is not None else None
+        return Branch(
+            source=source,
+            condition=condition,
+            true_target=true_name or f"missing_{true_offset}",
+            false_target=false_name or f"missing_{false_offset}",
+        )
     if len(multi_targets) > 1 and not profile.is_conditional_jump(instruction):
         width = callbacks.branch_stack_width(instruction)
         if len(state.stack) < width:
@@ -1408,6 +1549,17 @@ def _hint_target_polarity(step) -> str:
         if hint.kind in {"branch-target", "loop-backedge"} and hint.detail == "target-if-false":
             return "target-if-false"
     return "true"
+
+
+def _hint_target_with_detail(step, detail: str) -> int | None:
+    for hint in getattr(step, "hints", ()):
+        if (
+            hint.kind in {"branch-target", "loop-backedge"}
+            and hint.detail == detail
+            and hint.target is not None
+        ):
+            return hint.target
+    return None
 
 
 def _hint_default_target(step) -> int | None:

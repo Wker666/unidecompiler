@@ -15,6 +15,7 @@ VMHintKind = Literal[
     "loop-backedge",
     "exception-region",
     "exception-handler",
+    "exception-handler-pop",
     "branch-value",
     "materialized-condition",
     "call-shape",

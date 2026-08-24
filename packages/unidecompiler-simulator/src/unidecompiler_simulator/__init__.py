@@ -25,7 +25,7 @@ from unidecompiler_simulator.environment import (
     ExternalEnvironment,
     ExternalFunction,
 )
-from unidecompiler_simulator.values import ObjectValue, SliceValue, TableValue
+from unidecompiler_simulator.values import ObjectValue, SliceValue, TableValue, UNDEFINED, UndefinedValue
 
 __all__ = [
     "NotHandled",
@@ -34,6 +34,8 @@ __all__ = [
     "ObjectValue",
     "SliceValue",
     "TableValue",
+    "UNDEFINED",
+    "UndefinedValue",
     "ResolvedFunction",
     "SimulationAdapter",
     "SimulationTarget",

@@ -153,12 +153,38 @@ def lift_linear_vm_function(
 def lift_vm_step_function(
     spec: VMFunctionSpec,
     steps: tuple[VMBytecodeStep, ...],
+    *,
+    control_provenance: tuple[SourceRef, ...] = (),
     **kwargs: Any,
 ) -> FunctionIR:
     """Lift VM steps and retain a frontend-neutral instruction projection."""
     function = _lift_vm_step_function(spec, steps, **kwargs)
     instructions = tuple(_generic_instruction(step) for step in steps)
-    return replace(function, metadata={**function.metadata, "bytecode_instructions": instructions})
+    control_sources = tuple(
+        step.source
+        for step in steps
+        if any(
+            hint.kind
+            in {
+                "branch-target",
+                "loop-backedge",
+                "case-target",
+                "default-target",
+                "exception-handler",
+                "exception-handler-pop",
+            }
+            for hint in step.hints
+        )
+    )
+    return replace(
+        function,
+        control_provenance=tuple(
+            dict.fromkeys(
+                (*function.control_provenance, *control_sources, *control_provenance)
+            )
+        ),
+        metadata={**function.metadata, "bytecode_instructions": instructions},
+    )
 
 
 def _generic_instruction(step: VMBytecodeStep) -> dict[str, Any]:
@@ -198,6 +224,16 @@ def _lift_vm_step_function(
 
     if not steps:
         return entry_vm_function(spec, terminator=vm_return(source=SourceRef(frontend=spec.frontend)), structured_lift="empty")
+    if (
+        profile is not None
+        and stateful_callbacks is not None
+        and _has_exception_handler_facts(steps)
+    ):
+        low_level = _lift_low_level_cfg_candidate(
+            spec, steps, profile, stateful_callbacks
+        )
+        if low_level is not None:
+            return low_level
     if profile is not None and stateful_callbacks is not None and _has_exception_region_facts(steps):
         protected = _lift_exception_region_candidate(spec, steps, profile, stateful_callbacks, callbacks)
         if protected is not None:
@@ -346,6 +382,12 @@ def finalize_recovered_vm_function(spec: VMFunctionSpec, function: FunctionIR) -
         return function
     structural_reason = _unsafe_structural_recovery_reason(function)
     if function.recovery_kind == "generic-vm-low-level-cfg":
+        # Exceptional CFG edges are first-class control flow.  Ordinary
+        # branch/loop structurers do not yet own them and must not erase them
+        # while simplifying the normal graph.  A dedicated exception-region
+        # structurer runs on this preserved floor in a later pass.
+        if any(block.exception_target is not None for block in function.blocks):
+            return function
         if structural_reason is None:
             if _function_has_try_regions(function):
                 return apply_low_level_cfg_structuring(
@@ -835,6 +877,8 @@ def _collect_unbound_from_expr(
         _collect_unbound_from_expr(expr.key, local_names, bound, unbound)
         return
     if isinstance(expr, NewObject):
+        if expr.constructor is not None:
+            _collect_unbound_from_expr(expr.constructor, local_names, bound, unbound)
         for arg in expr.args:
             _collect_unbound_from_expr(arg, local_names, bound, unbound)
         return
@@ -862,7 +906,7 @@ def block_vm_function(
     unsupported_raw: tuple[str, ...] = (),
     structured_lift: str | None = None,
 ) -> FunctionIR:
-    return assemble_function(
+    function = assemble_function(
         name=spec.name,
         params=spec.params,
         frontend=spec.frontend,
@@ -1040,17 +1084,24 @@ def _lift_low_level_cfg_candidate(
 
 
 def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
-    return assemble_function(
+    status = "ok" if not result.diagnostics else "partial"
+    exception_targets = dict(result.exception_targets)
+    function = assemble_function(
         name=spec.name,
         params=spec.params,
         frontend=spec.frontend,
         blocks=tuple(
-            FunctionBlockSpec(id=block_id, statements=statements, terminator=terminator)
+            FunctionBlockSpec(
+                id=block_id,
+                statements=statements,
+                terminator=terminator,
+                exception_target=exception_targets.get(block_id),
+            )
             for block_id, statements, terminator in result.blocks
         ),
         metadata={
             **(spec.metadata or {}),
-            "decompile_status": "partial",
+            "decompile_status": status,
             "structured_lift": "generic-vm-low-level-cfg",
             "local_names": spec.local_names,
             "instruction_count": spec.instruction_count,
@@ -1061,11 +1112,20 @@ def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
         },
         recovery_kind="generic-vm-low-level-cfg",
     )
+    return replace(function, control_provenance=result.control_provenance)
 
 
 def _has_exception_region_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
     return any(
         hint.kind == "exception-region" and isinstance(hint.value, dict)
+        for step in steps
+        for hint in step.hints
+    )
+
+
+def _has_exception_handler_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
+    return any(
+        hint.kind in {"exception-handler", "exception-handler-pop"}
         for step in steps
         for hint in step.hints
     )
@@ -1586,6 +1646,11 @@ def _expr_has_collection_projection(expr: Expr) -> bool:
         return _expr_has_collection_projection(expr.obj)
     if isinstance(expr, GetItem):
         return _expr_has_collection_projection(expr.obj) or _expr_has_collection_projection(expr.key)
+    if isinstance(expr, NewObject):
+        return (
+            expr.constructor is not None
+            and _expr_has_collection_projection(expr.constructor)
+        ) or any(_expr_has_collection_projection(arg) for arg in expr.args)
     if isinstance(expr, Phi):
         return any(_expr_has_collection_projection(value) for _pred, value in expr.incoming)
     if isinstance(expr, (ArrayLiteral, TableLiteral, SetLiteral, ObjectLiteral, MapLiteral)):

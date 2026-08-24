@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from collections.abc import Callable
 from types import SimpleNamespace
 
@@ -90,6 +90,12 @@ def apply_low_level_cfg_structuring(
         structured = structure_low_level_cfg(current)
         if structured is None or not is_safe(structured):
             return current
+        structured = replace(
+            structured,
+            control_provenance=tuple(dict.fromkeys(
+                (*current.control_provenance, *structured.control_provenance)
+            )),
+        )
         # Exact structurers must make tangible CFG progress (an edge or a
         # block disappears).  This prevents a registry error from creating an
         # unbounded rewrite cycle while still allowing an inner-region
