@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from unidecompiler.core.ir import BasicBlock, FunctionIR, ModuleIR, SourceRef, Stmt, Terminator
+from unidecompiler.core.ir import BasicBlock, ExceptionalEdge, FunctionIR, ModuleIR, SourceRef, Stmt, Terminator
 
 
 @dataclass(frozen=True)
@@ -11,7 +11,8 @@ class FunctionBlockSpec:
     id: str
     statements: tuple[Stmt, ...] = ()
     terminator: Terminator | None = None
-    exception_target: str | None = None
+    exception_edge: ExceptionalEdge | None = None
+    active_exception_handlers: tuple[str, ...] = ()
 
 
 def assemble_entry_function(
@@ -51,7 +52,8 @@ def assemble_function(
                 id=block.id,
                 statements=block.statements,
                 terminator=block.terminator,
-                exception_target=block.exception_target,
+                exception_edge=block.exception_edge,
+                active_exception_handlers=block.active_exception_handlers,
             )
             for block in blocks
         ),

@@ -129,7 +129,8 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
                 id=block.id,
                 statements=tuple(phi_statements + list(block.statements)),
                 terminator=block.terminator,
-                exception_target=block.exception_target,
+                exception_edge=block.exception_edge,
+                active_exception_handlers=block.active_exception_handlers,
             )
         )
     return FunctionIR(
@@ -140,6 +141,7 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
         source=function.source,
         recovery_kind=function.recovery_kind,
         control_provenance=function.control_provenance,
+        bytecode_control_flow=function.bytecode_control_flow,
         metadata={**function.metadata, "ssa_phi_blocks": _phi_metadata(placements)},
     )
 
@@ -188,7 +190,8 @@ def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
                     id=block.id,
                     statements=tuple(statements),
                     terminator=terminator,
-                    exception_target=block.exception_target,
+                    exception_edge=block.exception_edge,
+                    active_exception_handlers=block.active_exception_handlers,
                 ),
             ),
             nested_functions=tuple(
@@ -198,6 +201,7 @@ def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
             source=function.source,
             recovery_kind=function.recovery_kind,
             control_provenance=function.control_provenance,
+            bytecode_control_flow=function.bytecode_control_flow,
             metadata={**function.metadata, "ssa_status": "straight-line"},
         )
     )

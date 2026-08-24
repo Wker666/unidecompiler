@@ -153,7 +153,10 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
         function_id = f"{module.name}:{ordinal}:{function.name}"
         rows = tuple(function.metadata.get("bytecode_instructions", ()))
         source = function.source or (rows[0].get("source") if rows else None)
-        raw = tuple(function.metadata.get("unsupported_raw", ()))
+        raw = (
+            *tuple(function.metadata.get("unsupported_raw", ())),
+            *tuple(function.metadata.get("unsupported_context", ())),
+        )
         status = function.metadata.get("decompile_status", "unknown")
         functions.append(FunctionResult(function_id, function.name, status, function.metadata.get("unsupported_reason"), raw, source))
         if status in {"partial", "unsupported"}:
@@ -170,22 +173,15 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
                 ))
                 byte_range = None
             instructions.append(BytecodeInstruction(function_id, row["offset"], row["opcode"], tuple(value["text"] for value in row["operands"]), row["raw"], row["source"], byte_range))
-            offset = row.get("offset")
-            source_ref = row.get("source")
-            control = tuple(row.get("control", ()))
-            targets = tuple(
-                item["target"] for item in control
-                if isinstance(item, dict) and isinstance(item.get("target"), int)
-            )
-            flows = {item.get("flow") for item in control if isinstance(item, dict)}
-            flow = next(iter(flows)) if len(flows) == 1 else None
-            if isinstance(offset, int) and isinstance(source_ref, SourceRef):
-                function_control.append(BytecodeControlFlowInstruction(
-                    offset=offset,
-                    source=source_ref,
-                    flow=flow if flow in {"conditional", "unconditional", "multiway"} else None,
-                    targets=targets,
-                ))
+        for control in function.bytecode_control_flow:
+            if control.source.offset is None:
+                continue
+            function_control.append(BytecodeControlFlowInstruction(
+                offset=control.source.offset,
+                source=control.source,
+                flow=control.flow,
+                targets=control.targets,
+            ))
         control_instructions.append((function_id, tuple(function_control)))
     index = build_symbol_index(
         ast,

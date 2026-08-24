@@ -715,6 +715,9 @@ VMHint(kind="loop-backedge", source=source, target=header_offset, flow="conditio
 VMHint(kind="case-target", source=source, target=case_offset, value=case_value)
 VMHint(kind="default-target", source=source, target=default_offset)
 VMHint(kind="exception-region", source=source, value={"start": start, "end": end, "target": handler})
+VMHint(kind="exception-handler", source=source, target=handler)
+VMHint(kind="exception-handler-pop", source=source)
+VMHint(kind="exception-edge-state", source=source, value={"stack_depth": 0, "push_exception": False})
 ```
 Legal kind:
 ```text
@@ -726,6 +729,8 @@ fallthrough
 loop-backedge
 exception-region
 exception-handler
+exception-handler-pop
+exception-edge-state
 branch-value
 materialized-condition
 call-shape
@@ -761,6 +766,42 @@ If `branch_condition()` returns an expression that is true on fallthrough, you c
 detail="target-if-false"
 ```
 If the polarity is wrong, the `if` branch in the pseudocode will be reversed, and the failure path and success path may be read reversely.
+
+### Handler stacks and precise exceptional state
+
+Use `exception-handler` when an instruction pushes a dynamically scoped
+handler and `exception-handler-pop` when an instruction removes the innermost
+handler. The core owns the exceptional CFG edge and nested handler recovery:
+
+```python
+VMHint(kind="exception-handler", source=source, target=handler_offset)
+VMHint(kind="exception-handler-pop", source=source)
+```
+
+If an instruction inside that protected scope can throw implicitly, for
+example through a generic `Call`, the frontend must also state the exact
+operand-stack shape at the exceptional edge. Do not make the frontend build a
+handler block or catch AST:
+
+```python
+VMHint(
+    kind="exception-edge-state",
+    source=source,
+    value={
+        "stack_depth": 0,
+        "push_exception": False,
+    },
+)
+```
+
+`stack_depth` is the number of values preserved from the bottom of the
+incoming operand stack. `push_exception=True` appends the active exception as
+a neutral `current_exception` value for VMs whose handler entry receives it on
+the operand stack. The fact is attached to the potentially throwing
+instruction. It describes VM state only; core still decides reachability,
+merges handler inputs, emits generic IR, and validates nesting. Omitting this
+fact when the state cannot otherwise be proven produces explicit unsupported
+output instead of a guessed handler state.
 
 ### materialized-condition
 
@@ -1346,7 +1387,9 @@ Do not call `assemble_module()`, `assemble_function()` or construct `FunctionIR`
 
 ## 20. GUI display and bytecode_instructions
 
-`lift_vm_step_function()` will project the step into the `bytecode_instructions` of the function metadata, and the GUI uses these lines to display the disassembly and control edges.
+`lift_vm_step_function()` projects each step into the function metadata's
+`bytecode_instructions`. The GUI uses this presentation-only projection to
+display disassembly rows. It does not contain control-flow or recovery facts.
 
 Each display line should:
 
@@ -1355,15 +1398,23 @@ Each display line should:
 - `operands`
 - `raw`
 - `source`
-- `control`
-- `byte_range` when, and only when, the frontend supplied an exact
+- `artifact_range` when, and only when, the frontend supplied an exact
   `VMDecodedInstruction.artifact_range`
 
-`bytecode_instructions` is a public projection. Its `byte_range` field is a
+`bytecode_instructions` is a public projection. Its `artifact_range` field is a
 `ByteRange | None`; it is not the frontend-private `MyInstruction` object and
 does not expose parser state. A GUI may select a disassembly row, AST node, or
 structure node and navigate to zero, one, or several projected ranges. A
 missing range is normal: show the logical VM offset and do not highlight bytes.
+
+Control-flow presentation follows a separate typed path. The frontend submits
+only neutral `VMHint` values such as `branch-target`, `loop-backedge`,
+`case-target`, and `default-target`. Core validates and projects those facts
+into `FunctionIR.bytecode_control_flow`, a tuple of typed `BytecodeControlFlow`
+values containing only `source`, `flow`, and `targets`. The engine builds the
+read-only GUI control-flow index from that first-class model. Frontends must not
+construct `BytecodeControlFlow` themselves or copy hints, targets, exception
+state, or recovery decisions into metadata.
 
 If the GUI control flow view crashes, first check:
 
@@ -1372,7 +1423,11 @@ If the GUI control flow view crashes, first check:
 - Whether there is a self-loop display edge between source/target and basic block.
 - Whether multiple conflicting targets are submitted for the same conditional jump.
 
-If the core's internal CFG is correct, but there is a self-loop of the same block in the GUI display metadata, you can filter and display only the control hint in the metadata. Don't change the core CFG, and don't lose hints required for real recovery.
+If the core's internal CFG is correct but the GUI projection is not, inspect the
+neutral hints and the resulting `FunctionIR.bytecode_control_flow`. Fix the
+VM-neutral core projection or presentation index as appropriate. Do not add a
+metadata control channel, change the recovered CFG, or drop hints required for
+real recovery.
 
 ## 20.0 Exact artifact byte provenance and Structure / Hex
 
@@ -2709,6 +2764,9 @@ Common field combinations:
 | `fallthrough` | `target` | `label` | explicit fallthrough fact |
 | `materialized-condition` | None | `detail`, `flow` | Condition has been materialized on stack/register |
 | `exception-region` | `value` | `label` | try/protected range |
+| `exception-handler` | `target` | `label` | push a dynamically scoped handler |
+| `exception-handler-pop` | None | `label` | pop the innermost handler scope |
+| `exception-edge-state` | `value` | `label` | exact stack shape at an implicit exceptional edge |
 | `call-shape` | `value` | `label` | Call parameters/return shape |
 | `aggregate-shape` | `value` | `label` | array/map/object shape |
 

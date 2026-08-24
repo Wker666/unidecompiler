@@ -14,6 +14,7 @@ from unidecompiler.core.ast import (
     CapturedVarRef,
     CollectionProjectionExpr,
     ConstExpr,
+    CurrentExceptionRef,
     UndefinedLiteralExpr,
     ExprStmt,
     ForEachStmt,
@@ -149,6 +150,8 @@ def _emit_function_body(
             lines.append(f"    // unsupported opcodes: {opcodes}")
         for raw in function.metadata.get("unsupported_raw", ()):
             lines.append(f"    // raw: {raw}")
+        for context in function.metadata.get("unsupported_context", ()):
+            lines.append(f"    // context: {context}")
         lines.append("}")
         return lines
     if not function.body:
@@ -529,6 +532,8 @@ def _source_spans(lines: list[str]) -> tuple[dict, ...]:
 
 
 def _emit_expr(expr: AstExpr) -> str:
+    if isinstance(expr, CurrentExceptionRef):
+        return "current_exception"
     if isinstance(expr, GlobalRef):
         return expr.name
     if isinstance(expr, CapturedVarRef):
@@ -896,7 +901,7 @@ def _should_inline_assignment(
 
 
 def _is_safe_inline_expr(expr: AstExpr) -> bool:
-    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr)):
+    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr, CurrentExceptionRef)):
         return True
     if isinstance(expr, UnaryExpr):
         return _is_safe_inline_expr(expr.value)

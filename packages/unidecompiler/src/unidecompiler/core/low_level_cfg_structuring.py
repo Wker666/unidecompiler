@@ -83,6 +83,8 @@ def apply_low_level_cfg_structuring(
 ) -> FunctionIR:
     if function.recovery_kind != "generic-vm-low-level-cfg":
         return function
+    if _has_exceptional_block_context(function):
+        return function
     if is_safe is None:
         return function
     current = function
@@ -90,12 +92,6 @@ def apply_low_level_cfg_structuring(
         structured = structure_low_level_cfg(current)
         if structured is None or not is_safe(structured):
             return current
-        structured = replace(
-            structured,
-            control_provenance=tuple(dict.fromkeys(
-                (*current.control_provenance, *structured.control_provenance)
-            )),
-        )
         # Exact structurers must make tangible CFG progress (an edge or a
         # block disappears).  This prevents a registry error from creating an
         # unbounded rewrite cycle while still allowing an inner-region
@@ -118,6 +114,8 @@ def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
     one verified replacement, preserving the registry's deterministic policy.
     """
 
+    if _has_exceptional_block_context(function):
+        return None
     current = function
     normalized = False
     while True:
@@ -125,6 +123,19 @@ def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
             structured = structurer(current)
             if structured is None:
                 continue
+            structured = replace(
+                structured,
+                control_provenance=tuple(
+                    dict.fromkeys(
+                        (*current.control_provenance, *structured.control_provenance)
+                    )
+                ),
+                bytecode_control_flow=tuple(
+                    dict.fromkeys(
+                        (*current.bytecode_control_flow, *structured.bytecode_control_flow)
+                    )
+                ),
+            )
             if structurer in _LOW_LEVEL_CFG_NORMALIZERS:
                 current = structured
                 normalized = True
@@ -132,6 +143,15 @@ def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
             return structured
         else:
             return current if normalized else None
+
+
+def _has_exceptional_block_context(function: FunctionIR) -> bool:
+    """Keep exceptional edges and active re-raise scopes on their exact CFG floor."""
+
+    return any(
+        block.exception_edge is not None or block.active_exception_handlers
+        for block in function.blocks
+    )
 
 
 def _rewrite_while_structured_function(

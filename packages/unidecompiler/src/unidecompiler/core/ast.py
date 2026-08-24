@@ -28,6 +28,11 @@ class UndefinedLiteralExpr(AstExpr):
 
 
 @dataclass(frozen=True)
+class CurrentExceptionRef(AstExpr):
+    pass
+
+
+@dataclass(frozen=True)
 class UnaryExpr(AstExpr):
     op: str = ""
     value: AstExpr = field(default_factory=AstExpr)

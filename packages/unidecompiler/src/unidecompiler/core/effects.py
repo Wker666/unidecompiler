@@ -11,6 +11,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     Call,
     Const,
+    CurrentException,
     GetAttr,
     GetItem,
     IndirectCall,
@@ -215,7 +216,7 @@ class StoreItemAtDepth(Effect):
 
 @dataclass(frozen=True)
 class LoadIndirect(Effect):
-    pass
+    """Consume an indirect reference and push the referenced value."""
 
 
 @dataclass(frozen=True)
@@ -745,12 +746,14 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         state.append_statement(StoreItem(source=effect.source, obj=obj, key=key, value=value))
         return True
     if isinstance(effect, LoadIndirect):
-        if not state.stack:
-            state.diagnostics.append("stack-underflow")
+        top = state.pop()
+        if top is None:
             return False
-        top = state.stack[-1]
         if isinstance(top, IndirectRef):
             state.push(top.target)
+        else:
+            state.diagnostics.append("invalid-indirect-load-target")
+            return False
         return True
     if isinstance(effect, StoreIndirect):
         values = state.pop_many(2)
@@ -1264,7 +1267,7 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         return True
     if isinstance(effect, ExceptionMatch):
         expected = state.pop()
-        active = state.stack[-1] if state.stack else Global(name="current_exception", source=effect.source)
+        active = state.stack[-1] if state.stack else CurrentException(source=effect.source)
         if expected is None:
             return False
         state.push(

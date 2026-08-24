@@ -10,6 +10,7 @@ from unidecompiler.core.ast import (
     CapturedVarRef,
     CollectionProjectionExpr,
     ConstExpr,
+    CurrentExceptionRef,
     UndefinedLiteralExpr,
     ExprStmt,
     ForRangeStmt,
@@ -62,6 +63,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     CollectionProjection,
     Const,
+    CurrentException,
     UndefinedLiteral,
     Continue,
     Expr,
@@ -228,8 +230,13 @@ def _low_level_block_to_ast(block) -> tuple[object, ...]:
     statements: list[object] = [LabelStmt(name=block.id)]
     for statement in block.statements:
         statements.append(_statement_to_ast(statement))
-    if block.exception_target is not None:
-        statements.append(OnExceptionGotoStmt(target=block.exception_target))
+    if block.exception_edge is not None:
+        statements.append(
+            OnExceptionGotoStmt(
+                source=block.exception_edge.source,
+                target=block.exception_edge.target,
+            )
+        )
     if block.terminator is not None:
         statements.append(_terminator_to_ast(block.terminator))
     return tuple(statements)
@@ -392,6 +399,8 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return ConstExpr(source=expr.source, type=expr.type, value=expr.value)
     if isinstance(expr, UndefinedLiteral):
         return UndefinedLiteralExpr(source=expr.source, type=expr.type)
+    if isinstance(expr, CurrentException):
+        return CurrentExceptionRef(source=expr.source, type=expr.type)
     if isinstance(expr, UnaryOp):
         return UnaryExpr(
             source=expr.source,

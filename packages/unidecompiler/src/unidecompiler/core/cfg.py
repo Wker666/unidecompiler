@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from unidecompiler.core.ir import BasicBlock, Branch, FunctionIR, Jump, MultiBranch, Raise, Reraise, Return
+from unidecompiler.core.ir import BasicBlock, Branch, FunctionIR, Jump, MultiBranch, Raise, Reraise, Return, SourceRef
 
 
 @dataclass(frozen=True)
@@ -10,6 +10,7 @@ class CFGEdge:
     source: str
     target: str
     kind: str
+    provenance: SourceRef | None = None
 
 
 @dataclass(frozen=True)
@@ -41,14 +42,15 @@ def build_cfg(function: FunctionIR) -> CFG:
     diagnostics: list[str] = []
 
     for index, block in enumerate(function.blocks):
-        if block.exception_target is not None:
+        if block.exception_edge is not None:
             _add_edge(
                 edges,
                 diagnostics,
                 blocks,
                 block.id,
-                block.exception_target,
+                block.exception_edge.target,
                 "exception",
+                block.exception_edge.source,
             )
         terminator = block.terminator
         if isinstance(terminator, Branch):
@@ -184,11 +186,12 @@ def _add_edge(
     source: str,
     target: str,
     kind: str,
+    provenance: SourceRef | None = None,
 ) -> None:
     if target not in blocks:
         diagnostics.append(f"edge from {source} points to missing block {target}")
         return
-    edges.append(CFGEdge(source=source, target=target, kind=kind))
+    edges.append(CFGEdge(source=source, target=target, kind=kind, provenance=provenance))
 
 
 def _edge_value(value: object) -> str:

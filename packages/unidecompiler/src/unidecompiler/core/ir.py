@@ -48,7 +48,16 @@ class Const(Expr):
 
 @dataclass(frozen=True)
 class UndefinedLiteral(Expr):
-    """A language-level undefined/uninitialized value distinct from null."""
+    """An undefined/uninitialized value distinct from null.
+
+    Its truthiness and language-specific operations require frontend-owned,
+    data-only simulator facts; generic recovery never guesses them.
+    """
+
+
+@dataclass(frozen=True)
+class CurrentException(Expr):
+    """The value of the exception active in the current generic-IR handler."""
 
 
 @dataclass(frozen=True)
@@ -337,11 +346,30 @@ class MultiBranch(Terminator):
 
 
 @dataclass(frozen=True)
+class ExceptionalEdge:
+    """A VM-neutral exceptional CFG edge with instruction provenance."""
+
+    target: BlockId
+    source: SourceRef | None = None
+
+
+@dataclass(frozen=True)
+class BytecodeControlFlow:
+    """Typed bytecode control-flow facts retained for read-only analysis."""
+
+    source: SourceRef
+    flow: Literal["conditional", "unconditional", "multiway"] | None = None
+    targets: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class BasicBlock:
     id: BlockId
     statements: tuple[Stmt, ...] = ()
     terminator: Terminator | None = None
-    exception_target: BlockId | None = None
+    exception_edge: ExceptionalEdge | None = None
+    # VM-neutral identities for nested handlers in which bare re-raise is valid.
+    active_exception_handlers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -353,6 +381,7 @@ class FunctionIR:
     source: SourceRef | None = None
     recovery_kind: str | None = None
     control_provenance: tuple[SourceRef, ...] = ()
+    bytecode_control_flow: tuple[BytecodeControlFlow, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

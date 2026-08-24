@@ -13,6 +13,7 @@ from unidecompiler.core.ir import (
     ArrayLiteral,
     Assign,
     AssignMany,
+    BasicBlock,
     BinaryOp,
     Branch,
     Break,
@@ -20,6 +21,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     CollectionProjection,
     Const,
+    CurrentException,
     UndefinedLiteral,
     Continue,
     Expr,
@@ -216,6 +218,7 @@ class _Frame:
     context: object | None
     predecessor: str | None = None
     active_exception: _Raised | None = None
+    active_exception_handlers: list[tuple[_Raised, str]] = field(default_factory=list)
 
 
 class SimulationEngine:
@@ -492,56 +495,137 @@ class _Runner:
             current = function.blocks[0].id
             while current in blocks:
                 block = blocks[current]
+                self._sync_exception_context(frame, block, current)
                 self._event("enter-block", current)
                 try:
                     try:
                         self._execute_statements(block.statements, current)
+                        terminator = block.terminator
+                        if terminator is None:
+                            index = block_index[current] + 1
+                            if index >= len(function.blocks):
+                                return ()
+                            frame.predecessor = current
+                            current = function.blocks[index].id
+                        elif isinstance(terminator, Return):
+                            return self._eval_values(terminator.values)
+                        elif isinstance(terminator, Jump):
+                            frame.predecessor = current
+                            current = terminator.target
+                        elif isinstance(terminator, Branch):
+                            frame.predecessor = current
+                            current = (
+                                terminator.true_target
+                                if self._truthy(self._eval_expr(terminator.condition))
+                                else terminator.false_target
+                            )
+                        elif isinstance(terminator, MultiBranch):
+                            selector = self._eval_expr(terminator.selector)
+                            current = terminator.default_target
+                            for value, target in terminator.cases:
+                                if self._truthy(
+                                    self._binary(
+                                        "==",
+                                        selector,
+                                        self._eval_expr(value),
+                                        frame.context,
+                                        "dynamic",
+                                    )
+                                ):
+                                    current = target
+                                    break
+                            frame.predecessor = block.id
+                        else:
+                            self._unsupported(
+                                f"unsupported terminator {type(terminator).__name__}"
+                            )
                     except _Raised as raised:
-                        if block.exception_target is None:
+                        if block.exception_edge is None:
                             raise
-                        frame.active_exception = raised
+                        target = block.exception_edge.target
+                        target_block = blocks.get(target)
+                        self._enter_exception_handler(
+                            frame,
+                            target_block,
+                            target,
+                            raised,
+                        )
                         frame.predecessor = current
-                        current = block.exception_target
+                        current = target
                         continue
                 except _ReturnSignal as returned:
                     return returned.values
-                terminator = block.terminator
-                if terminator is None:
-                    index = block_index[current] + 1
-                    if index >= len(function.blocks):
-                        return ()
-                    frame.predecessor = current
-                    current = function.blocks[index].id
-                elif isinstance(terminator, Return):
-                    return self._eval_values(terminator.values)
-                elif isinstance(terminator, Jump):
-                    frame.predecessor = current
-                    current = terminator.target
-                elif isinstance(terminator, Branch):
-                    frame.predecessor = current
-                    current = terminator.true_target if self._truthy(self._eval_expr(terminator.condition)) else terminator.false_target
-                elif isinstance(terminator, MultiBranch):
-                    selector = self._eval_expr(terminator.selector)
-                    current = terminator.default_target
-                    for value, target in terminator.cases:
-                        if self._truthy(
-                            self._binary(
-                                "==",
-                                selector,
-                                self._eval_expr(value),
-                                frame.context,
-                                "dynamic",
-                            )
-                        ):
-                            current = target
-                            break
-                    frame.predecessor = block.id
-                else:
-                    self._unsupported(f"unsupported terminator {type(terminator).__name__}")
             self._unsupported(f"missing target block in {function.name}")
         finally:
             self.last_locals = snapshot_value(frame.locals)
             self.frames.pop()
+
+    def _sync_exception_context(
+        self,
+        frame: _Frame,
+        block: BasicBlock,
+        block_id: str,
+    ) -> None:
+        declared = block.active_exception_handlers
+        actual = tuple(
+            handler for _raised, handler in frame.active_exception_handlers
+        )
+        if declared:
+            while len(frame.active_exception_handlers) > len(declared):
+                frame.active_exception_handlers.pop()
+            actual = tuple(
+                handler for _raised, handler in frame.active_exception_handlers
+            )
+            if actual != declared:
+                self._unsupported(
+                    f"active exception context for block {block_id!r} does not "
+                    f"match its declared handlers"
+                )
+        elif frame.active_exception_handlers:
+            # Backwards-compatible one-block handlers can omit explicit
+            # context.  Once control leaves that target, the caught exception
+            # is no longer active and bare re-raise must fail.
+            if frame.active_exception_handlers[-1][1] != block_id:
+                frame.active_exception_handlers.clear()
+        frame.active_exception = (
+            frame.active_exception_handlers[-1][0]
+            if frame.active_exception_handlers
+            else None
+        )
+
+    def _enter_exception_handler(
+        self,
+        frame: _Frame,
+        target_block: BasicBlock | None,
+        target_id: str,
+        raised: _Raised,
+    ) -> None:
+        declared = (
+            target_block.active_exception_handlers
+            if target_block is not None
+            else ()
+        )
+        if not declared:
+            # Without an explicit nested context, the target is a standalone
+            # compatibility handler.  Do not retain stale exceptions from a
+            # handler that is being unwound.
+            frame.active_exception_handlers.clear()
+            handler_context = target_id
+        else:
+            parent_context = declared[:-1]
+            while len(frame.active_exception_handlers) > len(parent_context):
+                frame.active_exception_handlers.pop()
+            actual_parent = tuple(
+                handler for _raised, handler in frame.active_exception_handlers
+            )
+            if actual_parent != parent_context:
+                self._unsupported(
+                    f"exception edge to {target_id!r} does not match its "
+                    "declared parent handler context"
+                )
+            handler_context = declared[-1]
+        frame.active_exception_handlers.append((raised, handler_context))
+        frame.active_exception = raised
 
     def _execute_statements(self, statements: tuple[Stmt, ...], block_id: str) -> None:
         for statement in statements:
@@ -682,6 +766,12 @@ class _Runner:
             return expr.value
         if isinstance(expr, UndefinedLiteral):
             return UNDEFINED
+        if isinstance(expr, CurrentException):
+            if frame.active_exception is None:
+                self._unsupported(
+                    "current exception used outside an active exception handler"
+                )
+            return frame.active_exception.value
         if isinstance(expr, Global):
             result = self._adapter_value("resolve_global", expr.name, frame.context)
             if result is NotHandled:
@@ -710,6 +800,15 @@ class _Runner:
         if isinstance(expr, UnaryOp):
             value = self._eval_expr(expr.value)
             op = expr.op.strip()
+            if value is UNDEFINED:
+                result = self._adapter_value(
+                    "unary_op", op, value, frame.context
+                )
+                if result is NotHandled:
+                    self._unsupported(
+                        "undefined unary operation requires a simulator adapter"
+                    )
+                return result
             if op in {"-", "neg"}:
                 try:
                     return -value
@@ -805,6 +904,10 @@ class _Runner:
             if result is NotHandled:
                 if not isinstance(constructor, str):
                     self._unsupported("dynamic constructor requires a simulator adapter")
+                if args:
+                    self._unsupported(
+                        "constructor arguments require a simulator adapter"
+                    )
                 return ObjectValue(constructor)
             return result
         if isinstance(expr, GetAttr):
@@ -920,6 +1023,10 @@ class _Runner:
         return _MultiReturnValue(values)
 
     def _invoke_intrinsic(self, name: str, args: tuple[Any, ...], bit_width: int | None = None) -> Any:
+        if any(value is UNDEFINED for value in args):
+            self._unsupported(
+                f"intrinsic {name!r} does not define operations on undefined values"
+            )
         try:
             if name == "neg":
                 return -args[0]
@@ -1014,6 +1121,15 @@ class _Runner:
         numeric_domain: str = "default",
         bit_width: int | None = None,
     ) -> Any:
+        if left is UNDEFINED or right is UNDEFINED:
+            result = self._adapter_value(
+                "binary_op", op, left, right, context
+            )
+            if result is NotHandled:
+                self._unsupported(
+                    "undefined binary operation requires a simulator adapter"
+                )
+            return result
         if semantics == "dynamic":
             result = self._adapter_value("binary_op", op, left, right, context)
             if result is not NotHandled:
@@ -1172,6 +1288,8 @@ class _Runner:
             if not isinstance(result, bool):
                 raise TypeError("adapter truthy operation must return bool or NotHandled")
             return result
+        if value is UNDEFINED:
+            self._unsupported("undefined truthiness requires a simulator adapter")
         return bool(value)
 
     def _get_attr(self, obj: Any, attr: str) -> Any:
@@ -1344,6 +1462,10 @@ class _Runner:
             if not isinstance(result, bool):
                 raise TypeError("adapter exception matcher must return bool or NotHandled")
             return result
+        if value is UNDEFINED or expected is UNDEFINED:
+            self._unsupported(
+                "undefined exception matching requires a simulator adapter"
+            )
         if value == expected:
             return True
         if isinstance(expected, str):

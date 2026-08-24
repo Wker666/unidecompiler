@@ -355,7 +355,6 @@ def _wasm_local_store(function: WasmFunctionListing, instruction: WasmInstructio
         return (
             DuplicateTop(source=source, materialized_name=name),
             StoreLocal(source=source, name=name, target=Var(name=name, source=source)),
-            LoadLocal(source=source, name=name, fallback=Var(name=name, source=source)),
         )
     return (StoreLocal(source=source, name=name, target=Var(name=name, source=source)),)
 

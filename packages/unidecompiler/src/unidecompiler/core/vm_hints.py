@@ -16,6 +16,7 @@ VMHintKind = Literal[
     "exception-region",
     "exception-handler",
     "exception-handler-pop",
+    "exception-edge-state",
     "branch-value",
     "materialized-condition",
     "call-shape",

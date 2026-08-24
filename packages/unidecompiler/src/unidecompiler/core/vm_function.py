@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from dataclasses import replace
 from typing import Any, Callable, Generic, TypeVar
 
@@ -18,13 +18,16 @@ from unidecompiler.core.ir import (
     BinaryOp,
     Branch,
     Break,
+    BytecodeControlFlow,
     Call,
     CapturedVar,
     CollectionProjection,
     Const,
     Continue,
+    CurrentException,
     Expr,
     ExprStmt,
+    ExceptionalEdge,
     ForEach,
     ForRange,
     FunctionIR,
@@ -160,6 +163,21 @@ def lift_vm_step_function(
     """Lift VM steps and retain a frontend-neutral instruction projection."""
     function = _lift_vm_step_function(spec, steps, **kwargs)
     instructions = tuple(_generic_instruction(step) for step in steps)
+    metadata = dict(function.metadata)
+    if (
+        metadata.get("decompile_status") == "unsupported"
+        and not metadata.get("unsupported_context")
+    ):
+        unsupported_opcodes = frozenset(metadata.get("unsupported_opcodes", ()))
+        indexes = tuple(
+            index
+            for index, step in enumerate(steps)
+            if step.opcode in unsupported_opcodes
+        )
+        metadata["unsupported_context"] = _unsupported_context_for_indexes(
+            steps,
+            indexes or ((len(steps) - 1,) if steps else ()),
+        )
     control_sources = tuple(
         step.source
         for step in steps
@@ -170,8 +188,10 @@ def lift_vm_step_function(
                 "loop-backedge",
                 "case-target",
                 "default-target",
+                "exception-region",
                 "exception-handler",
                 "exception-handler-pop",
+                "exception-edge-state",
             }
             for hint in step.hints
         )
@@ -183,7 +203,13 @@ def lift_vm_step_function(
                 (*function.control_provenance, *control_sources, *control_provenance)
             )
         ),
-        metadata={**function.metadata, "bytecode_instructions": instructions},
+        bytecode_control_flow=tuple(
+            control
+            for step in steps
+            for control in (_bytecode_control_flow(step),)
+            if control is not None
+        ),
+        metadata={**metadata, "bytecode_instructions": instructions},
     )
 
 
@@ -200,13 +226,33 @@ def _generic_instruction(step: VMBytecodeStep) -> dict[str, Any]:
         "raw": step.raw or ("" if decoded is None else decoded.raw),
         "artifact_range": None if decoded is None else decoded.artifact_range,
         "source": step.source,
-        "control": tuple(
-            {"kind": hint.kind, "target": hint.target, "flow": hint.flow}
-            for hint in step.hints
-            if hint.kind in {"branch-target", "loop-backedge", "case-target", "default-target"}
-            and hint.target is not None
-        ),
     }
+
+
+def _bytecode_control_flow(step: VMBytecodeStep) -> BytecodeControlFlow | None:
+    if step.source.offset is None:
+        return None
+    targets = tuple(
+        dict.fromkeys(
+            hint.target
+            for hint in step.hints
+            if isinstance(hint.target, int)
+            and hint.kind
+            in {
+                "branch-target",
+                "loop-backedge",
+                "case-target",
+                "default-target",
+            }
+        )
+    )
+    flows = {
+        hint.flow
+        for hint in step.hints
+        if hint.flow in {"conditional", "unconditional", "multiway"}
+    }
+    flow = next(iter(flows)) if len(flows) == 1 else None
+    return BytecodeControlFlow(source=step.source, flow=flow, targets=targets)
 
 
 def _lift_vm_step_function(
@@ -224,24 +270,33 @@ def _lift_vm_step_function(
 
     if not steps:
         return entry_vm_function(spec, terminator=vm_return(source=SourceRef(frontend=spec.frontend)), structured_lift="empty")
+    if profile is not None and stateful_callbacks is not None and _has_exception_region_facts(steps):
+        protected = _lift_exception_region_candidate(
+            spec,
+            steps,
+            profile,
+            stateful_callbacks,
+            callbacks,
+            raw_window,
+        )
+        if protected is not None:
+            return protected
     if (
         profile is not None
         and stateful_callbacks is not None
         and _has_exception_handler_facts(steps)
     ):
         low_level = _lift_low_level_cfg_candidate(
-            spec, steps, profile, stateful_callbacks
+            spec, steps, profile, stateful_callbacks, raw_window
         )
         if low_level is not None:
             return low_level
-    if profile is not None and stateful_callbacks is not None and _has_exception_region_facts(steps):
-        protected = _lift_exception_region_candidate(spec, steps, profile, stateful_callbacks, callbacks)
-        if protected is not None:
-            return protected
     if stateful_callbacks is not None and any(
         any(hint.kind == "materialized-condition" for hint in step.hints) for step in steps
     ):
-        low_level = _lift_low_level_cfg_candidate(spec, steps, profile, stateful_callbacks) if profile is not None else None
+        low_level = _lift_low_level_cfg_candidate(
+            spec, steps, profile, stateful_callbacks, raw_window
+        ) if profile is not None else None
         if low_level is not None and not _function_has_unsupported(low_level):
             return low_level
     if profile is not None and any(profile.is_control(step) for step in steps):
@@ -256,7 +311,9 @@ def _lift_vm_step_function(
                     if stateful is not None and not _function_has_unsupported(stateful) and not _function_has_unbound_loop_control(stateful):
                         return stateful
                     if has_unbound_loop_control:
-                        low_level = _lift_low_level_cfg_candidate(spec, steps, profile, stateful_callbacks)
+                        low_level = _lift_low_level_cfg_candidate(
+                            spec, steps, profile, stateful_callbacks, raw_window
+                        )
                         if low_level is not None:
                             return low_level
                 function = entry_vm_function(
@@ -285,7 +342,9 @@ def _lift_vm_step_function(
                         or (_raise_effect_count(steps) > _function_raise_statement_count(function))
                     )
                 ):
-                    low_level = _lift_low_level_cfg_candidate(spec, steps, profile, stateful_callbacks)
+                    low_level = _lift_low_level_cfg_candidate(
+                        spec, steps, profile, stateful_callbacks, raw_window
+                    )
                     if (
                         low_level is not None
                         and not _function_has_unsupported(low_level)
@@ -294,7 +353,9 @@ def _lift_vm_step_function(
                         return low_level
                 finalized = finalize_recovered_vm_function(spec, function)
                 if finalized.metadata.get("decompile_status") == "unsupported" and stateful_callbacks is not None:
-                    low_level = _lift_low_level_cfg_candidate(spec, steps, profile, stateful_callbacks)
+                    low_level = _lift_low_level_cfg_candidate(
+                        spec, steps, profile, stateful_callbacks, raw_window
+                    )
                     if low_level is not None and not _function_reads_unbound_locals(low_level):
                         return low_level
                 return finalized
@@ -308,7 +369,9 @@ def _lift_vm_step_function(
                 and not _function_has_degenerate_branch(stateful)
             ):
                 return stateful
-            low_level = _lift_low_level_cfg_candidate(spec, steps, profile, stateful_callbacks)
+            low_level = _lift_low_level_cfg_candidate(
+                spec, steps, profile, stateful_callbacks, raw_window
+            )
             if low_level is not None:
                 return finalize_recovered_vm_function(spec, low_level)
     result = run_vm_steps(steps, initial_locals=initial_locals, initial_stack=initial_stack)
@@ -382,39 +445,43 @@ def finalize_recovered_vm_function(spec: VMFunctionSpec, function: FunctionIR) -
         return function
     structural_reason = _unsafe_structural_recovery_reason(function)
     if function.recovery_kind == "generic-vm-low-level-cfg":
+        unbound = _function_unbound_local_reads(function, spec)
+        if structural_reason is not None or unbound:
+            reason = structural_reason or "recovered IR reads locals that were never bound"
+            unsupported = unsupported_vm_function(
+                spec,
+                (),
+                reason=reason,
+                structured_lift=function.recovery_kind,
+            )
+            return replace(
+                unsupported,
+                metadata={**unsupported.metadata, "unbound_locals": unbound},
+            )
         # Exceptional CFG edges are first-class control flow.  Ordinary
         # branch/loop structurers do not yet own them and must not erase them
-        # while simplifying the normal graph.  A dedicated exception-region
-        # structurer runs on this preserved floor in a later pass.
-        if any(block.exception_target is not None for block in function.blocks):
+        # while simplifying the normal graph.
+        if any(block.exception_edge is not None for block in function.blocks):
             return function
-        if structural_reason is None:
-            if _function_has_try_regions(function):
-                return apply_low_level_cfg_structuring(
-                    function,
-                    is_safe=lambda structured: (
-                        _unsafe_structural_recovery_reason(structured) is None
-                        and not _function_unbound_local_reads(structured, spec)
-                    ),
-                )
+        if _function_has_try_regions(function):
             return apply_low_level_cfg_structuring(
                 function,
                 is_safe=lambda structured: (
                     _unsafe_structural_recovery_reason(structured) is None
                     and not _function_unbound_local_reads(structured, spec)
-                    and (
-                        _function_has_degenerate_branch(function)
-                        or not _function_has_degenerate_branch(structured)
-                    )
                 ),
             )
-        unsupported = unsupported_vm_function(
-            spec,
-            (),
-            reason=structural_reason,
-            structured_lift=function.recovery_kind,
+        return apply_low_level_cfg_structuring(
+            function,
+            is_safe=lambda structured: (
+                _unsafe_structural_recovery_reason(structured) is None
+                and not _function_unbound_local_reads(structured, spec)
+                and (
+                    _function_has_degenerate_branch(function)
+                    or not _function_has_degenerate_branch(structured)
+                )
+            ),
         )
-        return replace(unsupported, metadata={**unsupported.metadata, "unbound_locals": ()})
     unbound = _function_unbound_local_reads(function, spec)
     if not unbound and structural_reason is None:
         return function
@@ -927,6 +994,7 @@ def block_vm_function(
         },
         recovery_kind=structured_lift,
     )
+    return function
 
 
 def partial_vm_function(
@@ -1067,25 +1135,63 @@ def _lift_low_level_cfg_candidate(
     steps: tuple[VMBytecodeStep, ...],
     profile: VMRegionProfile[VMBytecodeStep],
     stateful_callbacks: VMStatefulCallbacks[VMBytecodeStep],
+    raw_window: Callable[[int], tuple[str, ...]] | None,
 ) -> FunctionIR | None:
     result = lift_stateful_low_level_cfg(steps, profile, stateful_callbacks)
     if result is None or not result.blocks:
         return None
+    if result.diagnostics:
+        return _unsupported_low_level_cfg_diagnostics(
+            spec, steps, result, raw_window
+        )
     function = _assemble_low_level_cfg(spec, result)
     if not _function_has_exit_terminator(function):
-        return unsupported_vm_function(
+        return _unsupported_low_level_failure(
             spec,
-            (),
+            steps,
             reason="low-level CFG recovery did not reach a function exit",
-            structured_lift="generic-vm-low-level-cfg",
+            raw_window=raw_window,
+            indexes=_low_level_failure_instruction_indexes(function, steps),
         )
     finalized = finalize_recovered_vm_function(spec, function)
+    if (
+        finalized.metadata.get("decompile_status") == "unsupported"
+        and not finalized.metadata.get("unsupported_raw")
+    ):
+        enriched = _unsupported_low_level_failure(
+            spec,
+            steps,
+            reason=finalized.metadata.get("unsupported_reason")
+            or "low-level CFG recovery was unsafe",
+            raw_window=raw_window,
+            indexes=_low_level_failure_instruction_indexes(
+                function,
+                steps,
+                tuple(finalized.metadata.get("unbound_locals") or ()),
+            ),
+        )
+        return replace(
+            enriched,
+            metadata={
+                **enriched.metadata,
+                **{
+                    key: value
+                    for key, value in finalized.metadata.items()
+                    if key not in {
+                        "unsupported_reason",
+                        "unsupported_opcodes",
+                        "unsupported_raw",
+                    }
+                },
+            },
+        )
     return finalized
 
 
 def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
     status = "ok" if not result.diagnostics else "partial"
-    exception_targets = dict(result.exception_targets)
+    exception_edges = dict(result.exception_edges)
+    active_exception_handlers = dict(result.active_exception_handlers)
     function = assemble_function(
         name=spec.name,
         params=spec.params,
@@ -1095,7 +1201,15 @@ def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
                 id=block_id,
                 statements=statements,
                 terminator=terminator,
-                exception_target=exception_targets.get(block_id),
+                exception_edge=(
+                    ExceptionalEdge(
+                        target=exception_edges[block_id].target,
+                        source=exception_edges[block_id].source,
+                    )
+                    if block_id in exception_edges
+                    else None
+                ),
+                active_exception_handlers=active_exception_handlers.get(block_id, ()),
             )
             for block_id, statements, terminator in result.blocks
         ),
@@ -1117,7 +1231,7 @@ def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
 
 def _has_exception_region_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
     return any(
-        hint.kind == "exception-region" and isinstance(hint.value, dict)
+        hint.kind == "exception-region"
         for step in steps
         for hint in step.hints
     )
@@ -1125,7 +1239,8 @@ def _has_exception_region_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
 
 def _has_exception_handler_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
     return any(
-        hint.kind in {"exception-handler", "exception-handler-pop"}
+        hint.kind
+        in {"exception-handler", "exception-handler-pop", "exception-edge-state"}
         for step in steps
         for hint in step.hints
     )
@@ -1137,6 +1252,7 @@ def _lift_exception_region_candidate(
     profile: VMRegionProfile[VMBytecodeStep],
     callbacks: VMStatefulCallbacks[VMBytecodeStep],
     region_callbacks: VMRegionCallbacks[VMBytecodeStep] | None,
+    raw_window: Callable[[int], tuple[str, ...]] | None,
 ) -> FunctionIR | None:
     """Recover simple typed handlers from neutral protected-region facts.
 
@@ -1147,6 +1263,22 @@ def _lift_exception_region_candidate(
 
     cfg = lift_stateful_low_level_cfg(steps, profile, callbacks)
     if cfg is None or not cfg.blocks:
+        return None
+    if cfg.exception_fact_diagnostics:
+        return _unsupported_low_level_cfg_diagnostics(
+            spec,
+            steps,
+            replace(
+                cfg,
+                issues=tuple(
+                    issue
+                    for issue in cfg.issues
+                    if issue.category == "exception-fact"
+                ),
+            ),
+            raw_window,
+        )
+    if cfg.diagnostics:
         return None
     low_level = _assemble_low_level_cfg(spec, cfg)
     regions = _top_level_exception_regions(steps)
@@ -1296,7 +1428,7 @@ def _lift_direct_exception_handler(
             binding = effects[0].target if isinstance(effects[0].target, Var) else Var(name=effects[0].name, source=effects[0].source)
             initial_locals[effects[0].name] = binding
             body_start += 1
-    initial_stack = () if binding is not None else (Global(name="current_exception", source=steps[entry].source),)
+    initial_stack = () if binding is not None else (CurrentException(source=steps[entry].source),)
     lifted = callbacks.lift_linear(body_start, len(steps), initial_locals, initial_stack)
     if lifted is None or lifted.stack:
         return None
@@ -1339,7 +1471,7 @@ def _lift_one_typed_exception_handler(
         return None
     body_start = branch_index + 1
     initial_locals = dict(callbacks.initial_locals())
-    initial_stack: tuple[Expr, ...] = (Global(name="current_exception", source=steps[entry].source),)
+    initial_stack: tuple[Expr, ...] = (CurrentException(source=steps[entry].source),)
     binding: Var | None = None
     if body_start < mismatch:
         effects = tuple(steps[body_start].effects or ())
@@ -1683,7 +1815,184 @@ def _statements_have_loop_construct(statements: tuple[object, ...]) -> bool:
 
 
 def _function_has_exit_terminator(function: FunctionIR) -> bool:
-    return any(isinstance(block.terminator, (Return, Raise)) for block in function.blocks)
+    return any(
+        isinstance(block.terminator, Return)
+        or (
+            block.statements
+            and isinstance(block.statements[-1], (Raise, Reraise))
+        )
+        for block in function.blocks
+    )
+
+
+def _unsupported_low_level_cfg_diagnostics(
+    spec: VMFunctionSpec,
+    steps: tuple[VMBytecodeStep, ...],
+    result,
+    raw_window: Callable[[int], tuple[str, ...]] | None,
+) -> FunctionIR:
+    indexes = tuple(
+        index
+        for index in (result.diagnostic_instructions or (0,))
+        if 0 <= index < len(steps)
+    ) or (0,)
+    return _unsupported_low_level_failure(
+        spec,
+        steps,
+        reason="; ".join(result.diagnostics),
+        raw_window=raw_window,
+        indexes=indexes,
+    )
+
+
+def _unsupported_low_level_failure(
+    spec: VMFunctionSpec,
+    steps: tuple[VMBytecodeStep, ...],
+    *,
+    reason: str,
+    raw_window: Callable[[int], tuple[str, ...]] | None,
+    indexes: tuple[int, ...],
+) -> FunctionIR:
+    safe_indexes = tuple(
+        dict.fromkeys(index for index in indexes if 0 <= index < len(steps))
+    ) or (0,)
+    opcodes = tuple(dict.fromkeys(steps[index].opcode for index in safe_indexes))
+    raw = tuple(
+        dict.fromkeys(
+            item
+            for index in safe_indexes
+            for item in (
+                raw_window(index)
+                if raw_window is not None
+                else (steps[index].raw,)
+            )
+            if item
+        )
+    )
+    function = unsupported_vm_function(
+        spec,
+        opcodes,
+        reason=reason,
+        raw=raw,
+        structured_lift="generic-vm-low-level-cfg",
+    )
+    return replace(
+        function,
+        metadata={
+            **function.metadata,
+            "unsupported_context": _unsupported_context_for_indexes(
+                steps,
+                safe_indexes,
+            ),
+        },
+    )
+
+
+def _unsupported_context_for_indexes(
+    steps: tuple[VMBytecodeStep, ...],
+    indexes: tuple[int, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        _unsupported_instruction_context(steps[index])
+        for index in dict.fromkeys(indexes)
+        if 0 <= index < len(steps)
+    )
+
+
+def _unsupported_instruction_context(step: VMBytecodeStep) -> str:
+    decoded = step.decoded
+    operands = () if decoded is None else tuple(
+        f"{operand.role}={operand.text or operand.value!s}"
+        for operand in decoded.operands
+    )
+    hints = tuple(
+        ", ".join(
+            part
+            for part in (
+                hint.kind,
+                None if hint.target is None else f"target={hint.target}",
+                None if hint.value is None else f"value={hint.value!r}",
+                None if not hint.label else f"label={hint.label}",
+                None if hint.detail is None else f"detail={hint.detail}",
+                None if hint.flow is None else f"flow={hint.flow}",
+            )
+            if part is not None
+        )
+        for hint in step.hints
+    )
+    return (
+        f"offset={step.source.offset!r}; opcode={step.opcode}; "
+        f"operands=[{'; '.join(operands)}]; hints=[{'; '.join(hints)}]"
+    )
+
+
+def _low_level_failure_instruction_indexes(
+    function: FunctionIR,
+    steps: tuple[VMBytecodeStep, ...],
+    unbound_names: tuple[str, ...] = (),
+) -> tuple[int, ...]:
+    offsets: list[int] = []
+    for block in function.blocks:
+        terminator = block.terminator
+        if (
+            isinstance(terminator, Jump)
+            and terminator.target.startswith("missing_")
+        ) or (
+            isinstance(terminator, Branch)
+            and (
+                terminator.true_target.startswith("missing_")
+                or terminator.false_target.startswith("missing_")
+            )
+        ) or (
+            isinstance(terminator, MultiBranch)
+            and (
+                terminator.default_target.startswith("missing_")
+                or any(
+                    target.startswith("missing_")
+                    for _value, target in terminator.cases
+                )
+            )
+        ):
+            if terminator.source is not None and terminator.source.offset is not None:
+                offsets.append(terminator.source.offset)
+    if unbound_names:
+        offsets.extend(_unbound_var_source_offsets(function.blocks, set(unbound_names)))
+    if not offsets and function.blocks:
+        last = function.blocks[-1]
+        candidate = last.terminator or (last.statements[-1] if last.statements else None)
+        source = getattr(candidate, "source", None)
+        if source is not None and source.offset is not None:
+            offsets.append(source.offset)
+    indexes = tuple(
+        index
+        for index, step in enumerate(steps)
+        if step.source.offset in offsets
+    )
+    return indexes or ((len(steps) - 1,) if steps else ())
+
+
+def _unbound_var_source_offsets(value: object, names: set[str]) -> tuple[int, ...]:
+    if isinstance(value, Var) and value.name in names:
+        source = value.source
+        return (
+            ()
+            if source is None or source.offset is None
+            else (source.offset,)
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(
+            offset
+            for item in value
+            for offset in _unbound_var_source_offsets(item, names)
+        )
+    if not is_dataclass(value) or isinstance(value, SourceRef):
+        return ()
+    return tuple(
+        offset
+        for item in fields(value)
+        if item.name != "metadata"
+        for offset in _unbound_var_source_offsets(getattr(value, item.name), names)
+    )
 
 
 def _has_unbound_loop_control(statements: tuple[object, ...], *, in_loop: bool = False) -> bool:

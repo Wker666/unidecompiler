@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Generic, TypeVar
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
+from typing import Callable, Generic, Literal, TypeVar
 
 from unidecompiler.core.vm_bytecode import VMBytecodeStep, run_vm_steps
 from unidecompiler.core.effects import (
@@ -31,6 +32,7 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     Continue,
+    CurrentException,
     Expr,
     ForEach,
     GetItem,
@@ -41,11 +43,13 @@ from unidecompiler.core.ir import (
     MultiBranch,
     Phi,
     Raise,
+    Reraise,
     Return,
     SourceRef,
     Stmt,
     Terminator,
     UnaryOp,
+    UndefinedLiteral,
     Unsupported,
     Var,
     While,
@@ -197,9 +201,66 @@ class VMControlPrefixResult:
 @dataclass(frozen=True)
 class VMControlCFGResult:
     blocks: tuple[tuple[str, tuple[Stmt, ...], Terminator | None], ...]
-    diagnostics: tuple[str, ...] = ()
-    exception_targets: tuple[tuple[str, str], ...] = ()
+    issues: tuple["VMControlDiagnostic", ...] = ()
+    exception_edges: tuple[tuple[str, "VMExceptionalEdge"], ...] = ()
+    active_exception_handlers: tuple[tuple[str, tuple[str, ...]], ...] = ()
     control_provenance: tuple[SourceRef, ...] = ()
+
+    @property
+    def diagnostics(self) -> tuple[str, ...]:
+        return tuple(issue.message for issue in self.issues)
+
+    @property
+    def diagnostic_instructions(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys(issue.instruction for issue in self.issues))
+
+    @property
+    def exception_fact_diagnostics(self) -> tuple[str, ...]:
+        return tuple(
+            issue.message
+            for issue in self.issues
+            if issue.category == "exception-fact"
+        )
+
+    @property
+    def exception_fact_instructions(self) -> tuple[int, ...]:
+        return tuple(
+            dict.fromkeys(
+                issue.instruction
+                for issue in self.issues
+                if issue.category == "exception-fact"
+            )
+        )
+
+
+@dataclass(frozen=True)
+class VMExceptionalEdge:
+    target: str
+    source: SourceRef
+
+
+@dataclass(frozen=True)
+class _ExceptionEdgeState:
+    state: VMLinearState
+    source: SourceRef
+
+
+@dataclass(frozen=True)
+class VMControlDiagnostic:
+    message: str
+    instruction: int
+    category: Literal["recovery", "exception-fact"] = "recovery"
+
+
+class _HandlerFrameKind(str, Enum):
+    PROTECTED = "protected"
+    ACTIVE = "active"
+
+
+@dataclass(frozen=True)
+class _HandlerFrame:
+    kind: _HandlerFrameKind
+    handler: int
 
 
 def lift_stateful_control_prefix(
@@ -235,16 +296,24 @@ def lift_stateful_low_level_cfg(
         return None
     sorted_leaders = sorted(leaders)
     leader_positions = {leader: position for position, leader in enumerate(sorted_leaders)}
-    diagnostics: list[str] = []
-    StateKey = tuple[int, tuple[int, ...]]
+    issues: list[VMControlDiagnostic] = []
+    # A handler stack is ordered.  Keeping protected ranges and active
+    # exception contexts in separate tuples loses that order: a protected
+    # range pushed from inside a handler must be popped before the handler
+    # context itself.  Tagged frames preserve the VM-neutral nesting exactly.
+    StateKey = tuple[int, tuple[_HandlerFrame, ...]]
 
     def block_name(key: StateKey) -> str:
-        index, handlers = key
+        index, handler_frames = key
         base = f"block_{profile.offset(instructions[index])}"
-        if not handlers:
+        if not handler_frames:
             return base
-        suffix = "_".join(str(profile.offset(instructions[item])) for item in handlers)
-        return f"{base}__handlers_{suffix}"
+        suffixes = [
+            f"{'handlers' if frame.kind is _HandlerFrameKind.PROTECTED else 'handling'}_"
+            f"{profile.offset(instructions[frame.handler])}"
+            for frame in handler_frames
+        ]
+        return f"{base}__{'__'.join(suffixes)}"
 
     entry_key: StateKey = (sorted_leaders[0], ())
     incoming: dict[StateKey, VMLinearState] = {
@@ -257,13 +326,19 @@ def lift_stateful_low_level_cfg(
     incoming_predecessors: dict[StateKey, tuple[str, ...]] = {entry_key: ()}
     lifted_blocks: dict[StateKey, VMLinearState] = {}
     terminators: dict[StateKey, Terminator | None] = {}
-    exception_targets: dict[StateKey, StateKey] = {}
+    exception_edges: dict[StateKey, tuple[StateKey, SourceRef]] = {}
     consumed_control_sources: set[SourceRef] = set()
     worklist = [entry_key]
+    max_handler_depth = sum(
+        1
+        for instruction in instructions
+        for hint in tuple(getattr(instruction, "hints", ()) or ())
+        if hint.kind == "exception-handler"
+    )
 
     while worklist:
         key = worklist.pop(0)
-        start, handler_stack = key
+        start, handler_frames = key
         position = leader_positions[start]
         in_state = incoming[key]
         end = sorted_leaders[position + 1] if position + 1 < len(sorted_leaders) else len(instructions)
@@ -279,7 +354,11 @@ def lift_stateful_low_level_cfg(
             if retry_start != start:
                 lifted = callbacks.lift_linear(retry_start, linear_end, in_state.locals.copy(), in_state.stack)
         if lifted is None:
-            diagnostics.append(f"cannot lift low-level block at {profile.offset(instructions[start])}")
+            _append_control_diagnostic(
+                issues,
+                f"cannot lift low-level block at {profile.offset(instructions[start])}",
+                start,
+            )
             lifted = VMLinearState(locals=in_state.locals.copy(), stack=in_state.stack)
         if in_state.edge_statements and not lifted.statements:
             lifted = VMLinearState(
@@ -291,23 +370,46 @@ def lift_stateful_low_level_cfg(
                 stopped_at=lifted.stopped_at,
             )
         lifted_blocks[key] = lifted
-        active_handler = handler_stack[-1] if handler_stack else None
-        outgoing_handlers = _apply_exception_handler_hints(
+        protected_position = _innermost_protected_handler_position(handler_frames)
+        active_handler = (
+            handler_frames[protected_position].handler
+            if protected_position is not None
+            else None
+        )
+        outgoing_handler_frames = _apply_exception_handler_hints(
             instructions,
             start,
             linear_end,
-            handler_stack,
+            handler_frames,
             profile,
-            diagnostics,
+            issues,
+            consumed_control_sources,
+            max_handler_depth,
+        )
+        declared_exception_state = _exception_edge_state(
+            instructions,
+            start,
+            linear_end,
+            in_state,
+            profile,
+            issues,
             consumed_control_sources,
         )
+        if declared_exception_state is not None and active_handler is None:
+            _append_control_diagnostic(
+                issues,
+                f"exception edge state at {profile.offset(instructions[start])} "
+                "has no active handler",
+                start,
+                category="exception-fact",
+            )
         terminator: Terminator | None = lifted.terminator
         if terminator is None and control_index is not None:
             lifted = _apply_control_instruction_effects(lifted, instructions[control_index])
             lifted_blocks[key] = lifted
             terminator = lifted.terminator
         contextual_names = {
-            index: block_name((index, outgoing_handlers))
+            index: block_name((index, outgoing_handler_frames))
             for index in sorted_leaders
         }
         if terminator is None and control_index is not None:
@@ -334,7 +436,11 @@ def lift_stateful_low_level_cfg(
             )
         terminators[key] = terminator
         outgoing = lifted
-        if control_index is not None and (
+        iterator_branch = (
+            control_index is not None
+            and _hint_target_polarity(instructions[control_index]) == "iter-false"
+        )
+        if control_index is not None and not iterator_branch and (
             profile.is_conditional_jump(instructions[control_index])
             or isinstance(terminator, MultiBranch)
         ):
@@ -354,7 +460,10 @@ def lift_stateful_low_level_cfg(
             outgoing = _materialize_cross_block_stack(outgoing, profile, instructions[start])
             lifted_blocks[key] = outgoing
         for successor in successors:
-            successor_key: StateKey = (successor, outgoing_handlers)
+            successor_key: StateKey = (
+                successor,
+                outgoing_handler_frames,
+            )
             successor_outgoing = _low_level_successor_state(
                 outgoing,
                 terminator,
@@ -375,6 +484,19 @@ def lift_stateful_low_level_cfg(
                 current_predecessors=incoming_predecessors.get(successor_key, ()),
             )
             if merged is None:
+                _append_control_diagnostic(
+                    issues,
+                    f"cannot merge normal state from "
+                    f"{profile.offset(instructions[start])} into block "
+                    f"{profile.offset(instructions[successor])}",
+                    start,
+                )
+                _append_control_diagnostic(
+                    issues,
+                    f"normal state merge target is block "
+                    f"{profile.offset(instructions[successor])}",
+                    successor,
+                )
                 continue
             previous_predecessors = incoming_predecessors.get(successor_key, ())
             if predecessor not in previous_predecessors:
@@ -384,21 +506,78 @@ def lift_stateful_low_level_cfg(
                 if successor_key not in worklist:
                     worklist.append(successor_key)
 
-        if active_handler is not None and active_handler in leader_positions:
+        exact_raise = _statements_end_with_raise(lifted.statements)
+        exact_raise_state = (
+            outgoing
+            if exact_raise
+            and not _contains_ir_node(lifted.statements[:-1], (Call, Raise, Reraise))
+            and not _contains_ir_node(lifted.statements[-1], (Call,))
+            else None
+        )
+        exact_exception_state = (
+            declared_exception_state.state
+            if declared_exception_state is not None
+            else exact_raise_state
+        )
+        exception_source = (
+            declared_exception_state.source
+            if declared_exception_state is not None
+            else _exception_source_for_explicit_raise(
+                lifted,
+                instructions[start],
+            )
+        )
+        ambiguous_exception = _contains_ir_node(
+            (lifted.statements, terminator),
+            (Call, Raise, Reraise),
+        ) and exact_exception_state is None
+        if active_handler is not None and ambiguous_exception:
+            _append_control_diagnostic(
+                issues,
+                f"cannot prove exceptional state for block at "
+                f"{profile.offset(instructions[start])}",
+                start,
+            )
+        if (
+            active_handler is not None
+            and active_handler in leader_positions
+            and exact_exception_state is not None
+        ):
             successor = active_handler
-            successor_key = (successor, handler_stack[:-1])
-            exception_targets[key] = successor_key
+            assert protected_position is not None
+            successor_key = (
+                successor,
+                (
+                    *handler_frames[:protected_position],
+                    _HandlerFrame(_HandlerFrameKind.ACTIVE, active_handler),
+                ),
+            )
             current = incoming.get(successor_key)
             predecessor = block_name(key)
             merged = _merge_low_level_incoming(
                 current,
-                outgoing,
+                exact_exception_state,
                 predecessor,
                 profile,
                 instructions[successor],
                 current_predecessors=incoming_predecessors.get(successor_key, ()),
             )
-            if merged is not None:
+            if merged is None:
+                _append_control_diagnostic(
+                    issues,
+                    f"cannot merge exceptional state from "
+                    f"{profile.offset(instructions[start])} into handler "
+                    f"{profile.offset(instructions[successor])}",
+                    start,
+                )
+                _append_control_diagnostic(
+                    issues,
+                    f"exceptional state merge target is handler "
+                    f"{profile.offset(instructions[successor])}",
+                    successor,
+                )
+            else:
+                exception_edges[key] = (successor_key, exception_source)
                 previous_predecessors = incoming_predecessors.get(successor_key, ())
                 if predecessor not in previous_predecessors:
                     incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
@@ -410,18 +589,43 @@ def lift_stateful_low_level_cfg(
     blocks: list[tuple[str, tuple[Stmt, ...], Terminator | None]] = []
     ordered_keys = sorted(
         lifted_blocks,
-        key=lambda item: (item[0], tuple(profile.offset(instructions[index]) for index in item[1])),
+        key=lambda item: (
+            item[0],
+            tuple(
+                (frame.kind.value, profile.offset(instructions[frame.handler]))
+                for frame in item[1]
+            ),
+        ),
     )
     for key in ordered_keys:
         lifted = lifted_blocks[key]
         blocks.append((block_name(key), tuple(lifted.statements), terminators.get(key)))
     return VMControlCFGResult(
         blocks=tuple(blocks),
-        diagnostics=tuple(diagnostics),
-        exception_targets=tuple(
-            (block_name(source), block_name(target))
-            for source, target in exception_targets.items()
+        issues=tuple(issues),
+        exception_edges=tuple(
+            (
+                block_name(source),
+                VMExceptionalEdge(target=block_name(target), source=edge_source),
+            )
+            for source, (target, edge_source) in exception_edges.items()
             if source in lifted_blocks and target in lifted_blocks
+        ),
+        active_exception_handlers=tuple(
+            (
+                block_name(key),
+                tuple(
+                    f"handler_{profile.offset(instructions[handler])}"
+                    for frame in key[1]
+                    if frame.kind is _HandlerFrameKind.ACTIVE
+                    for handler in (frame.handler,)
+                ),
+            )
+            for key in ordered_keys
+            if any(
+                frame.kind is _HandlerFrameKind.ACTIVE
+                for frame in key[1]
+            )
         ),
         control_provenance=tuple(
             sorted(
@@ -523,6 +727,11 @@ def _cfg_leaders(
     leaders = {0}
     for index, instruction in enumerate(instructions):
         for hint in tuple(getattr(instruction, "hints", ()) or ()):
+            if hint.kind == "exception-edge-state":
+                leaders.add(index)
+                if index + 1 < len(instructions):
+                    leaders.add(index + 1)
+                continue
             if hint.kind == "exception-handler" and hint.target is not None:
                 target_index = _instruction_index_by_offset(
                     instructions, hint.target, profile
@@ -563,34 +772,259 @@ def _apply_exception_handler_hints(
     instructions: tuple[InstructionT, ...],
     start: int,
     end: int,
-    handlers: tuple[int, ...],
+    handler_frames: tuple[_HandlerFrame, ...],
     profile: VMRegionProfile[InstructionT],
-    diagnostics: list[str],
+    issues: list[VMControlDiagnostic],
     consumed_sources: set[SourceRef],
-) -> tuple[int, ...]:
+    max_handler_depth: int,
+) -> tuple[_HandlerFrame, ...]:
     """Apply neutral handler-stack facts along one split low-level block."""
 
-    stack = list(handlers)
+    stack = list(handler_frames)
     for index in range(start, end):
         instruction = instructions[index]
         for hint in tuple(getattr(instruction, "hints", ()) or ()):
-            if hint.kind == "exception-handler" and hint.target is not None:
+            if hint.kind == "exception-handler" and hint.target is None:
+                consumed_sources.add(hint.source)
+                _append_control_diagnostic(
+                    issues,
+                    f"exception handler at {profile.offset(instruction)} has no target",
+                    index,
+                    category="exception-fact",
+                )
+            elif hint.kind == "exception-handler" and hint.target is not None:
                 consumed_sources.add(hint.source)
                 target_index = _instruction_index_by_offset(
                     instructions, hint.target, profile
                 )
                 if target_index is None:
-                    diagnostics.append(
+                    _append_control_diagnostic(
+                        issues,
                         f"exception handler at {profile.offset(instruction)} "
-                        f"points to missing offset {hint.target}"
+                        f"points to missing offset {hint.target}",
+                        index,
+                        category="exception-fact",
                     )
                     continue
-                stack.append(target_index)
+                if len(stack) >= max_handler_depth:
+                    _append_control_diagnostic(
+                        issues,
+                        f"exception handler stack at {profile.offset(instruction)} "
+                        "does not converge",
+                        index,
+                        category="exception-fact",
+                    )
+                    continue
+                stack.append(
+                    _HandlerFrame(_HandlerFrameKind.PROTECTED, target_index)
+                )
             elif hint.kind == "exception-handler-pop":
                 consumed_sources.add(hint.source)
                 if stack:
                     stack.pop()
+                else:
+                    _append_control_diagnostic(
+                        issues,
+                        f"exception handler pop at {profile.offset(instruction)} has no active handler",
+                        index,
+                        category="exception-fact",
+                    )
+            elif hint.kind == "exception-region":
+                if not isinstance(hint.value, dict):
+                    consumed_sources.add(hint.source)
+                    _append_control_diagnostic(
+                        issues,
+                        f"exception region at {profile.offset(instruction)} "
+                        "requires a mapping value",
+                        index,
+                        category="exception-fact",
+                    )
+                else:
+                    _validate_exception_region_hint(
+                        instructions,
+                        index,
+                        hint.value,
+                        profile,
+                        issues,
+                        consumed_sources,
+                        hint.source,
+                    )
     return tuple(stack)
+
+
+def _innermost_protected_handler_position(
+    handler_frames: tuple[_HandlerFrame, ...],
+) -> int | None:
+    for position in range(len(handler_frames) - 1, -1, -1):
+        if handler_frames[position].kind is _HandlerFrameKind.PROTECTED:
+            return position
+    return None
+
+
+def _validate_exception_region_hint(
+    instructions: tuple[InstructionT, ...],
+    index: int,
+    value: dict[object, object],
+    profile: VMRegionProfile[InstructionT],
+    issues: list[VMControlDiagnostic],
+    consumed_sources: set[SourceRef],
+    source: SourceRef,
+) -> None:
+    """Reject malformed protected-region facts instead of ignoring them."""
+
+    consumed_sources.add(source)
+    start, end, target = (value.get(name) for name in ("start", "end", "target"))
+    if not all(isinstance(item, int) for item in (start, end, target)):
+        _append_control_diagnostic(
+            issues,
+            f"exception region at {profile.offset(instructions[index])} "
+            "requires integer start, end, and target offsets",
+            index,
+            category="exception-fact",
+        )
+        return
+    if start >= end:
+        _append_control_diagnostic(
+            issues,
+            f"exception region at {profile.offset(instructions[index])} "
+            f"has invalid exclusive range {start}..{end}",
+            index,
+            category="exception-fact",
+        )
+        return
+    missing = tuple(
+        (name, offset)
+        for name, offset in (("start", start), ("target", target))
+        if _instruction_index_by_offset(instructions, offset, profile) is None
+    )
+    if missing:
+        detail = ", ".join(f"{name} {offset}" for name, offset in missing)
+        _append_control_diagnostic(
+            issues,
+            f"exception region at {profile.offset(instructions[index])} "
+            f"references missing {detail}",
+            index,
+            category="exception-fact",
+        )
+        return
+    instruction_offsets = tuple(
+        offset
+        for instruction in instructions
+        if isinstance((offset := profile.offset(instruction)), int)
+    )
+    if (
+        _instruction_index_by_offset(instructions, end, profile) is None
+        and instruction_offsets
+        and end <= max(instruction_offsets)
+    ):
+        _append_control_diagnostic(
+            issues,
+            f"exception region at {profile.offset(instructions[index])} "
+            f"has non-boundary exclusive end {end}",
+            index,
+            category="exception-fact",
+        )
+
+
+def _exception_edge_state(
+    instructions: tuple[InstructionT, ...],
+    start: int,
+    end: int,
+    incoming: VMLinearState,
+    profile: VMRegionProfile[InstructionT],
+    issues: list[VMControlDiagnostic],
+    consumed_sources: set[SourceRef],
+) -> _ExceptionEdgeState | None:
+    """Build the declared VM state at a potentially-throwing instruction.
+
+    The fact is intentionally narrow: a frontend states how much of the
+    incoming operand stack survives and whether the caught exception is pushed.
+    Core still owns the exceptional CFG edge, handler merge, and generic IR.
+    """
+
+    facts = tuple(
+        (index, hint)
+        for index in range(start, end)
+        for hint in tuple(getattr(instructions[index], "hints", ()) or ())
+        if hint.kind == "exception-edge-state"
+    )
+    if not facts:
+        return None
+    for _index, hint in facts:
+        consumed_sources.add(hint.source)
+    if len(facts) != 1:
+        _append_control_diagnostic(
+            issues,
+            f"block at {profile.offset(instructions[start])} has multiple "
+            "exception edge state facts",
+            start,
+            category="exception-fact",
+        )
+        return None
+    index, hint = facts[0]
+    value = hint.value
+    if not isinstance(value, dict):
+        _append_control_diagnostic(
+            issues,
+            f"exception edge state at {profile.offset(instructions[index])} "
+            "requires a mapping value",
+            index,
+            category="exception-fact",
+        )
+        return None
+    stack_depth = value.get("stack_depth")
+    push_exception = value.get("push_exception", False)
+    if (
+        not isinstance(stack_depth, int)
+        or isinstance(stack_depth, bool)
+        or stack_depth < 0
+        or stack_depth > len(incoming.stack)
+        or not isinstance(push_exception, bool)
+    ):
+        _append_control_diagnostic(
+            issues,
+            f"exception edge state at {profile.offset(instructions[index])} "
+            "requires a valid stack_depth and boolean push_exception",
+            index,
+            category="exception-fact",
+        )
+        return None
+    stack = incoming.stack[:stack_depth]
+    if push_exception:
+        stack = (
+            *stack,
+            CurrentException(source=hint.source),
+        )
+    return _ExceptionEdgeState(
+        state=VMLinearState(locals=incoming.locals.copy(), stack=stack),
+        source=hint.source,
+    )
+
+
+def _exception_source_for_explicit_raise(
+    lifted: VMLinearState,
+    fallback_instruction: InstructionT,
+) -> SourceRef:
+    if lifted.statements:
+        statement = lifted.statements[-1]
+        if isinstance(statement, (Raise, Reraise)) and statement.source is not None:
+            return statement.source
+    source = getattr(fallback_instruction, "source", None)
+    if isinstance(source, SourceRef):
+        return source
+    raise TypeError("VM instructions must provide SourceRef provenance")
+
+
+def _append_control_diagnostic(
+    issues: list[VMControlDiagnostic],
+    message: str,
+    index: int,
+    *,
+    category: Literal["recovery", "exception-fact"] = "recovery",
+) -> None:
+    diagnostic = VMControlDiagnostic(message, index, category)
+    if diagnostic not in issues:
+        issues.append(diagnostic)
 
 
 def _first_terminal_effect_index(
@@ -801,10 +1235,10 @@ def _low_level_successor_state(
         return edge_state
     if not isinstance(terminator.condition.callee, Global) or terminator.condition.callee.name != "iter_has_next":
         return edge_state
-    if len(terminator.condition.args) != 1 or not state.stack:
+    if len(terminator.condition.args) != 1 or not edge_state.stack:
         return edge_state
     iterator = terminator.condition.args[0]
-    if state.stack[-1] != iterator:
+    if edge_state.stack[-1] != iterator:
         return edge_state
     source = SourceRef(frontend=profile.frontend, offset=profile.offset(successor_instruction))
     next_value = Call(
@@ -859,7 +1293,23 @@ def _apply_branch_edge_effects(
 
 
 def _statements_end_with_raise(statements: tuple[Stmt, ...]) -> bool:
-    return bool(statements) and isinstance(statements[-1], Raise)
+    return bool(statements) and isinstance(statements[-1], (Raise, Reraise))
+
+
+def _contains_ir_node(value: object, node_types: tuple[type, ...]) -> bool:
+    """Walk immutable generic IR data without depending on a concrete VM."""
+
+    if isinstance(value, node_types):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_ir_node(item, node_types) for item in value)
+    if not is_dataclass(value) or isinstance(value, SourceRef):
+        return False
+    return any(
+        _contains_ir_node(getattr(value, item.name), node_types)
+        for item in fields(value)
+        if item.name not in {"source", "type"}
+    )
 
 
 def _materialize_cross_block_stack(
@@ -906,20 +1356,19 @@ def _merge_low_level_incoming(
     source = SourceRef(frontend=profile.frontend, offset=profile.offset(instruction))
     locals_ = dict(current.locals)
     changed = False
-    for name, value in incoming.locals.items():
-        if name not in locals_:
-            locals_[name] = value
-            changed = True
-            continue
+    undefined = UndefinedLiteral(source=source)
+    for name in current.locals.keys() | incoming.locals.keys():
+        current_value = current.locals.get(name, undefined)
+        incoming_value = incoming.locals.get(name, undefined)
         merged = _merge_phi_expr(
-            locals_[name],
-            value,
+            current_value,
+            incoming_value,
             predecessor,
             source,
             suffix=name,
             current_predecessors=current_predecessors,
         )
-        if merged != locals_[name]:
+        if name not in locals_ or merged != locals_[name]:
             locals_[name] = merged
             changed = True
     if len(current.stack) != len(incoming.stack):
@@ -1002,6 +1451,8 @@ def _same_logical_expr_seen(left: Expr, right: Expr, seen: set[tuple[int, int]])
         return left.name == right.name
     if isinstance(left, Const) and isinstance(right, Const):
         return left.value == right.value
+    if isinstance(left, UndefinedLiteral) and isinstance(right, UndefinedLiteral):
+        return True
     if isinstance(left, Phi) and isinstance(right, Phi):
         if len(left.incoming) != len(right.incoming):
             return False
