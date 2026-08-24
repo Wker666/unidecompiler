@@ -494,7 +494,15 @@ class _Runner:
                 block = blocks[current]
                 self._event("enter-block", current)
                 try:
-                    self._execute_statements(block.statements, current)
+                    try:
+                        self._execute_statements(block.statements, current)
+                    except _Raised as raised:
+                        if block.exception_target is None:
+                            raise
+                        frame.active_exception = raised
+                        frame.predecessor = current
+                        current = block.exception_target
+                        continue
                 except _ReturnSignal as returned:
                     return returned.values
                 terminator = block.terminator
@@ -787,10 +795,17 @@ class _Runner:
                 values.append(self._eval_expr(expr.value))
             return set(values) if expr.kind == "set" else values
         if isinstance(expr, NewObject):
+            constructor = (
+                expr.type_name
+                if expr.constructor is None
+                else self._eval_expr(expr.constructor)
+            )
             args = tuple(self._eval_expr(arg) for arg in expr.args)
-            result = self._adapter_value("create_object", expr.type_name, args, frame.context)
+            result = self._adapter_value("create_object", constructor, args, frame.context)
             if result is NotHandled:
-                return ObjectValue(expr.type_name)
+                if not isinstance(constructor, str):
+                    self._unsupported("dynamic constructor requires a simulator adapter")
+                return ObjectValue(constructor)
             return result
         if isinstance(expr, GetAttr):
             return self._get_attr(self._eval_expr(expr.obj), expr.attr)
