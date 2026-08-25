@@ -778,6 +778,31 @@ VMHint(kind="exception-handler", source=source, target=handler_offset)
 VMHint(kind="exception-handler-pop", source=source)
 ```
 
+The value-free form remains strict: it pops the innermost handler frame and is
+unsupported when no frame exists. A VM whose one instruction is shared by
+different handler-context CFG clones can select one frame conditionally:
+
+```python
+VMHint(
+    kind="exception-handler-pop",
+    source=source,
+    value={
+        "handler": 90783,          # handler target offset
+        "frame_kind": "active",   # "active", "protected", or "any"
+        "if_present": True,
+    },
+)
+```
+
+The core pops only the matching innermost frame. With `if_present=True`, a
+clone without that exact frame treats the hint as a no-op; it must not become
+unsupported merely because another clone has the frame. A missing target with
+`if_present=False`, a malformed selector, or an attempt to pop through a newer
+frame remains an explicit unsupported diagnostic. Hints on one instruction are
+applied in their submitted order, so a handler entry may first pop its old
+`active` frame and then push a new `protected` handler with
+`exception-handler`.
+
 If an instruction inside that protected scope can throw implicitly, for
 example through a generic `Call`, the frontend must also state the exact
 operand-stack shape at the exceptional edge. Do not make the frontend build a
@@ -793,6 +818,30 @@ VMHint(
     },
 )
 ```
+
+For an instruction shared by CFG clones, scope the fact to the target offset
+of the active or protected handler context that it describes:
+
+```python
+VMHint(
+    kind="exception-edge-state",
+    source=source,
+    value={
+        "stack_depth": 0,
+        "push_exception": False,
+        "handler": 14378,
+    },
+)
+```
+
+The core selects this fact only in a clone whose innermost active or protected
+handler targets `14378`. Clones without that handler ignore this scoped fact
+rather than reporting `has no active handler`. If a clone with a handler
+context has no matching fact for an implicit throw, recovery still reports
+`cannot prove exceptional state`; conflicting matching facts are explicit
+unsupported diagnostics. Only a protected frame can receive a newly created
+exceptional CFG edge. Do not use metadata to carry handler context, and do not
+duplicate the frontend instruction to encode separate paths.
 
 `stack_depth` is the number of values preserved from the bottom of the
 incoming operand stack. `push_exception=True` appends the active exception as
@@ -2765,8 +2814,8 @@ Common field combinations:
 | `materialized-condition` | None | `detail`, `flow` | Condition has been materialized on stack/register |
 | `exception-region` | `value` | `label` | try/protected range |
 | `exception-handler` | `target` | `label` | push a dynamically scoped handler |
-| `exception-handler-pop` | None | `label` | pop the innermost handler scope |
-| `exception-edge-state` | `value` | `label` | exact stack shape at an implicit exceptional edge |
+| `exception-handler-pop` | None | `value`, `label` | strictly pop the innermost handler, or select `handler`, `frame_kind`, and `if_present` |
+| `exception-edge-state` | `value` | `label` | exact stack shape at an implicit exceptional edge; optional `handler` scopes it to one active/protected handler target |
 | `call-shape` | `value` | `label` | Call parameters/return shape |
 | `aggregate-shape` | `value` | `label` | array/map/object shape |
 

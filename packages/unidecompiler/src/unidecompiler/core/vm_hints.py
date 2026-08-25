@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 from unidecompiler.core.ir import SourceRef
 
@@ -24,6 +24,27 @@ VMHintKind = Literal[
 ]
 
 VMControlFlowKind = Literal["conditional", "unconditional", "multiway"]
+VMExceptionHandlerFrameKind = Literal["active", "protected", "any"]
+
+
+class VMExceptionEdgeStateValue(TypedDict, total=False):
+    """Neutral state fact for an implicit exceptional CFG edge.
+
+    ``handler`` scopes the fact to the active or protected handler target
+    offset for one CFG clone. Omitting it retains the legacy, unscoped fact.
+    """
+
+    stack_depth: int
+    push_exception: bool
+    handler: int
+
+
+class VMExceptionHandlerPopValue(TypedDict, total=False):
+    """Optional precise selector for an exception-handler-pop hint."""
+
+    handler: int
+    frame_kind: VMExceptionHandlerFrameKind
+    if_present: bool
 
 
 @dataclass(frozen=True)

@@ -370,8 +370,14 @@ def lift_stateful_low_level_cfg(
                 stopped_at=lifted.stopped_at,
             )
         lifted_blocks[key] = lifted
+        handler_context_position = _innermost_handler_position(handler_frames)
+        handler_context = (
+            handler_frames[handler_context_position].handler
+            if handler_context_position is not None
+            else None
+        )
         protected_position = _innermost_protected_handler_position(handler_frames)
-        active_handler = (
+        protected_handler = (
             handler_frames[protected_position].handler
             if protected_position is not None
             else None
@@ -394,8 +400,13 @@ def lift_stateful_low_level_cfg(
             profile,
             issues,
             consumed_control_sources,
+            handler_offset=(
+                profile.offset(instructions[handler_context])
+                if handler_context is not None
+                else None
+            ),
         )
-        if declared_exception_state is not None and active_handler is None:
+        if declared_exception_state is not None and handler_context is None:
             _append_control_diagnostic(
                 issues,
                 f"exception edge state at {profile.offset(instructions[start])} "
@@ -531,7 +542,7 @@ def lift_stateful_low_level_cfg(
             (lifted.statements, terminator),
             (Call, Raise, Reraise),
         ) and exact_exception_state is None
-        if active_handler is not None and ambiguous_exception:
+        if handler_context is not None and ambiguous_exception:
             _append_control_diagnostic(
                 issues,
                 f"cannot prove exceptional state for block at "
@@ -539,18 +550,18 @@ def lift_stateful_low_level_cfg(
                 start,
             )
         if (
-            active_handler is not None
-            and active_handler in leader_positions
+            protected_handler is not None
+            and protected_handler in leader_positions
             and exact_exception_state is not None
         ):
-            successor = active_handler
+            successor = protected_handler
             assert protected_position is not None
             successor_key = (
                 successor,
-                (
-                    *handler_frames[:protected_position],
-                    _HandlerFrame(_HandlerFrameKind.ACTIVE, active_handler),
-                ),
+                    (
+                        *handler_frames[:protected_position],
+                        _HandlerFrame(_HandlerFrameKind.ACTIVE, protected_handler),
+                    ),
             )
             current = incoming.get(successor_key)
             predecessor = block_name(key)
@@ -820,15 +831,14 @@ def _apply_exception_handler_hints(
                 )
             elif hint.kind == "exception-handler-pop":
                 consumed_sources.add(hint.source)
-                if stack:
-                    stack.pop()
-                else:
-                    _append_control_diagnostic(
-                        issues,
-                        f"exception handler pop at {profile.offset(instruction)} has no active handler",
-                        index,
-                        category="exception-fact",
-                    )
+                _apply_exception_handler_pop_hint(
+                    instructions,
+                    index,
+                    hint.value,
+                    stack,
+                    profile,
+                    issues,
+                )
             elif hint.kind == "exception-region":
                 if not isinstance(hint.value, dict):
                     consumed_sources.add(hint.source)
@@ -852,6 +862,94 @@ def _apply_exception_handler_hints(
     return tuple(stack)
 
 
+def _apply_exception_handler_pop_hint(
+    instructions: tuple[InstructionT, ...],
+    index: int,
+    value: object | None,
+    stack: list[_HandlerFrame],
+    profile: VMRegionProfile[InstructionT],
+    issues: list[VMControlDiagnostic],
+) -> None:
+    """Apply a legacy or precisely scoped handler pop without guessing.
+
+    A legacy hint has no value and pops the innermost frame strictly.  A
+    mapping selects a handler target and frame kind so the same instruction can
+    be reached by CFG clones with different handler context.
+    """
+
+    offset = profile.offset(instructions[index])
+    if value is None:
+        if stack:
+            stack.pop()
+        else:
+            _append_control_diagnostic(
+                issues,
+                f"exception handler pop at {offset} has no active handler",
+                index,
+                category="exception-fact",
+            )
+        return
+    if not isinstance(value, dict):
+        _append_control_diagnostic(
+            issues,
+            f"exception handler pop at {offset} requires a mapping value",
+            index,
+            category="exception-fact",
+        )
+        return
+
+    handler = value.get("handler")
+    frame_kind = value.get("frame_kind", "any")
+    if_present = value.get("if_present", False)
+    if (
+        not isinstance(handler, int)
+        or isinstance(handler, bool)
+        or frame_kind not in {"active", "protected", "any"}
+        or not isinstance(if_present, bool)
+    ):
+        _append_control_diagnostic(
+            issues,
+            f"exception handler pop at {offset} requires integer handler, "
+            "frame_kind active/protected/any, and boolean if_present",
+            index,
+            category="exception-fact",
+        )
+        return
+
+    expected_kind = (
+        None if frame_kind == "any" else _HandlerFrameKind(frame_kind)
+    )
+    position = next(
+        (
+            position
+            for position in range(len(stack) - 1, -1, -1)
+            if profile.offset(instructions[stack[position].handler]) == handler
+            and (expected_kind is None or stack[position].kind is expected_kind)
+        ),
+        None,
+    )
+    if position is None:
+        if not if_present:
+            _append_control_diagnostic(
+                issues,
+                f"exception handler pop at {offset} has no matching "
+                f"{frame_kind} handler {handler}",
+                index,
+                category="exception-fact",
+            )
+        return
+    if position != len(stack) - 1:
+        _append_control_diagnostic(
+            issues,
+            f"exception handler pop at {offset} cannot pop non-innermost "
+            f"{frame_kind} handler {handler}",
+            index,
+            category="exception-fact",
+        )
+        return
+    stack.pop()
+
+
 def _innermost_protected_handler_position(
     handler_frames: tuple[_HandlerFrame, ...],
 ) -> int | None:
@@ -859,6 +957,20 @@ def _innermost_protected_handler_position(
         if handler_frames[position].kind is _HandlerFrameKind.PROTECTED:
             return position
     return None
+
+
+def _innermost_handler_position(
+    handler_frames: tuple[_HandlerFrame, ...],
+) -> int | None:
+    """Return the innermost active or protected handler context.
+
+    A handler-scoped exception-state fact describes the CFG clone in which it
+    is valid, not only the frame that may currently receive a new exceptional
+    edge.  Active frames therefore participate in matching and proof checks;
+    only protected frames can be exceptional-edge targets.
+    """
+
+    return len(handler_frames) - 1 if handler_frames else None
 
 
 def _validate_exception_region_hint(
@@ -934,6 +1046,7 @@ def _exception_edge_state(
     profile: VMRegionProfile[InstructionT],
     issues: list[VMControlDiagnostic],
     consumed_sources: set[SourceRef],
+    handler_offset: int | None,
 ) -> _ExceptionEdgeState | None:
     """Build the declared VM state at a potentially-throwing instruction.
 
@@ -952,43 +1065,72 @@ def _exception_edge_state(
         return None
     for _index, hint in facts:
         consumed_sources.add(hint.source)
-    if len(facts) != 1:
+
+    matching_facts: list[tuple[int, object, dict[object, object]]] = []
+    for index, hint in facts:
+        if not isinstance(hint.value, dict):
+            _append_control_diagnostic(
+                issues,
+                f"exception edge state at {profile.offset(instructions[index])} "
+                "requires a mapping value",
+                index,
+                category="exception-fact",
+            )
+            continue
+        declared_handler = hint.value.get("handler")
+        if declared_handler is not None and (
+            not isinstance(declared_handler, int) or isinstance(declared_handler, bool)
+        ):
+            _append_control_diagnostic(
+                issues,
+                f"exception edge state at {profile.offset(instructions[index])} "
+                "requires integer handler when handler is provided",
+                index,
+                category="exception-fact",
+            )
+            continue
+        if declared_handler is None or declared_handler == handler_offset:
+            matching_facts.append((index, hint, hint.value))
+    if not matching_facts:
+        return None
+
+    validated_facts: list[tuple[int, object, int, bool]] = []
+    for index, hint, value in matching_facts:
+        stack_depth = value.get("stack_depth")
+        push_exception = value.get("push_exception", False)
+        if (
+            not isinstance(stack_depth, int)
+            or isinstance(stack_depth, bool)
+            or stack_depth < 0
+            or stack_depth > len(incoming.stack)
+            or not isinstance(push_exception, bool)
+        ):
+            _append_control_diagnostic(
+                issues,
+                f"exception edge state at {profile.offset(instructions[index])} "
+                "requires a valid stack_depth and boolean push_exception",
+                index,
+                category="exception-fact",
+            )
+            continue
+        validated_facts.append((index, hint, stack_depth, push_exception))
+    if not validated_facts:
+        return None
+
+    fact_shapes = {
+        (stack_depth, push_exception)
+        for _, _, stack_depth, push_exception in validated_facts
+    }
+    if len(fact_shapes) != 1:
         _append_control_diagnostic(
             issues,
-            f"block at {profile.offset(instructions[start])} has multiple "
-            "exception edge state facts",
+            f"block at {profile.offset(instructions[start])} has conflicting "
+            "exception edge state facts for its handler context",
             start,
             category="exception-fact",
         )
         return None
-    index, hint = facts[0]
-    value = hint.value
-    if not isinstance(value, dict):
-        _append_control_diagnostic(
-            issues,
-            f"exception edge state at {profile.offset(instructions[index])} "
-            "requires a mapping value",
-            index,
-            category="exception-fact",
-        )
-        return None
-    stack_depth = value.get("stack_depth")
-    push_exception = value.get("push_exception", False)
-    if (
-        not isinstance(stack_depth, int)
-        or isinstance(stack_depth, bool)
-        or stack_depth < 0
-        or stack_depth > len(incoming.stack)
-        or not isinstance(push_exception, bool)
-    ):
-        _append_control_diagnostic(
-            issues,
-            f"exception edge state at {profile.offset(instructions[index])} "
-            "requires a valid stack_depth and boolean push_exception",
-            index,
-            category="exception-fact",
-        )
-        return None
+    index, hint, stack_depth, push_exception = validated_facts[0]
     stack = incoming.stack[:stack_depth]
     if push_exception:
         stack = (
