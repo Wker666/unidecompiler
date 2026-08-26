@@ -27,6 +27,8 @@ from unidecompiler_simulator import (
 )
 from unidecompiler_simulation_host_python import PythonFileEnvironment
 
+FULL_PSEUDOCODE_CONFIRM_BYTES = 512 * 1024
+
 try:
     from PySide6.QtCore import QObject, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
     from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
@@ -673,6 +675,11 @@ class Workbench(QMainWindow):
         self._artifact_data: dict[str, bytes] = {}
         self._displayed_result_path: str | None = None
         self._displayed_function_id: str | None = None
+        self._pseudocode_view_mode = "overview"
+        self._pseudocode_view_start = 0
+        self._pseudocode_view_end = 0
+        self._pseudocode_view_function_id: str | None = None
+        self._full_pseudocode_confirmed: set[str] = set()
         self._displayed_resource_path: str | None = None
         self._open_document_paths: list[str] = []
         self._closed_document_paths: set[str] = set()
@@ -1325,11 +1332,7 @@ class Workbench(QMainWindow):
             self._focus_source(hit.result, hit.source, hit.function_id)
         if hit.kind == "Pseudocode" and hit.text_start is not None and hit.text_end is not None:
             self.detail_tabs.setCurrentWidget(self.pseudocode)
-            cursor = self.pseudocode.textCursor()
-            cursor.setPosition(hit.text_start)
-            cursor.setPosition(hit.text_end, QTextCursor.MoveMode.KeepAnchor)
-            self.pseudocode.setTextCursor(cursor)
-            self.pseudocode.centerCursor()
+            self._select_full_pseudocode_range(hit.text_start, hit.text_end)
         elif hit.kind == "Bytecode":
             self.detail_tabs.setCurrentWidget(self.analysis_panel)
 
@@ -1468,9 +1471,10 @@ class Workbench(QMainWindow):
         location = f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}"
         result = self._selected_result()
         if result is not None and result.pseudocode is not None:
+            full_position = self._view_to_full_offset(cursor.position())
             mappings = [
                 item for item in result.pseudocode.source_map
-                if item.start <= cursor.position() < item.end and item.source.offset is not None
+                if item.start <= full_position < item.end and item.source.offset is not None
             ]
             if mappings:
                 source = min(mappings, key=lambda item: item.end - item.start).source
@@ -2320,10 +2324,11 @@ class Workbench(QMainWindow):
         result_changed = self._displayed_result_path != result.display_path
         function_changed = result_changed or self._displayed_function_id != function_id
         if result_changed:
-            self.pseudocode.setPlainText("" if result.pseudocode is None else result.pseudocode.text)
             self._populate_ast(result.ast, result)
             self._populate_structure(result)
             self._displayed_result_path = result.display_path
+        if function_id is None:
+            self._show_module_pseudocode(result)
         if function_changed:
             self._populate_bytecode(result, function_id)
             self._populate_references(result, function_id)
@@ -2376,6 +2381,113 @@ class Workbench(QMainWindow):
             return
         self._navigate_to_function(function.id, result)
 
+    def _view_to_full_offset(self, position: int) -> int:
+        if self._pseudocode_view_mode == "function":
+            return self._pseudocode_view_start + position
+        if self._pseudocode_view_mode == "module":
+            return position
+        return -1
+
+    def _full_to_view_offset(self, position: int) -> int | None:
+        if self._pseudocode_view_mode == "function":
+            if not self._pseudocode_view_start <= position <= self._pseudocode_view_end:
+                return None
+            return position - self._pseudocode_view_start
+        return position if self._pseudocode_view_mode == "module" else None
+
+    def _set_pseudocode_view(self, text: str, *, mode: str, start: int = 0, end: int = 0, function_id: str | None = None) -> None:
+        signals_blocked = self.pseudocode.blockSignals(True)
+        self.pseudocode.setUpdatesEnabled(False)
+        try:
+            self.pseudocode.setPlainText(text)
+        finally:
+            self.pseudocode.setUpdatesEnabled(True)
+            self.pseudocode.blockSignals(signals_blocked)
+        self._pseudocode_view_mode = mode
+        self._pseudocode_view_start = start
+        self._pseudocode_view_end = end
+        self._pseudocode_view_function_id = function_id
+
+    def _show_module_pseudocode(self, result: DecompileResult) -> bool:
+        pseudocode = result.pseudocode
+        if pseudocode is None:
+            self._set_pseudocode_view("", mode="module", start=0, end=0)
+            return False
+        size = len(pseudocode.text.encode("utf-8"))
+        if result.display_path not in self._full_pseudocode_confirmed and size > FULL_PSEUDOCODE_CONFIRM_BYTES:
+            answer = QMessageBox.question(
+                self,
+                "Open complete pseudocode",
+                f"This file's pseudocode is {size / 1024:.1f} KiB. Loading it may make browsing and searching less responsive.\n\nOpen it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._set_pseudocode_view(
+                    "// Complete pseudocode was not loaded.\n"
+                    "// Select a function in the tree to browse without loading the whole file.",
+                    mode="unavailable",
+                )
+                self.statusBar().showMessage("Opening complete pseudocode was cancelled")
+                return False
+            self._full_pseudocode_confirmed.add(result.display_path)
+        self._set_pseudocode_view(
+            pseudocode.text,
+            mode="module",
+            start=0,
+            end=len(pseudocode.text),
+        )
+        return True
+
+    def _function_pseudocode_range(self, result: DecompileResult, function_id: str) -> tuple[int, int] | None:
+        pseudocode = result.pseudocode
+        if pseudocode is None:
+            return None
+        ranges = [item for item in pseudocode.source_map if item.function_id == function_id]
+        if not ranges:
+            return None
+        mapping = max(ranges, key=lambda item: (item.end - item.start, -item.start))
+        return mapping.start, mapping.end
+
+    def _show_function_pseudocode(self, result: DecompileResult, function_id: str) -> bool:
+        if (
+            self._displayed_result_path == result.display_path
+            and self._pseudocode_view_mode == "function"
+            and self._pseudocode_view_function_id == function_id
+        ):
+            return True
+        pseudocode = result.pseudocode
+        span = self._function_pseudocode_range(result, function_id)
+        if pseudocode is None or span is None:
+            self.statusBar().showMessage("No associated pseudocode for this function")
+            return False
+        start, end = span
+        self._set_pseudocode_view(
+            pseudocode.text[start:end],
+            mode="function",
+            start=start,
+            end=end,
+            function_id=function_id,
+        )
+        return True
+
+    def _select_full_pseudocode_range(self, start: int, end: int) -> bool:
+        local_start = self._full_to_view_offset(start)
+        local_end = self._full_to_view_offset(end)
+        if local_start is None or local_end is None:
+            self.statusBar().showMessage("Match is outside the currently displayed function; select the result's function to view it")
+            return False
+        cursor = self.pseudocode.textCursor()
+        cursor.setPosition(local_start)
+        cursor.setPosition(local_end, QTextCursor.MoveMode.KeepAnchor)
+        signals_blocked = self.pseudocode.blockSignals(True)
+        try:
+            self.pseudocode.setTextCursor(cursor)
+        finally:
+            self.pseudocode.blockSignals(signals_blocked)
+        self.pseudocode.centerCursor()
+        return True
+
     def _navigate_to_function(self, function_id: str, result: DecompileResult) -> None:
         item = self._find_function_item(function_id)
         if item is None:
@@ -2401,18 +2513,10 @@ class Workbench(QMainWindow):
         return None
 
     def _select_function(self, function_id: str, result: DecompileResult) -> None:
-        if result.pseudocode is None:
-            return
-        mapping = next(
-            (item for item in result.pseudocode.source_map if item.function_id == function_id),
-            None,
-        )
-        if mapping is None:
-            self.statusBar().showMessage("No associated pseudocode")
+        if result.pseudocode is None or not self._show_function_pseudocode(result, function_id):
             return
         cursor = self.pseudocode.textCursor()
-        cursor.setPosition(mapping.start)
-        cursor.setPosition(mapping.end, QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(0)
         self.pseudocode.blockSignals(True)
         try:
             self.pseudocode.setTextCursor(cursor)
@@ -2756,9 +2860,13 @@ class Workbench(QMainWindow):
 
     def _pseudocode_selected(self) -> None:
         result = self._selected_result()
-        if not isinstance(result, DecompileResult) or result.pseudocode is None:
+        if (
+            not isinstance(result, DecompileResult)
+            or result.pseudocode is None
+            or self._pseudocode_view_mode not in {"module", "function"}
+        ):
             return
-        position = self.pseudocode.textCursor().position()
+        position = self._view_to_full_offset(self.pseudocode.textCursor().position())
         candidates = [item for item in result.pseudocode.source_map if item.start <= position < item.end]
         if not candidates:
             self.statusBar().showMessage("No associated bytecode")
@@ -2780,6 +2888,8 @@ class Workbench(QMainWindow):
     ) -> None:
         if source is None or function_id is None:
             self.statusBar().showMessage("No associated bytecode")
+            return
+        if not self._show_function_pseudocode(result, function_id):
             return
         self._populate_bytecode(result, function_id)
         for row in range(self.bytecode.rowCount()):
@@ -2819,15 +2929,7 @@ class Workbench(QMainWindow):
                     ]
             if ranges:
                 mapping = min(ranges, key=lambda item: item.end - item.start)
-                cursor = self.pseudocode.textCursor()
-                cursor.setPosition(mapping.start)
-                cursor.setPosition(mapping.end, QTextCursor.MoveMode.KeepAnchor)
-                self.pseudocode.blockSignals(True)
-                try:
-                    self.pseudocode.setTextCursor(cursor)
-                finally:
-                    self.pseudocode.blockSignals(False)
-                self.pseudocode.centerCursor()
+                self._select_full_pseudocode_range(mapping.start, mapping.end)
         instruction = self._instruction_for_source(result, source, function_id)
         if instruction is not None:
             self.hex_view.highlight_ranges(
