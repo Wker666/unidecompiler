@@ -30,8 +30,8 @@ from unidecompiler_simulation_host_python import PythonFileEnvironment
 FULL_PSEUDOCODE_CONFIRM_BYTES = 512 * 1024
 
 try:
-    from PySide6.QtCore import QObject, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
+    from PySide6.QtCore import QObject, QPointF, QRect, QSize, QRegularExpression, QSettings, QThread, Qt, Signal, Slot
+    from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFontDatabase, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument, QTransform
     from PySide6.QtWidgets import (
         QApplication, QDialog, QFileDialog, QInputDialog, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
         QComboBox, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QProgressBar, QPushButton, QSplitter, QSpinBox, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTabBar, QToolBar, QToolButton, QTreeWidget,
@@ -60,6 +60,12 @@ class LineNumberArea(QWidget):
 
     def paintEvent(self, event) -> None:
         self.editor.paint_line_numbers(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.editor.toggle_fold_at_y(event.position().y()):
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class FindPanel(QFrame):
@@ -679,6 +685,7 @@ class Workbench(QMainWindow):
         self._pseudocode_view_start = 0
         self._pseudocode_view_end = 0
         self._pseudocode_view_function_id: str | None = None
+        self._suppress_pseudocode_selection = False
         self._full_pseudocode_confirmed: set[str] = set()
         self._displayed_resource_path: str | None = None
         self._open_document_paths: list[str] = []
@@ -734,7 +741,9 @@ class Workbench(QMainWindow):
         goto_line = QAction("Go to line", self, shortcut="Ctrl+G", triggered=self.go_to_line)
         zoom_in = QAction("Zoom in", self, shortcut="Ctrl+=", triggered=lambda: self.pseudocode.zoomIn(1))
         zoom_out = QAction("Zoom out", self, shortcut="Ctrl+-", triggered=lambda: self.pseudocode.zoomOut(1))
-        edit_menu.addActions((find, find_all, goto_line, zoom_in, zoom_out))
+        fold_all = QAction("Fold all code blocks", self, shortcut="Ctrl+Shift+[", triggered=lambda: self.pseudocode.fold_all())
+        unfold_all = QAction("Unfold all code blocks", self, shortcut="Ctrl+Shift+]", triggered=lambda: self.pseudocode.unfold_all())
+        edit_menu.addActions((find, find_all, goto_line, zoom_in, zoom_out, fold_all, unfold_all))
         find_all.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
         find_all.setToolTip("Find in all decompiled files")
         navigate_menu = self.menuBar().addMenu("Navigate")
@@ -2375,10 +2384,14 @@ class Workbench(QMainWindow):
         result = self._selected_result()
         if not isinstance(result, DecompileResult):
             return
-        function = next((item for item in result.functions if item.name == name), None)
-        if function is None:
+        matches = [item for item in result.functions if item.name == name]
+        if not matches:
             self.statusBar().showMessage(f"No function named {name}")
             return
+        if len(matches) > 1:
+            self.statusBar().showMessage(f"Ambiguous function name {name}; select the target in the function tree")
+            return
+        function = matches[0]
         self._navigate_to_function(function.id, result)
 
     def _view_to_full_offset(self, position: int) -> int:
@@ -2396,6 +2409,7 @@ class Workbench(QMainWindow):
         return position if self._pseudocode_view_mode == "module" else None
 
     def _set_pseudocode_view(self, text: str, *, mode: str, start: int = 0, end: int = 0, function_id: str | None = None) -> None:
+        self._suppress_pseudocode_selection = True
         signals_blocked = self.pseudocode.blockSignals(True)
         self.pseudocode.setUpdatesEnabled(False)
         try:
@@ -2403,10 +2417,12 @@ class Workbench(QMainWindow):
         finally:
             self.pseudocode.setUpdatesEnabled(True)
             self.pseudocode.blockSignals(signals_blocked)
+        self.pseudocode._rebuild_fold_ranges()
         self._pseudocode_view_mode = mode
         self._pseudocode_view_start = start
         self._pseudocode_view_end = end
         self._pseudocode_view_function_id = function_id
+        self._suppress_pseudocode_selection = False
 
     def _show_module_pseudocode(self, result: DecompileResult) -> bool:
         pseudocode = result.pseudocode
@@ -2517,11 +2533,13 @@ class Workbench(QMainWindow):
             return
         cursor = self.pseudocode.textCursor()
         cursor.setPosition(0)
+        self._suppress_pseudocode_selection = True
         self.pseudocode.blockSignals(True)
         try:
             self.pseudocode.setTextCursor(cursor)
         finally:
             self.pseudocode.blockSignals(False)
+            self._suppress_pseudocode_selection = False
 
     def _populate_bytecode(self, result: DecompileResult, function_id: str | None) -> None:
         rows = [row for row in result.instructions if function_id is None or row.function_id == function_id]
@@ -2859,6 +2877,8 @@ class Workbench(QMainWindow):
             self.statusBar().showMessage(f"No known target for {reference.name}")
 
     def _pseudocode_selected(self) -> None:
+        if self._suppress_pseudocode_selection:
+            return
         result = self._selected_result()
         if (
             not isinstance(result, DecompileResult)
@@ -2875,7 +2895,12 @@ class Workbench(QMainWindow):
         if mapping.source.offset is None:
             self.statusBar().showMessage("No associated bytecode")
             return
-        self._focus_source(result, mapping.source, mapping.function_id)
+        selected = self.input_tree.currentItem()
+        selected_data = None if selected is None else selected.data(0, Qt.ItemDataRole.UserRole)
+        selected_function_id = selected_data[1] if isinstance(selected_data, tuple) else None
+        if isinstance(selected_data, tuple) and selected_function_id != mapping.function_id:
+            return
+        self._focus_source(result, mapping.source, mapping.function_id, switch_to_function=False)
 
     def _focus_source(
         self,
@@ -2885,11 +2910,12 @@ class Workbench(QMainWindow):
         *,
         select_ast: bool = True,
         select_structure: bool = True,
+        switch_to_function: bool = False,
     ) -> None:
         if source is None or function_id is None:
             self.statusBar().showMessage("No associated bytecode")
             return
-        if not self._show_function_pseudocode(result, function_id):
+        if switch_to_function and not self._show_function_pseudocode(result, function_id):
             return
         self._populate_bytecode(result, function_id)
         for row in range(self.bytecode.rowCount()):
@@ -3140,8 +3166,35 @@ def _same_source(left: object, right: object) -> bool:
     )
 
 
+def _code_braces(text: str) -> tuple[str, ...]:
+    """Return braces outside strings and line comments for folding detection."""
+    braces: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            break
+        if character in {"'", '"'}:
+            quote = character
+        elif character in {"{", "}"}:
+            braces.append(character)
+        index += 1
+    return tuple(braces)
+
+
 class PseudocodeEditor(QPlainTextEdit):
-    """Read-only editor with Ctrl+click navigation for recovered functions."""
+    """Read-only editor with folding and Ctrl+click navigation for functions."""
 
     function_activated = Signal(str)
     resized = Signal()
@@ -3151,9 +3204,12 @@ class PseudocodeEditor(QPlainTextEdit):
         self.setReadOnly(True)
         self.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self._theme_colors: dict[str, str] = {}
+        self._fold_ranges: dict[int, int] = {}
+        self._folded_headers: set[int] = set()
         self.line_number_area = LineNumberArea(self)
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
+        self.textChanged.connect(self._rebuild_fold_ranges)
         self.update_line_number_area_width(0)
 
     def set_theme(self, colors: dict[str, str]) -> None:
@@ -3162,7 +3218,7 @@ class PseudocodeEditor(QPlainTextEdit):
 
     def line_number_area_width(self) -> int:
         digits = len(str(max(1, self.blockCount())))
-        return 10 + self.fontMetrics().horizontalAdvance("9") * digits
+        return 38 + self.fontMetrics().horizontalAdvance("9") * digits
 
     def update_line_number_area_width(self, _count: int) -> None:
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -3191,11 +3247,97 @@ class PseudocodeEditor(QPlainTextEdit):
         painter.setPen(QColor(self._theme_colors["line_number_foreground"]))
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
+                if number in self._fold_ranges:
+                    center_x = 11
+                    center_y = top + self.fontMetrics().height() // 2
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(self._theme_colors.get("status_info", self._theme_colors["line_number_foreground"])))
+                    if number in self._folded_headers:
+                        painter.drawPolygon(QPolygonF([
+                            QPointF(center_x - 3, center_y - 6),
+                            QPointF(center_x + 5, center_y),
+                            QPointF(center_x - 3, center_y + 6),
+                        ]))
+                    else:
+                        painter.drawPolygon(QPolygonF([
+                            QPointF(center_x - 5, center_y - 3),
+                            QPointF(center_x + 5, center_y - 3),
+                            QPointF(center_x, center_y + 5),
+                        ]))
+                    painter.setPen(QColor(self._theme_colors["line_number_foreground"]))
+                painter.setPen(QColor(self._theme_colors["line_number_foreground"]))
                 painter.drawText(0, top, self.line_number_area.width() - 6, self.fontMetrics().height(), Qt.AlignmentFlag.AlignRight, str(number + 1))
             block = block.next()
             top = bottom
             bottom = top + round(self.blockBoundingRect(block).height())
             number += 1
+
+    def _rebuild_fold_ranges(self) -> None:
+        """Recompute brace-delimited code blocks after a new document is loaded."""
+        self._fold_ranges.clear()
+        self._folded_headers.clear()
+        stack: list[int] = []
+        block = self.document().firstBlock()
+        while block.isValid():
+            for character in _code_braces(block.text()):
+                if character == "{":
+                    stack.append(block.blockNumber())
+                elif stack:
+                    start = stack.pop()
+                    end = block.blockNumber()
+                    if end > start + 1:
+                        self._fold_ranges[start] = end
+            block = block.next()
+        self.line_number_area.update()
+
+    def _apply_folding(self) -> None:
+        block = self.document().firstBlock()
+        while block.isValid():
+            block.setVisible(True)
+            block.setLineCount(1)
+            block = block.next()
+        for start in sorted(self._folded_headers):
+            end = self._fold_ranges.get(start)
+            if end is None:
+                continue
+            block = self.document().findBlockByNumber(start + 1)
+            while block.isValid() and block.blockNumber() <= end:
+                block.setVisible(False)
+                block.setLineCount(0)
+                block = block.next()
+        self.document().adjustSize()
+        self.viewport().update()
+        self.line_number_area.update()
+
+    def toggle_fold_at_y(self, y: float) -> bool:
+        """Toggle the fold marker whose row contains *y* in the gutter."""
+        block = self.firstVisibleBlock()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        gutter_top = self.line_number_area.geometry().top()
+        y += gutter_top
+        while block.isValid():
+            height = self.blockBoundingRect(block).height()
+            if top <= y < top + height:
+                number = block.blockNumber()
+                if number not in self._fold_ranges:
+                    return False
+                if number in self._folded_headers:
+                    self._folded_headers.remove(number)
+                else:
+                    self._folded_headers.add(number)
+                self._apply_folding()
+                return True
+            top += height
+            block = block.next()
+        return False
+
+    def fold_all(self) -> None:
+        self._folded_headers = set(self._fold_ranges)
+        self._apply_folding()
+
+    def unfold_all(self) -> None:
+        self._folded_headers.clear()
+        self._apply_folding()
 
     def mousePressEvent(self, event) -> None:
         if (
