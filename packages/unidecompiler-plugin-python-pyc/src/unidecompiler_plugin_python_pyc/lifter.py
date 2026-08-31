@@ -32,11 +32,13 @@ from unidecompiler.core.effects import (
     Iterate,
     MakeFunctionValue,
     MergeMap,
+    OfferImplicitCallArguments,
     Pop,
     Push,
     RaiseTop,
     RaiseWithCause,
     ReraiseTop,
+    ResumeValue,
     ReturnTop,
     ReturnVoid,
     StoreAttr,
@@ -55,7 +57,6 @@ from unidecompiler.core.effects import (
 )
 from unidecompiler.core.vm_module import assemble_vm_module
 from unidecompiler.core.ir import (
-    Assign,
     BinaryOp,
     CapturedVar,
     Const,
@@ -83,14 +84,12 @@ from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import (
     VMLinearState,
     VMRegionCallbacks,
+    VMRegionSlice,
     VMRegionOpcodeClasses,
     VMRegionProfile,
     VMStatefulCallbacks,
     build_hint_region_profile,
     lift_control_region as lift_vm_control_region,
-)
-from unidecompiler.core.vm_structures import (
-    vm_unsupported,
 )
 from unidecompiler_plugin_python_pyc.pyc import PycCodeObject, PycExceptionRegion, PycModule
 
@@ -122,7 +121,6 @@ BINARY_SYMBOLS = {
 COMPLEX_OPS = {
 }
 IGNORED_OPS = {
-    "RESUME",
     "CACHE",
     "NOP",
     "EXTENDED_ARG",
@@ -130,7 +128,7 @@ IGNORED_OPS = {
     "COPY_FREE_VARS",
 }
 PYTHON_REGION_OPCODE_CLASSES = VMRegionOpcodeClasses(
-    noise=frozenset({"END_FOR", "POP_TOP", "NOP", "RESUME"}),
+    noise=frozenset({"END_FOR", "POP_TOP", "NOP"}),
     control=frozenset(
         {
             "POP_JUMP_IF_FALSE",
@@ -283,7 +281,10 @@ def _build_set(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
 
 
 def _get_iter(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (Iterate(source=source),)
+    return (
+        Iterate(source=source),
+        OfferImplicitCallArguments(source=source, max_explicit_arg_count=0),
+    )
 
 
 def _unpack_sequence(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -360,7 +361,10 @@ def _binary_slice(_context, _instruction, source: SourceRef) -> tuple[Effect, ..
 
 
 def _store_slice(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (StoreItemEffect(source=source),)
+    return (
+        BuildCall(source=source, arg_count=2, callee=Global(name="slice", source=source)),
+        StoreItemEffect(source=source, order="value-obj-key"),
+    )
 
 
 def _list_extend(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -443,8 +447,8 @@ def _map_add(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     return (StoreItemAtDepth(source=source, depth=_instruction_count(instruction)),)
 
 
-def _set_add(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (SetAdd(source=source),)
+def _set_add(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    return (SetAdd(source=source, depth=_instruction_count(instruction)),)
 
 
 def _store_local(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -482,6 +486,13 @@ def _yield_value(_context, instruction, source: SourceRef) -> tuple[Effect, ...]
     if instruction.arg in {1, 2}:
         return ()
     return (YieldTop(source=source, default=Const(value=None, source=source)),)
+
+
+def _resume(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    # CPython's resume mode 5 continues a ``yield`` expression, whose value
+    # is supplied by the caller.  Await/send modes manage their result in the
+    # surrounding protocol and must not manufacture an extra stack value.
+    return (ResumeValue(source=source),) if _instruction_count(instruction) == 5 else ()
 
 
 def _send(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -605,6 +616,7 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
         "BUILD_TUPLE": _build_tuple,
         "BUILD_SET": _build_set,
         "SET_ADD": _set_add,
+        "RESUME": _resume,
         "GET_ITER": _get_iter,
         "GET_YIELD_FROM_ITER": _get_iter,
         "UNPACK_SEQUENCE": _unpack_sequence,
@@ -684,8 +696,8 @@ def lift_code_object(code: PycCodeObject) -> FunctionIR:
         _python_function_spec(code),
         steps,
         profile=_python_region_profile(steps, instructions),
-        callbacks=_python_region_callbacks(code, instructions),
-        stateful_callbacks=_python_stateful_callbacks(code, instructions),
+        callbacks_factory=lambda normalized_steps: _python_region_callbacks(code, normalized_steps),
+        stateful_callbacks_factory=lambda normalized_steps: _python_stateful_callbacks(code, normalized_steps),
         initial_locals=_python_initial_locals(code),
         raw_window=lambda index: _raw_instruction_window(instructions, index),
     )
@@ -884,21 +896,40 @@ def _python_initial_locals(code: PycCodeObject) -> dict[str, Expr]:
 
 def _python_region_callbacks(
     code: PycCodeObject,
-    instructions: tuple[object, ...],
+    prepared_steps: tuple[VMBytecodeStep, ...],
 ) -> VMRegionCallbacks[VMBytecodeStep]:
+    def lift_slice(slice_start, slice_end, stack):
+        slice_steps = prepared_steps[slice_start:slice_end]
+        result = lift_steps(
+            slice_steps,
+            initial_locals=_python_initial_locals(code),
+            initial_stack=stack,
+        )
+        if result.state.diagnostics:
+            return VMRegionSlice(stopped_at=slice_start)
+        output: list[object] = list(result.state.statements)
+        if result.stopped_at is not None and result.state.terminator is None:
+            return VMRegionSlice(
+                statements=tuple(output),
+                stopped_at=slice_start + slice_steps.index(result.stopped_at),
+            )
+        if result.state.terminator is not None:
+            output.append(result.state.terminator)
+        return VMRegionSlice(statements=tuple(output))
+
+    def lift_expr(slice_start, slice_end, stack):
+        result = lift_steps(
+            prepared_steps[slice_start:slice_end],
+            initial_locals=_python_initial_locals(code),
+            initial_stack=stack,
+        )
+        if result.state.diagnostics or not result.state.stack:
+            return None
+        return result.state.stack[-1]
+
     return VMRegionCallbacks(
-        lift_slice=lambda slice_start, slice_end, stack: _lift_instruction_slice(
-            code,
-            instructions[slice_start:slice_end],
-            [],
-            stack,
-        ),
-        lift_expr=lambda slice_start, slice_end, stack: _lift_stack_expr(
-            code,
-            instructions[slice_start:slice_end],
-            [],
-            stack,
-        ),
+        lift_slice=lift_slice,
+        lift_expr=lift_expr,
         lift_iter_loop=lambda _get_iter_index, _iterable: None,
         lift_async_iter_loop=lambda _prefix_start, _get_aiter_index, _region_end: None,
         lift_comprehension=lambda _prefix_start, _get_iter_index, _region_end, _iterable: None,
@@ -907,42 +938,35 @@ def _python_region_callbacks(
 
 def _python_stateful_callbacks(
     code: PycCodeObject,
-    instructions: tuple[object, ...],
+    prepared_steps: tuple[VMBytecodeStep, ...],
 ) -> VMStatefulCallbacks[VMBytecodeStep]:
+    def lift_linear(start, end, locals_, stack):
+        slice_steps = prepared_steps[start:end]
+        result = lift_steps(
+            slice_steps,
+            initial_locals=locals_,
+            initial_stack=stack,
+        )
+        stopped_at_terminal_end = (
+            result.stopped_at is slice_steps[-1]
+            if slice_steps and result.state.terminator is not None
+            else False
+        )
+        if result.state.diagnostics or (
+            result.stopped_at is not None and not stopped_at_terminal_end
+        ):
+            return None
+        return VMLinearState(
+            locals=result.state.locals,
+            stack=tuple(result.state.stack),
+            statements=tuple(result.state.statements),
+            terminator=result.state.terminator,
+        )
+
     return VMStatefulCallbacks(
         initial_locals=lambda: _python_initial_locals(code),
-        lift_linear=lambda start, end, locals, stack: _python_linear_state(
-            instructions[start:end],
-            locals,
-            stack,
-        ),
+        lift_linear=lift_linear,
         branch_condition=_python_branch_condition,
-    )
-
-
-def _python_linear_state(
-    instructions: tuple[object, ...],
-    initial_locals: dict[str, Expr],
-    initial_stack: tuple[Expr, ...],
-) -> VMLinearState | None:
-    result = _run_python_stack_slice(
-        _PycLinearLocals(tuple(initial_locals)),
-        instructions,
-        dict(initial_locals),
-        initial_stack,
-    )
-    stopped_at_terminal_end = (
-        getattr(result.stopped_at, "source", None) == _python_source(instructions[-1])
-        if instructions and result.state.terminator is not None
-        else False
-    )
-    if result.state.diagnostics or (result.stopped_at is not None and not stopped_at_terminal_end):
-        return None
-    return VMLinearState(
-        locals=result.state.locals,
-        stack=tuple(result.state.stack),
-        statements=tuple(result.state.statements),
-        terminator=result.state.terminator,
     )
 
 
@@ -960,11 +984,6 @@ def _python_branch_condition(branch: VMBytecodeStep, stack: tuple[Expr, ...]) ->
     if branch.opcode == "POP_JUMP_IF_NOT_NONE":
         return BinaryOp(source=source, op="==", left=condition, right=Const(value=None, source=source))
     return condition
-
-
-class _PycLinearLocals:
-    def __init__(self, varnames: tuple[str, ...]) -> None:
-        self.varnames = varnames
 
 
 def _python_region_profile(
@@ -997,70 +1016,6 @@ def _await_region_end(instructions: tuple[object, ...], start: int, end: int) ->
             cursor += 1
         return cursor
     return None
-
-
-def _lift_instruction_slice(
-    code: PycCodeObject,
-    instructions: tuple[object, ...],
-    assignments: list[Assign],
-    preloaded_stack: tuple[Expr, ...] = (),
-) -> tuple[object, ...]:
-    if not instructions:
-        return ()
-    initial_locals = {
-        name: Var(name=name, source=SourceRef(frontend="python-pyc", detail=f"local:{name}"))
-        for name in code.varnames
-    }
-    for assignment in assignments:
-        initial_locals[assignment.target.name] = assignment.target
-    result = _run_python_stack_slice(code, instructions, initial_locals, preloaded_stack)
-    if result.state.diagnostics:
-        return ()
-    output: list[object] = list(result.state.statements)
-    if result.stopped_at is not None and result.state.terminator is None:
-        try:
-            stopped_index = instructions.index(result.stopped_at)
-        except ValueError:
-            stopped_index = 0
-        output.append(
-            vm_unsupported(
-                source=result.stopped_at.source,
-                message="unsupported region",
-                detail=f"stopped at {result.stopped_at.opcode}",
-                raw=(result.stopped_at.raw,) if result.stopped_at.raw else _raw_instruction_window(instructions, stopped_index),
-            )
-        )
-    if result.state.terminator is not None:
-        output.append(result.state.terminator)
-    return tuple(output)
-
-
-def _lift_stack_expr(
-    code: PycCodeObject,
-    instructions: tuple[object, ...],
-    assignments: list[Assign],
-    preloaded_stack: tuple[Expr, ...] = (),
-) -> Expr | None:
-    initial_locals = {
-        name: Var(name=name, source=SourceRef(frontend="python-pyc", detail=f"local:{name}"))
-        for name in code.varnames
-    }
-    for assignment in assignments:
-        initial_locals[assignment.target.name] = assignment.target
-    result = _run_python_stack_slice(code, instructions, initial_locals, preloaded_stack)
-    if result.state.diagnostics or not result.state.stack:
-        return None
-    return result.state.stack[-1]
-
-
-def _run_python_stack_slice(
-    code: PycCodeObject,
-    instructions: tuple[object, ...],
-    initial_locals: dict[str, Expr],
-    initial_stack: tuple[Expr, ...] = (),
-):
-    steps = _python_bytecode_steps(instructions)
-    return lift_steps(steps, initial_locals=initial_locals, initial_stack=initial_stack)
 
 
 def _instruction_count(instruction) -> int:

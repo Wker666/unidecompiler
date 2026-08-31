@@ -22,6 +22,7 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    ResumeInput,
     UndefinedLiteral,
     Continue,
     Expr,
@@ -772,6 +773,8 @@ class _Runner:
                     "current exception used outside an active exception handler"
                 )
             return frame.active_exception.value
+        if isinstance(expr, ResumeInput):
+            self._unsupported("generator resume input requires an explicit resumption request")
         if isinstance(expr, Global):
             result = self._adapter_value("resolve_global", expr.name, frame.context)
             if result is NotHandled:

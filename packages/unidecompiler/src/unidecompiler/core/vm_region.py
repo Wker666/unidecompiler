@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from typing import Callable, Generic, Literal, TypeVar
 
@@ -147,7 +147,7 @@ class VMRegionCallbacks(Generic[InstructionT]):
     VM stack details that are required to lift a linear slice.
     """
 
-    lift_slice: Callable[[int, int, tuple[Expr, ...]], tuple[Stmt, ...]]
+    lift_slice: Callable[[int, int, tuple[Expr, ...]], "VMRegionSlice | tuple[Stmt, ...]"]
     lift_expr: Callable[[int, int, tuple[Expr, ...]], Expr | None]
     lift_iter_loop: Callable[[int, Expr | None], tuple[ForEach, int] | None]
     lift_async_iter_loop: Callable[[int, int, int], tuple[tuple[Stmt, ...], ForEach, int] | None]
@@ -157,6 +157,18 @@ class VMRegionCallbacks(Generic[InstructionT]):
     capture_pattern_condition: Callable[[int, int, tuple[Expr, ...]], tuple[tuple[Stmt, ...], Expr] | None] = (
         lambda _start, _end, _stack: None
     )
+
+
+@dataclass(frozen=True)
+class VMRegionSlice:
+    """Result of a frontend-provided linear thin-IR evaluation.
+
+    The frontend reports only linear statements and a possible stopped index.
+    Core owns conversion of a stopped slice into structured unsupported IR.
+    """
+
+    statements: tuple[Stmt, ...] = ()
+    stopped_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -468,7 +480,15 @@ def lift_stateful_low_level_cfg(
             terminator, contextual_names, sorted_leaders, position
         )
         if successors:
+            pre_materialization_stack = outgoing.stack
             outgoing = _materialize_cross_block_stack(outgoing, profile, instructions[start])
+            if iterator_branch:
+                terminator = _retarget_iterator_branch_to_materialized_stack_slot(
+                    terminator,
+                    pre_materialization_stack,
+                    outgoing.stack,
+                )
+                terminators[key] = terminator
             lifted_blocks[key] = outgoing
         for successor in successors:
             successor_key: StateKey = (
@@ -1373,13 +1393,12 @@ def _low_level_successor_state(
     )
     if target_name != terminator.true_target:
         return edge_state
-    if not isinstance(terminator.condition, Call):
+    condition = _iterator_probe_condition(terminator)
+    if condition is None:
         return edge_state
-    if not isinstance(terminator.condition.callee, Global) or terminator.condition.callee.name != "iter_has_next":
+    if not edge_state.stack:
         return edge_state
-    if len(terminator.condition.args) != 1 or not edge_state.stack:
-        return edge_state
-    iterator = terminator.condition.args[0]
+    iterator = condition.args[0]
     if edge_state.stack[-1] != iterator:
         return edge_state
     source = SourceRef(frontend=profile.frontend, offset=profile.offset(successor_instruction))
@@ -1394,6 +1413,45 @@ def _low_level_successor_state(
         statements=edge_state.statements,
         terminator=edge_state.terminator,
         stopped_at=edge_state.stopped_at,
+    )
+
+
+def _iterator_probe_condition(terminator: Terminator | None) -> Call | None:
+    if not isinstance(terminator, Branch):
+        return None
+    condition = terminator.condition
+    if not isinstance(condition, Call):
+        return None
+    if not isinstance(condition.callee, Global) or condition.callee.name != "iter_has_next":
+        return None
+    if len(condition.args) != 1:
+        return None
+    return condition
+
+
+def _retarget_iterator_branch_to_materialized_stack_slot(
+    terminator: Terminator | None,
+    pre_materialization_stack: tuple[Expr, ...],
+    materialized_stack: tuple[Expr, ...],
+) -> Terminator | None:
+    """Retain a proven iterator stack identity across materialization."""
+
+    condition = _iterator_probe_condition(terminator)
+    if condition is None:
+        return terminator
+    if len(pre_materialization_stack) != len(materialized_stack):
+        return terminator
+    if not pre_materialization_stack:
+        return terminator
+    iterator = condition.args[0]
+    if pre_materialization_stack[-1] != iterator:
+        return terminator
+    materialized_iterator = materialized_stack[-1]
+    if iterator == materialized_iterator:
+        return terminator
+    return replace(
+        terminator,
+        condition=replace(condition, args=(materialized_iterator,)),
     )
 
 
@@ -1672,20 +1730,20 @@ def lift_control_region(
                 statements.extend(statement for statement in await_state.statements if not isinstance(statement, Unsupported))
                 initial_stack = await_state.stack
             else:
-                statements.extend(callbacks.lift_slice(cursor, await_end, initial_stack))
+                statements.extend(_lift_region_slice(instructions, cursor, await_end, profile, callbacks, initial_stack))
             if _contains_terminator_statement(statements):
                 break
             cursor = await_end
             continue
         next_control = _next_region_control(instructions, cursor, end, profile)
         if next_control is None:
-            statements.extend(callbacks.lift_slice(cursor, end, initial_stack))
+            statements.extend(_lift_region_slice(instructions, cursor, end, profile, callbacks, initial_stack))
             break
         instruction = instructions[next_control]
         source = SourceRef(frontend=profile.frontend, offset=profile.offset(instruction))
 
         if profile.is_jump(instruction):
-            statements.extend(_supported_slice(callbacks.lift_slice(cursor, next_control, initial_stack)))
+            statements.extend(_supported_slice(_lift_region_slice(instructions, cursor, next_control, profile, callbacks, initial_stack)))
             if _contains_terminator_statement(statements):
                 break
             if profile.is_forward_jump(instruction) and _jump_target_outside_region(
@@ -1733,7 +1791,7 @@ def lift_control_region(
                 continue
             loop_result = callbacks.lift_iter_loop(next_control, iterable)
             if loop_result is not None:
-                prefix = callbacks.lift_slice(cursor, next_control, initial_stack)
+                prefix = _lift_region_slice(instructions, cursor, next_control, profile, callbacks, initial_stack)
                 loop, exit_index = loop_result
                 statements.extend(statement for statement in prefix if not isinstance(statement, Unsupported))
                 statements.append(loop)
@@ -1749,7 +1807,7 @@ def lift_control_region(
                 break_boundary,
             )
             if generic_loop is not None:
-                prefix = callbacks.lift_slice(cursor, next_control, initial_stack)
+                prefix = _lift_region_slice(instructions, cursor, next_control, profile, callbacks, initial_stack)
                 loop, exit_index = generic_loop
                 statements.extend(statement for statement in prefix if not isinstance(statement, Unsupported))
                 statements.append(loop)
@@ -1757,7 +1815,7 @@ def lift_control_region(
                     break
                 cursor = exit_index + 1
                 continue
-            linear_slice = _supported_slice(callbacks.lift_slice(cursor, next_control + 1, initial_stack))
+            linear_slice = _supported_slice(_lift_region_slice(instructions, cursor, next_control + 1, profile, callbacks, initial_stack))
             if linear_slice:
                 statements.extend(linear_slice)
                 if _contains_terminator_statement(statements):
@@ -1791,7 +1849,7 @@ def lift_control_region(
                 continue
 
         if not profile.is_conditional_jump(instruction):
-            linear_slice = _supported_slice(callbacks.lift_slice(cursor, next_control, initial_stack))
+            linear_slice = _supported_slice(_lift_region_slice(instructions, cursor, next_control, profile, callbacks, initial_stack))
             if linear_slice:
                 statements.extend(linear_slice)
                 if _contains_terminator_statement(statements):
@@ -1819,7 +1877,7 @@ def lift_control_region(
         linear_prefix = (
             prefix_state.statements
             if prefix_state is not None
-            else callbacks.lift_slice(cursor, next_control, initial_stack)
+            else _lift_region_slice(instructions, cursor, next_control, profile, callbacks, initial_stack)
         )
         condition = prefix_state.stack[-1] if prefix_state is not None and prefix_state.stack else None
         body_initial_stack = prefix_state.stack[:-1] if prefix_state is not None and prefix_state.stack else initial_stack
@@ -2037,6 +2095,34 @@ def _single_unconditional_forward_jump_target(
 
 def _supported_slice(statements: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
     return tuple(statement for statement in statements if not isinstance(statement, Unsupported))
+
+
+def _lift_region_slice(
+    instructions: tuple[InstructionT, ...],
+    start: int,
+    end: int,
+    profile: VMRegionProfile[InstructionT],
+    callbacks: VMRegionCallbacks[InstructionT],
+    initial_stack: tuple[Expr, ...],
+) -> tuple[Stmt, ...]:
+    result = callbacks.lift_slice(start, end, initial_stack)
+    if not isinstance(result, VMRegionSlice):
+        return result
+    if result.stopped_at is None:
+        return result.statements
+    stopped_at = result.stopped_at
+    if stopped_at < start or stopped_at >= end:
+        stopped_at = start
+    instruction = instructions[stopped_at]
+    return (
+        *result.statements,
+        Unsupported(
+            source=SourceRef(frontend=profile.frontend, offset=profile.offset(instruction)),
+            message="unsupported region",
+            detail=f"stopped at {_opcode_name(instruction)}",
+            raw=profile.raw_window(stopped_at),
+        ),
+    )
 
 
 def _lift_branch_stack_value(
@@ -2365,7 +2451,9 @@ def _lift_generic_collection_projection(
     )
     prefix = tuple(
         statement
-        for statement in callbacks.lift_slice(prefix_start, iter_start_index, initial_stack)
+        for statement in _lift_region_slice(
+            instructions, prefix_start, iter_start_index, profile, callbacks, initial_stack
+        )
         if not isinstance(statement, Unsupported)
     )
     preserved_names = _loaded_local_names(instructions, iter_start_index + 1, accumulator_index)
@@ -2563,7 +2651,9 @@ def _lift_generic_async_iter_loop(
     )
     prefix = tuple(
         statement
-        for statement in callbacks.lift_slice(prefix_start, async_iter_index, initial_stack)
+        for statement in _lift_region_slice(
+            instructions, prefix_start, async_iter_index, profile, callbacks, initial_stack
+        )
         if not isinstance(statement, Unsupported)
     )
     return (

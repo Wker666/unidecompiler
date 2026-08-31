@@ -22,6 +22,7 @@ from unidecompiler.core.ir import (
     MapLiteral,
     NewObject,
     Placeholder,
+    ResumeInput,
     SetLiteral,
     UnaryOp,
     SourceRef,
@@ -242,7 +243,9 @@ class BuildSet(Effect):
 
 @dataclass(frozen=True)
 class SetAdd(Effect):
-    pass
+    """Add the top value to a set held below it on the operand stack."""
+
+    depth: int = 1
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,7 @@ class Swap(Effect):
 @dataclass(frozen=True)
 class Invoke(Effect):
     arg_count: int = 0
+    implicit_arg_count: int = 0
     receiver: Expr | None = None
     returns: int | Literal["unknown"] = 1
 
@@ -328,6 +332,7 @@ class Invoke(Effect):
 @dataclass(frozen=True)
 class InvokeKw(Effect):
     arg_count: int = 0
+    implicit_arg_count: int = 0
     receiver: Expr | None = None
     returns: int | Literal["unknown"] = 1
 
@@ -377,6 +382,21 @@ class CallStackArgs(Effect):
     callee_name: str = ""
     arg_count: int = 0
     returns: int | Literal["unknown"] = 1
+
+
+@dataclass(frozen=True)
+class OfferImplicitCallArguments(Effect):
+    """Offer top stack values to an immediately following stack invocation.
+
+    Some VMs carry call arguments in a protocol slot that is not included in
+    the invocation opcode's explicit operand count.  The frontend may expose
+    that stack fact without naming its opcode or deciding how the call is
+    recovered; core consumes the offer only when the next thin step is a
+    compatible generic invocation.
+    """
+
+    count: int = 1
+    max_explicit_arg_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -455,6 +475,13 @@ class ExceptionMatch(Effect):
 @dataclass(frozen=True)
 class YieldTop(Effect):
     default: Expr | None = None
+
+
+@dataclass(frozen=True)
+class ResumeValue(Effect):
+    """Push the value supplied when a suspended computation resumes."""
+
+    pass
 
 
 def apply_effect(state: StackMachineState, effect: Effect) -> bool:
@@ -809,16 +836,35 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         state.push(SetLiteral(source=effect.source, items=items))
         return True
     if isinstance(effect, SetAdd):
+        if effect.depth <= 0 or effect.depth >= len(state.stack):
+            state.diagnostics.append(f"invalid-set-add-depth:{effect.depth}")
+            return False
         value = state.pop()
         if value is None:
             return False
-        target = state.pop()
-        if target is None:
-            return False
+        target_index = len(state.stack) - effect.depth
+        target = state.stack[target_index]
         if isinstance(target, SetLiteral):
-            state.push(SetLiteral(source=effect.source, items=(*target.items, value)))
+            state.stack[target_index] = SetLiteral(
+                source=target.source or effect.source,
+                items=(*target.items, value),
+            )
         else:
-            state.push(target)
+            state.append_statement(
+                ExprStmt(
+                    source=effect.source,
+                    value=Call(
+                        source=effect.source,
+                        callee=GetAttr(
+                            source=effect.source,
+                            obj=target,
+                            attr="add",
+                        ),
+                        args=(value,),
+                        returns=0,
+                    ),
+                )
+            )
         return True
     if isinstance(effect, Iterate):
         value = state.pop()
@@ -995,13 +1041,13 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         state.stack[-1], state.stack[-effect.depth] = state.stack[-effect.depth], state.stack[-1]
         return True
     if isinstance(effect, Invoke):
-        args = state.pop_many(effect.arg_count)
+        args = state.pop_many(effect.arg_count + effect.implicit_arg_count)
         if args is None:
             return False
         callee = effect.receiver or state.pop()
         if callee is None:
             return False
-        if effect.arg_count == 0 and _looks_like_function_value(callee) and state.stack:
+        if effect.arg_count + effect.implicit_arg_count == 0 and _looks_like_function_value(callee) and state.stack:
             decorator = state.pop()
             if decorator is not None and _looks_like_callable_value(decorator):
                 call = Call(source=effect.source, callee=decorator, args=(callee,), returns=effect.returns)
@@ -1022,7 +1068,7 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         key_tuple = state.pop()
         if key_tuple is None:
             return False
-        args = state.pop_many(effect.arg_count)
+        args = state.pop_many(effect.arg_count + effect.implicit_arg_count)
         if args is None:
             return False
         callee = effect.receiver or state.pop()
@@ -1174,6 +1220,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         else:
             state.push(call)
         return True
+    if isinstance(effect, OfferImplicitCallArguments):
+        if effect.count < 0:
+            state.diagnostics.append(f"invalid-implicit-call-argument-count:{effect.count}")
+            return False
+        return True
     if isinstance(effect, MakeFunctionValue):
         fn = state.pop()
         if fn is None:
@@ -1285,6 +1336,9 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         from unidecompiler.core.ir import Yield
 
         state.append_statement(Yield(source=effect.source, value=value))
+        return True
+    if isinstance(effect, ResumeValue):
+        state.push(ResumeInput(source=effect.source))
         return True
     state.diagnostics.append(f"unknown-effect:{type(effect).__name__}")
     return False

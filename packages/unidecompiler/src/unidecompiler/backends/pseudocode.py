@@ -15,6 +15,7 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    ResumeInputExpr,
     UndefinedLiteralExpr,
     ExprStmt,
     ForEachStmt,
@@ -534,6 +535,8 @@ def _source_spans(lines: list[str]) -> tuple[dict, ...]:
 def _emit_expr(expr: AstExpr) -> str:
     if isinstance(expr, CurrentExceptionRef):
         return "current_exception"
+    if isinstance(expr, ResumeInputExpr):
+        return "resume_input()"
     if isinstance(expr, GlobalRef):
         return expr.name
     if isinstance(expr, CapturedVarRef):
@@ -901,7 +904,7 @@ def _should_inline_assignment(
 
 
 def _is_safe_inline_expr(expr: AstExpr) -> bool:
-    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr, CurrentExceptionRef)):
+    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr, CurrentExceptionRef, ResumeInputExpr)):
         return True
     if isinstance(expr, UnaryExpr):
         return _is_safe_inline_expr(expr.value)

@@ -119,6 +119,13 @@ class Placeholder(Expr):
 
 
 @dataclass(frozen=True)
+class ResumeInput(Expr):
+    """Value supplied when a suspended generator or coroutine is resumed."""
+
+    pass
+
+
+@dataclass(frozen=True)
 class TableField:
     key: Expr
     value: Expr

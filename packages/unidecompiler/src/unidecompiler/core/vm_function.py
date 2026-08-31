@@ -60,7 +60,7 @@ from unidecompiler.core.ir import (
     Yield,
 )
 from unidecompiler.core.stack_machine import StackLiftResult
-from unidecompiler.core.vm_bytecode import VMBytecodeStep, run_vm_steps
+from unidecompiler.core.vm_bytecode import VMBytecodeStep, normalize_vm_steps, run_vm_steps
 from unidecompiler.core.vm_region import (
     VMRegionCallbacks,
     VMLinearState,
@@ -158,9 +158,20 @@ def lift_vm_step_function(
     steps: tuple[VMBytecodeStep, ...],
     *,
     control_provenance: tuple[SourceRef, ...] = (),
+    callbacks_factory: Callable[[tuple[VMBytecodeStep, ...]], VMRegionCallbacks[VMBytecodeStep]] | None = None,
+    stateful_callbacks_factory: Callable[[tuple[VMBytecodeStep, ...]], VMStatefulCallbacks[VMBytecodeStep]] | None = None,
     **kwargs: Any,
 ) -> FunctionIR:
     """Lift VM steps and retain a frontend-neutral instruction projection."""
+    steps = normalize_vm_steps(steps)
+    if callbacks_factory is not None:
+        if "callbacks" in kwargs:
+            raise TypeError("callbacks and callbacks_factory are mutually exclusive")
+        kwargs["callbacks"] = callbacks_factory(steps)
+    if stateful_callbacks_factory is not None:
+        if "stateful_callbacks" in kwargs:
+            raise TypeError("stateful_callbacks and stateful_callbacks_factory are mutually exclusive")
+        kwargs["stateful_callbacks"] = stateful_callbacks_factory(steps)
     function = _lift_vm_step_function(spec, steps, **kwargs)
     instructions = tuple(_generic_instruction(step) for step in steps)
     metadata = dict(function.metadata)
@@ -331,6 +342,19 @@ def _lift_vm_step_function(
                     unsupported_opcodes=_unsupported_opcodes_from_statements(statements),
                     structured_lift="generic-vm-pipeline",
                 )
+                if (
+                    stateful_callbacks is not None
+                    and function.metadata.get("decompile_status") != "ok"
+                ):
+                    low_level = _lift_low_level_cfg_candidate(
+                        spec, steps, profile, stateful_callbacks, raw_window
+                    )
+                    if low_level is not None and _can_replace_non_ok_recovery_with_low_level_cfg(
+                        spec,
+                        function,
+                        low_level,
+                    ):
+                        return low_level
                 if (
                     stateful_callbacks is not None
                     and (
@@ -1186,6 +1210,30 @@ def _lift_low_level_cfg_candidate(
             },
         )
     return finalized
+
+
+def _can_replace_non_ok_recovery_with_low_level_cfg(
+    spec: VMFunctionSpec,
+    recovered: FunctionIR,
+    low_level: FunctionIR,
+) -> bool:
+    """Accept only a complete generic CFG recovery as a preservation fallback."""
+
+    if recovered.metadata.get("decompile_status") == "ok":
+        return False
+    if not (low_level.recovery_kind or "").startswith("generic-vm-low-level-cfg"):
+        return False
+    if low_level.metadata.get("decompile_status") != "ok":
+        return False
+    if not _function_has_exit_terminator(low_level):
+        return False
+    if _function_has_unsupported(low_level):
+        return False
+    if _function_has_unbound_loop_control(low_level):
+        return False
+    if _function_unbound_local_reads(low_level, spec):
+        return False
+    return _unsafe_structural_recovery_reason(low_level) is None
 
 
 def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:

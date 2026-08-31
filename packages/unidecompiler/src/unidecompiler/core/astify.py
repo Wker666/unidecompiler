@@ -11,6 +11,7 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    ResumeInputExpr,
     UndefinedLiteralExpr,
     ExprStmt,
     ForRangeStmt,
@@ -64,6 +65,7 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    ResumeInput,
     UndefinedLiteral,
     Continue,
     Expr,
@@ -401,6 +403,8 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return UndefinedLiteralExpr(source=expr.source, type=expr.type)
     if isinstance(expr, CurrentException):
         return CurrentExceptionRef(source=expr.source, type=expr.type)
+    if isinstance(expr, ResumeInput):
+        return ResumeInputExpr(source=expr.source, type=expr.type)
     if isinstance(expr, UnaryOp):
         return UnaryExpr(
             source=expr.source,

@@ -33,6 +33,11 @@ class CurrentExceptionRef(AstExpr):
 
 
 @dataclass(frozen=True)
+class ResumeInputExpr(AstExpr):
+    pass
+
+
+@dataclass(frozen=True)
 class UnaryExpr(AstExpr):
     op: str = ""
     value: AstExpr = field(default_factory=AstExpr)
