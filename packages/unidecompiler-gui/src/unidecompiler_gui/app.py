@@ -547,8 +547,10 @@ def _control_flow_layout(graph: object) -> tuple[dict[str, tuple[int, int]], dic
         for index, block in enumerate(graph.blocks)
     }
     edge_lanes: dict[object, int] = {edge: 0 for edge in graph.edges if edge.kind == "fallthrough"}
+    self_edges = [edge for edge in graph.edges if edge.kind != "fallthrough" and edge.source == edge.target]
     forward = [edge for edge in graph.edges if edge.kind != "fallthrough" and positions[edge.target][0] > positions[edge.source][0]]
     backward = [edge for edge in graph.edges if edge.kind != "fallthrough" and positions[edge.target][0] < positions[edge.source][0]]
+    edge_lanes.update(_allocate_edge_lanes(self_edges, positions, direction=1))
     edge_lanes.update(_allocate_edge_lanes(forward, positions, direction=-1))
     edge_lanes.update(_allocate_edge_lanes(backward, positions, direction=1))
     return positions, edge_lanes
