@@ -1358,18 +1358,106 @@ def _lift_exception_region_candidate(
         )
         if handlers is None:
             return None
-        body: tuple[Stmt | object, ...] = (*protected_block.statements,)
-        if protected_block.terminator is not None:
-            body = (*body, protected_block.terminator)
-        replacements[block_id] = BasicBlock(
-            id=protected_block.id,
-            statements=(Try(source=steps[_step_index_at_offset(steps, start, profile) or 0].source, body=body, handlers=handlers),),
-            terminator=None,
-        )
+        # Catching a value and immediately raising that same value has no
+        # observable generic-IR effect.  Keep the original low-level CFG in
+        # that exact case instead of introducing a second representation of
+        # the same exceptional path.
+        if _handlers_are_identity_reraises(handlers):
+            continue
+        # A protected range can span several basic blocks.  Preserve every
+        # ordinary CFG edge by wrapping the effects in each covered block,
+        # while keeping its terminator outside the Try.  Moving a branch,
+        # jump, or switch into a Try body makes the enclosing low-level block
+        # appear to have no normal successors, losing reachability and
+        # potentially turning parameters into falsely-unbound locals.  This
+        # is a generic property of protected CFG regions, independent of VM
+        # exception encoding.
+        for candidate in low_level.blocks:
+            candidate_offset = _block_start_offset(candidate.id)
+            if candidate_offset is None or not start <= candidate_offset < end:
+                continue
+            if not candidate.statements:
+                continue
+            # A Try statement cannot own a low-level terminator without
+            # removing its CFG successors.  Only leave the terminator outside
+            # when its expression is proven effect-free; otherwise retaining
+            # the exception range would require a richer structured CFG
+            # region and this candidate must not guess.
+            if (
+                candidate.exception_edge is not None
+                or candidate.active_exception_handlers
+                or not _terminator_is_exception_free(candidate.terminator)
+                or candidate.id in replacements
+            ):
+                return None
+            source_index = _step_index_at_offset(steps, candidate_offset, profile)
+            if source_index is None:
+                return None
+            replacements[candidate.id] = BasicBlock(
+                id=candidate.id,
+                statements=(
+                    Try(
+                        source=steps[source_index].source,
+                        body=candidate.statements,
+                        handlers=handlers,
+                    ),
+                ),
+                terminator=candidate.terminator,
+                exception_edge=candidate.exception_edge,
+                active_exception_handlers=candidate.active_exception_handlers,
+            )
     if not replacements:
-        return None
+        return low_level
     function = replace(low_level, blocks=tuple(replacements.get(block.id, block) for block in low_level.blocks))
     return finalize_recovered_vm_function(spec, function)
+
+
+def _block_start_offset(block_id: str) -> int | None:
+    """Return the numeric offset from a core-generated low-level block ID."""
+
+    prefix = block_id.split("__", 1)[0]
+    if not prefix.startswith("block_"):
+        return None
+    try:
+        return int(prefix.removeprefix("block_"))
+    except ValueError:
+        return None
+
+
+def _handlers_are_identity_reraises(handlers: tuple[ExceptHandler, ...]) -> bool:
+    """Prove that every handler only raises its bound generic exception."""
+
+    return bool(handlers) and all(
+        handler.binding is not None
+        and len(handler.body) == 1
+        and isinstance(handler.body[0], Raise)
+        and isinstance(handler.body[0].value, Var)
+        and handler.body[0].value.name == handler.binding.name
+        and handler.body[0].cause is None
+        for handler in handlers
+    )
+
+
+def _terminator_is_exception_free(terminator: object | None) -> bool:
+    if terminator is None or isinstance(terminator, Jump):
+        return True
+    if isinstance(terminator, Return):
+        return all(_expr_is_exception_free(value) for value in terminator.values)
+    if isinstance(terminator, Branch):
+        return _expr_is_exception_free(terminator.condition)
+    if isinstance(terminator, MultiBranch):
+        return _expr_is_exception_free(terminator.selector) and all(
+            _expr_is_exception_free(value) for value, _target in terminator.cases
+        )
+    return False
+
+
+def _expr_is_exception_free(expr: Expr) -> bool:
+    if isinstance(expr, (Var, Const, Global, CapturedVar, CurrentException)):
+        return True
+    if isinstance(expr, Phi):
+        return all(_expr_is_exception_free(value) for _predecessor, value in expr.incoming)
+    return False
 
 
 def _top_level_exception_regions(steps: tuple[VMBytecodeStep, ...]) -> tuple[dict[str, object], ...]:
