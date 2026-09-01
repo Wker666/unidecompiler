@@ -18,3 +18,7 @@ This requirement does not override the architecture rules below.
 - Add decoder, lifting, and source-equivalent verification tests. Add simulation tests when simulation is declared.
 
 See `docs/NEW_VM_FRONTEND.md` for the full contract.
+
+If `docs/AI_CONTEXT.md` exists, it is AI-only project context generated from
+user-selected reference artifacts. Read it before implementing; do not treat
+its unverified entry or inferred facts as established semantics.
