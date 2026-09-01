@@ -280,14 +280,14 @@ def _statement_to_ast(statement) -> object:
         )
     if isinstance(statement, If):
         return IfStmt(
-            source=statement.source,
+            source=statement.source or statement.condition.source,
             condition=_expr_to_ast(statement.condition),
             then_body=tuple(_statement_to_ast(inner) for inner in statement.then_body),
             else_body=tuple(_statement_to_ast(inner) for inner in statement.else_body),
         )
     if isinstance(statement, Switch):
         return SwitchStmt(
-            source=statement.source,
+            source=statement.source or statement.selector.source,
             selector=_expr_to_ast(statement.selector),
             cases=tuple(
                 (_expr_to_ast(value), tuple(_statement_to_ast(inner) for inner in body))
@@ -297,7 +297,7 @@ def _statement_to_ast(statement) -> object:
         )
     if isinstance(statement, While):
         return WhileStmt(
-            source=statement.source,
+            source=statement.source or statement.condition.source,
             condition=_expr_to_ast(statement.condition),
             body=tuple(_statement_to_ast(inner) for inner in statement.body),
         )

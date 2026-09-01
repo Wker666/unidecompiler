@@ -136,6 +136,82 @@ def compute_immediate_dominators(cfg: CFG) -> dict[str, str | None]:
     return idoms
 
 
+def compute_postdominators(cfg: CFG) -> dict[str, frozenset[str]]:
+    """Return postdominators for blocks that can reach a terminal exit.
+
+    Multiple terminal blocks are treated as independent exits.  A block that
+    cannot reach any exit (for example, an infinite loop) has no proven
+    postdominator set and is omitted rather than being assigned a guessed
+    relation.
+    """
+
+    successors = {block: set(cfg.successors(block)) for block in cfg.blocks}
+    exits = {block for block, targets in successors.items() if not targets}
+    if not exits:
+        return {}
+
+    # Use a least fixed point: a block is eligible only when every successor
+    # is already proven to reach a terminal exit.  This deliberately excludes
+    # loops and branches into non-terminating components; treating only the
+    # terminating successor as relevant would manufacture a postdominator that
+    # is not taken on every execution path.
+    can_reach_exit = set(exits)
+    changed = True
+    while changed:
+        changed = False
+        for block, targets in sorted(successors.items()):
+            if block in can_reach_exit or not targets or not targets <= can_reach_exit:
+                continue
+            can_reach_exit.add(block)
+            changed = True
+
+    postdominators: dict[str, set[str]] = {
+        block: ({block} if block in exits else set(can_reach_exit))
+        for block in can_reach_exit
+    }
+    changed = True
+    while changed:
+        changed = False
+        for block in sorted(can_reach_exit - exits):
+            reachable_successors = successors[block] & can_reach_exit
+            if not reachable_successors:
+                continue
+            intersection = set(can_reach_exit)
+            for successor in sorted(reachable_successors):
+                intersection &= postdominators[successor]
+            new_postdominators = {block} | intersection
+            if new_postdominators != postdominators[block]:
+                postdominators[block] = new_postdominators
+                changed = True
+
+    return {
+        block: frozenset(postdoms)
+        for block, postdoms in postdominators.items()
+    }
+
+
+def compute_immediate_postdominators(cfg: CFG) -> dict[str, str | None]:
+    """Return the nearest strict postdominator for each proven block."""
+
+    postdominators = compute_postdominators(cfg)
+    immediate: dict[str, str | None] = {}
+    for block, postdoms in postdominators.items():
+        strict = postdoms - {block}
+        immediate[block] = next(
+            (
+                candidate
+                for candidate in sorted(strict)
+                if all(
+                    candidate == other
+                    or candidate not in postdominators.get(other, frozenset())
+                    for other in sorted(strict)
+                )
+            ),
+            None,
+        )
+    return immediate
+
+
 def compute_dominance_frontier(cfg: CFG) -> dict[str, frozenset[str]]:
     idoms = compute_immediate_dominators(cfg)
     preds = _predecessors(cfg)

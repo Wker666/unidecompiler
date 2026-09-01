@@ -1329,15 +1329,14 @@ def _lift_exception_region_candidate(
     if cfg.diagnostics:
         return None
     low_level = _assemble_low_level_cfg(spec, cfg)
-    regions = _top_level_exception_regions(steps)
-    if not regions:
+    region_groups = _non_overlapping_exception_region_groups(steps)
+    if not region_groups:
         return None
     blocks_by_id = {block.id: block for block in low_level.blocks}
     replacements: dict[str, BasicBlock] = {}
-    for region in regions:
-        start = region["start"]
-        end = region["end"]
-        target = region["target"]
+    for region_group in region_groups:
+        start = region_group["start"]
+        end = region_group["end"]
         block_id = f"block_{start}"
         protected_block = blocks_by_id.get(block_id)
         if protected_block is None:
@@ -1345,24 +1344,28 @@ def _lift_exception_region_candidate(
             # handler path. It is not part of the normal CFG and must not
             # prevent recovery of an independently proven outer range.
             continue
-        handlers = _lift_typed_exception_handlers(
-            steps,
-            target,
-            protected_block,
-            profile,
-            callbacks,
-            direct_type=region.get("exception_type"),
-            protected_depth=region.get("depth"),
-            regions=regions,
-            region_callbacks=region_callbacks,
-        )
-        if handlers is None:
-            return None
+        handlers: list[ExceptHandler] = []
+        for region in region_group["entries"]:
+            recovered_handlers = _lift_typed_exception_handlers(
+                steps,
+                region["target"],
+                protected_block,
+                profile,
+                callbacks,
+                direct_type=region.get("exception_type"),
+                protected_depth=region.get("depth"),
+                regions=_flatten_exception_region_groups(region_groups),
+                region_callbacks=region_callbacks,
+            )
+            if recovered_handlers is None:
+                return None
+            handlers.extend(recovered_handlers)
+        handlers_tuple = tuple(handlers)
         # Catching a value and immediately raising that same value has no
         # observable generic-IR effect.  Keep the original low-level CFG in
         # that exact case instead of introducing a second representation of
         # the same exceptional path.
-        if _handlers_are_identity_reraises(handlers):
+        if _handlers_are_identity_reraises(handlers_tuple):
             continue
         # A protected range can span several basic blocks.  Preserve every
         # ordinary CFG edge by wrapping the effects in each covered block,
@@ -1376,7 +1379,25 @@ def _lift_exception_region_candidate(
             candidate_offset = _block_start_offset(candidate.id)
             if candidate_offset is None or not start <= candidate_offset < end:
                 continue
-            if not candidate.statements:
+            embedded_terminator: Return | None = None
+            if (
+                isinstance(candidate.terminator, Return)
+                and not _terminator_is_exception_free(candidate.terminator)
+            ):
+                # A terminal return has no normal CFG successors to preserve.
+                # Keeping its potentially throwing value computation inside
+                # the Try therefore retains both exception coverage and the
+                # exact function exit without repeating execution.
+                embedded_terminator = candidate.terminator
+            if not candidate.statements and embedded_terminator is None:
+                # A condition can be carried entirely by the low-level
+                # terminator.  It may have been computed by a protected VM
+                # instruction, so dropping the exception region in that case
+                # would move a potentially throwing expression outside its
+                # handlers.  Only an effect-free terminator is safe to leave
+                # as a plain CFG node.
+                if not _terminator_is_exception_free(candidate.terminator):
+                    return None
                 continue
             # A Try statement cannot own a low-level terminator without
             # removing its CFG successors.  Only leave the terminator outside
@@ -1386,7 +1407,10 @@ def _lift_exception_region_candidate(
             if (
                 candidate.exception_edge is not None
                 or candidate.active_exception_handlers
-                or not _terminator_is_exception_free(candidate.terminator)
+                or (
+                    embedded_terminator is None
+                    and not _terminator_is_exception_free(candidate.terminator)
+                )
                 or candidate.id in replacements
             ):
                 return None
@@ -1398,11 +1422,14 @@ def _lift_exception_region_candidate(
                 statements=(
                     Try(
                         source=steps[source_index].source,
-                        body=candidate.statements,
-                        handlers=handlers,
+                        body=(
+                            *candidate.statements,
+                            *((embedded_terminator,) if embedded_terminator is not None else ()),
+                        ),
+                        handlers=handlers_tuple,
                     ),
                 ),
-                terminator=candidate.terminator,
+                terminator=None if embedded_terminator is not None else candidate.terminator,
                 exception_edge=candidate.exception_edge,
                 active_exception_handlers=candidate.active_exception_handlers,
             )
@@ -1460,7 +1487,19 @@ def _expr_is_exception_free(expr: Expr) -> bool:
     return False
 
 
-def _top_level_exception_regions(steps: tuple[VMBytecodeStep, ...]) -> tuple[dict[str, object], ...]:
+def _non_overlapping_exception_region_groups(
+    steps: tuple[VMBytecodeStep, ...],
+) -> tuple[dict[str, object], ...] | None:
+    """Group equal protected intervals without guessing at nesting.
+
+    Exception-table entries commonly encode a multi-catch as several ordered
+    entries with exactly the same protected interval.  That is a neutral CFG
+    fact: their handler order is observable and is preserved in one generic
+    ``Try``.  Distinct overlapping intervals require nested protected CFG
+    recovery, so this simple pass declines them and leaves the low-level CFG
+    intact instead of overwriting handlers or inventing nesting.
+    """
+
     decoded: list[dict[str, object]] = []
     for step in steps:
         for hint in step.hints:
@@ -1479,12 +1518,39 @@ def _top_level_exception_regions(steps: tuple[VMBytecodeStep, ...]) -> tuple[dic
                 "exception_type": value.get("exception_type"),
             })
     handler_offsets = {entry["target"] for entry in decoded}
-    regions = {
-        (entry["start"], entry["end"], entry["target"]): entry
-        for entry in decoded
-        if entry["start"] not in handler_offsets
-    }
-    return tuple(regions[key] for key in sorted(regions))
+    top_level = [entry for entry in decoded if entry["start"] not in handler_offsets]
+    intervals = tuple(dict.fromkeys((entry["start"], entry["end"]) for entry in top_level))
+    if any(
+        left_start < right_end and right_start < left_end
+        for index, (left_start, left_end) in enumerate(intervals)
+        for right_start, right_end in intervals[index + 1 :]
+    ):
+        return None
+
+    groups: list[dict[str, object]] = []
+    for start, end in intervals:
+        entries = tuple(
+            entry
+            for entry in top_level
+            if entry["start"] == start and entry["end"] == end
+        )
+        if not entries:
+            continue
+        groups.append({"start": start, "end": end, "entries": entries})
+    return tuple(groups)
+
+
+def _flatten_exception_region_groups(
+    region_groups: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    """Expose grouped region entries to handler-local recovery helpers."""
+
+    return tuple(
+        entry
+        for group in region_groups
+        for entry in group["entries"]
+        if isinstance(entry, dict)
+    )
 
 
 def _lift_typed_exception_handlers(
@@ -1502,7 +1568,13 @@ def _lift_typed_exception_handlers(
     if entry is None:
         return None
     if isinstance(direct_type, str) and direct_type:
-        return _lift_direct_exception_handler(steps, entry, Global(name=direct_type, source=steps[entry].source), callbacks)
+        return _lift_direct_exception_handler(
+            steps,
+            entry,
+            Global(name=direct_type, source=steps[entry].source),
+            profile,
+            callbacks,
+        )
     handlers: list[ExceptHandler] = []
     while entry is not None:
         recovered = _lift_one_typed_exception_handler(
@@ -1553,6 +1625,7 @@ def _lift_direct_exception_handler(
     steps: tuple[VMBytecodeStep, ...],
     entry: int,
     exception_type: Expr,
+    profile: VMRegionProfile[VMBytecodeStep],
     callbacks: VMStatefulCallbacks[VMBytecodeStep],
 ) -> tuple[ExceptHandler, ...] | None:
     initial_locals = dict(callbacks.initial_locals())
@@ -1565,7 +1638,15 @@ def _lift_direct_exception_handler(
             initial_locals[effects[0].name] = binding
             body_start += 1
     initial_stack = () if binding is not None else (CurrentException(source=steps[entry].source),)
-    lifted = callbacks.lift_linear(body_start, len(steps), initial_locals, initial_stack)
+    lifted = _lift_first_terminal_linear_slice(
+        callbacks,
+        steps,
+        profile,
+        body_start,
+        len(steps),
+        initial_locals,
+        initial_stack,
+    )
     if lifted is None or lifted.stack:
         return None
     statements = _handler_statements_through_terminal(tuple(lifted.statements))
@@ -1575,6 +1656,37 @@ def _lift_direct_exception_handler(
     if not body or (lifted.terminator is None and not _ends_with_raise(statements)):
         return None
     return (ExceptHandler(exception_type=exception_type, binding=binding, body=body),)
+
+
+def _lift_first_terminal_linear_slice(
+    callbacks: VMStatefulCallbacks[VMBytecodeStep],
+    steps: tuple[VMBytecodeStep, ...],
+    profile: VMRegionProfile[VMBytecodeStep],
+    start: int,
+    limit: int,
+    initial_locals: dict[str, Expr],
+    initial_stack: tuple[Expr, ...],
+) -> VMLinearState | None:
+    """Lift exactly the first callback-proven terminal slice.
+
+    Adjacent exception handlers are separate CFG entries, even when their
+    instructions are contiguous in the bytecode stream.  A direct typed
+    handler therefore cannot be lifted through the remaining function body.
+    We accept only the first slice for which the frontend callback proves a
+    terminal at the end of that exact slice; a callback that encounters a
+    terminal earlier must reject the longer slice.  This is a generic linear
+    CFG boundary rule and deliberately does not depend on any VM opcode.
+    """
+
+    for end in range(start + 1, limit + 1):
+        if any(profile.is_control(step) for step in steps[start:end]):
+            return None
+        lifted = callbacks.lift_linear(start, end, initial_locals, initial_stack)
+        if lifted is None or lifted.stack:
+            continue
+        if isinstance(lifted.terminator, (Return, Raise, Reraise)):
+            return lifted
+    return None
 
 
 def _lift_one_typed_exception_handler(

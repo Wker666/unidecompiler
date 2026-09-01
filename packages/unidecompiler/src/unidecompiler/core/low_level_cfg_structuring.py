@@ -44,7 +44,13 @@ from unidecompiler.core.structuring import (
     StructuredWhile,
     structure_function,
 )
-from unidecompiler.core.cfg import build_cfg, find_natural_loops
+from unidecompiler.core.cfg import (
+    build_cfg,
+    compute_immediate_postdominators,
+    find_natural_loops,
+)
+from unidecompiler.core.cfg_rewrite import CFGRewriteCandidate, validate_cfg_rewrite
+from unidecompiler.core.region import RegionGraph
 
 
 LowLevelCfgStructurer = Callable[[FunctionIR], FunctionIR | None]
@@ -92,6 +98,14 @@ def apply_low_level_cfg_structuring(
         structured = structure_low_level_cfg(current)
         if structured is None or not is_safe(structured):
             return current
+        # An exact structurer has completed the preservation-floor rewrite.
+        # Do not feed its one-block structured view back through the registry:
+        # doing so can replace a proven result with a later presentation rule
+        # (for example, exact-branch-terminal-arms becoming single-block CFG).
+        # Lossless normalizers retain the low-level recovery kind and continue
+        # through the fixed-point loop below.
+        if structured.recovery_kind == "generic-vm-low-level-cfg-structured":
+            return structured
         # Exact structurers must make tangible CFG progress (an edge or a
         # block disappears).  This prevents a registry error from creating an
         # unbounded rewrite cycle while still allowing an inner-region
@@ -123,19 +137,46 @@ def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
             structured = structurer(current)
             if structured is None:
                 continue
-            structured = replace(
-                structured,
-                control_provenance=tuple(
-                    dict.fromkeys(
-                        (*current.control_provenance, *structured.control_provenance)
+            if current.recovery_kind in {
+                "generic-vm-low-level-cfg",
+                "generic-vm-low-level-cfg-structured",
+            }:
+                proof = (
+                    "lossless-normalization"
+                    if structurer in _LOW_LEVEL_CFG_NORMALIZERS
+                    else "exact-topology"
+                )
+                decision = validate_cfg_rewrite(
+                    CFGRewriteCandidate(
+                        original=current,
+                        rewritten=structured,
+                        rule=structured.metadata.get(
+                            "low_level_cfg_structured", structurer.__name__
+                        ),
+                        proof=proof,
                     )
-                ),
-                bytecode_control_flow=tuple(
-                    dict.fromkeys(
-                        (*current.bytecode_control_flow, *structured.bytecode_control_flow)
-                    )
-                ),
-            )
+                )
+                if not decision.accepted:
+                    continue
+                structured = decision.function
+            else:
+                # Keep the historical internal extension seam for callers
+                # that pass a non-VM FunctionIR.  VM preservation views above
+                # always cross the fail-closed rewrite gate, including later
+                # iterations after the first structured result.
+                structured = replace(
+                    structured,
+                    control_provenance=tuple(
+                        dict.fromkeys(
+                            (*current.control_provenance, *structured.control_provenance)
+                        )
+                    ),
+                    bytecode_control_flow=tuple(
+                        dict.fromkeys(
+                            (*current.bytecode_control_flow, *structured.bytecode_control_flow)
+                        )
+                    ),
+                )
             if structurer in _LOW_LEVEL_CFG_NORMALIZERS:
                 current = structured
                 normalized = True
@@ -151,6 +192,25 @@ def _has_exceptional_block_context(function: FunctionIR) -> bool:
     return any(
         block.exception_edge is not None or block.active_exception_handlers
         for block in function.blocks
+    )
+
+
+def _structure_exact_single_block_cfg(function: FunctionIR) -> FunctionIR | None:
+    """Remove the CFG presentation floor when no control-flow graph remains."""
+
+    if function.recovery_kind != "generic-vm-low-level-cfg" or len(function.blocks) != 1:
+        return None
+    cfg = build_cfg(function)
+    if cfg.diagnostics or cfg.edges or _has_exceptional_block_context(function):
+        return None
+    return replace(
+        function,
+        recovery_kind="generic-vm-low-level-cfg-structured",
+        metadata={
+            **function.metadata,
+            "structured_lift": "generic-vm-low-level-cfg-structured",
+            "low_level_cfg_structured": "exact-single-block-cfg",
+        },
     )
 
 
@@ -357,8 +417,8 @@ def _structure_exact_linear_block_merges(function: FunctionIR) -> FunctionIR | N
         changed = True
 
 
-def _structure_exact_nested_iterator_continue_loop(function: FunctionIR) -> FunctionIR | None:
-    """Recover the VM-neutral shape used by iterative DFS helpers.
+def _structure_exact_two_level_loop_with_guarded_continue(function: FunctionIR) -> FunctionIR | None:
+    """Recover two nested natural loops with a guarded outer continue.
 
     The matcher is deliberately topology-first. It only removes trivial phi
     assignments and empty jump blocks after proving both loop exits and the
@@ -457,11 +517,11 @@ def _structure_exact_nested_iterator_continue_loop(function: FunctionIR) -> Func
         function,
         (*setup.statements, outer_loop, *outer_exit.statements),
         final_return.terminator,
-        "exact-nested-iterator-continue-loop",
+        "exact-two-level-loop-with-guarded-continue",
     )
 
 
-def _structure_exact_partition_recursive_loop(function: FunctionIR) -> FunctionIR | None:
+def _structure_exact_branch_selected_dual_loops(function: FunctionIR) -> FunctionIR | None:
     if len(function.blocks) != 12:
         return None
     (
@@ -566,12 +626,12 @@ def _structure_exact_partition_recursive_loop(function: FunctionIR) -> FunctionI
         function,
         statements,
         Return(source=recursive_return.terminator.source, values=(Var(name=return_name),)),
-        "exact-partition-recursive-loop",
+        "exact-branch-selected-dual-loops",
     )
 
 
-def _structure_exact_dijkstra_nested_loops(function: FunctionIR) -> FunctionIR | None:
-    """Recover the exact nested-loop CFG emitted for a Dijkstra scan."""
+def _structure_exact_three_phase_nested_loops(function: FunctionIR) -> FunctionIR | None:
+    """Recover a selection, update, and aggregation nested-loop CFG."""
 
     if len(function.blocks) == 24:
         (
@@ -753,7 +813,7 @@ def _structure_exact_dijkstra_nested_loops(function: FunctionIR) -> FunctionIR |
             *(checksum_exit.statements if checksum_exit is not None else ()),
         ),
         final_return.terminator,
-        "exact-dijkstra-nested-loops",
+        "exact-three-phase-nested-loops",
     )
 
 
@@ -1731,6 +1791,7 @@ def _structure_exact_linear_arm_diamond_region(function: FunctionIR) -> Function
             statements=(
                 *source.statements,
                 If(
+                    source=terminator.source,
                     condition=terminator.condition,
                     then_body=(*true_statements, *true_copies),
                     else_body=(*false_statements, *false_copies),
@@ -1885,7 +1946,7 @@ def _structure_exact_optional_linear_arm_diamond_region(function: FunctionIR) ->
                             id=source.id,
                             statements=(
                                 *source.statements,
-                                If(condition=terminator.condition, then_body=then_body, else_body=else_body),
+                                If(source=terminator.source, condition=terminator.condition, then_body=then_body, else_body=else_body),
                                 *join_statements,
                             ),
                             terminator=rewritten_terminator,
@@ -1916,7 +1977,7 @@ def _structure_exact_optional_linear_arm_diamond_region(function: FunctionIR) ->
                     id=source.id,
                     statements=(
                         *source.statements,
-                        If(condition=terminator.condition, then_body=then_body, else_body=else_body),
+                        If(source=terminator.source, condition=terminator.condition, then_body=then_body, else_body=else_body),
                         *join_statements,
                     ),
                     terminator=rewritten_terminator,
@@ -2151,6 +2212,324 @@ def _structure_exact_direct_phi_dispatch_region(function: FunctionIR) -> Functio
     return None
 
 
+def _structure_exact_acyclic_tree_join_region(function: FunctionIR) -> FunctionIR | None:
+    """Collapse one proven acyclic branch tree with a single postdominating join.
+
+    This is a VM-neutral SESE reduction.  It accepts a branch or dispatch whose
+    arms form a tree (not a shared DAG) and reconverge at its immediate
+    postdominator.  Each tree node has one incoming edge, all leaves are the
+    join's complete predecessor set, and every join phi is materialized on the
+    original leaf edge before the tree is nested into generic ``If``/``Switch``
+    nodes.  Any loop, shared node, alternate entry, non-local exit, or complex
+    phi declines the rewrite and leaves the exact low-level CFG unchanged.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or find_natural_loops(cfg):
+        return None
+    immediate_postdominators = compute_immediate_postdominators(cfg)
+    block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
+
+    def successor_tree(
+        target: str,
+        predecessor: str,
+        join_id: str,
+        edge_copies: dict[str, tuple[Stmt, ...]],
+        path: frozenset[str],
+    ) -> tuple[tuple[Stmt, ...], frozenset[str], frozenset[str]] | None:
+        if target == join_id:
+            copies = edge_copies.get(predecessor)
+            if copies is None:
+                return None
+            return copies, frozenset(), frozenset({predecessor})
+        if target in path:
+            return None
+        block = block_map.get(target)
+        if block is None or set(cfg.predecessors(target)) != {predecessor}:
+            return None
+        statements = _statements_without_trivial_phi_assignments(
+            block.statements,
+            incoming_blocks=(predecessor,),
+        )
+        if statements is None or _statements_contain_break(statements):
+            return None
+        next_path = path | {target}
+        terminator = block.terminator
+        if isinstance(terminator, Jump):
+            child = successor_tree(
+                terminator.target,
+                block.id,
+                join_id,
+                edge_copies,
+                next_path,
+            )
+            if child is None:
+                return None
+            child_statements, child_blocks, leaves = child
+            return (*statements, *child_statements), child_blocks | {block.id}, leaves
+        if terminator is None:
+            successors = cfg.successors(block.id)
+            if len(successors) != 1:
+                return None
+            child = successor_tree(
+                successors[0],
+                block.id,
+                join_id,
+                edge_copies,
+                next_path,
+            )
+            if child is None:
+                return None
+            child_statements, child_blocks, leaves = child
+            return (*statements, *child_statements), child_blocks | {block.id}, leaves
+        if isinstance(terminator, Branch):
+            if terminator.true_target == terminator.false_target:
+                return None
+            then_result = successor_tree(
+                terminator.true_target,
+                block.id,
+                join_id,
+                edge_copies,
+                next_path,
+            )
+            else_result = successor_tree(
+                terminator.false_target,
+                block.id,
+                join_id,
+                edge_copies,
+                next_path,
+            )
+            if then_result is None or else_result is None:
+                return None
+            then_body, then_blocks, then_leaves = then_result
+            else_body, else_blocks, else_leaves = else_result
+            if then_blocks & else_blocks or then_leaves & else_leaves:
+                return None
+            if not statements and not then_body and not else_body:
+                return None
+            return (
+                (
+                    *statements,
+                    If(
+                        source=terminator.source,
+                        condition=terminator.condition,
+                        then_body=then_body,
+                        else_body=else_body,
+                    ),
+                ),
+                then_blocks | else_blocks | {block.id},
+                then_leaves | else_leaves,
+            )
+        if not isinstance(terminator, MultiBranch):
+            return None
+        targets = (*tuple(target for _value, target in terminator.cases), terminator.default_target)
+        if len(set(targets)) != len(targets):
+            return None
+        cases: list[tuple[Expr, tuple[Stmt, ...]]] = []
+        removed: frozenset[str] = frozenset({block.id})
+        leaves: frozenset[str] = frozenset()
+        for value, case_target in terminator.cases:
+            if any(_values_semantically_equal(value, existing) for existing, _body in cases):
+                return None
+            result = successor_tree(case_target, block.id, join_id, edge_copies, next_path)
+            if result is None:
+                return None
+            body, case_blocks, case_leaves = result
+            if removed & case_blocks or leaves & case_leaves:
+                return None
+            cases.append((value, body))
+            removed |= case_blocks
+            leaves |= case_leaves
+        default_result = successor_tree(
+            terminator.default_target,
+            block.id,
+            join_id,
+            edge_copies,
+            next_path,
+        )
+        if default_result is None:
+            return None
+        default_body, default_blocks, default_leaves = default_result
+        if removed & default_blocks or leaves & default_leaves:
+            return None
+        if not statements and not any(body for _value, body in cases) and not default_body:
+            return None
+        return (
+            (*statements, Switch(source=terminator.source, selector=terminator.selector, cases=tuple(cases), default_body=default_body)),
+            removed | default_blocks,
+            leaves | default_leaves,
+        )
+
+    for source in function.blocks:
+        terminator = source.terminator
+        if not isinstance(terminator, (Branch, MultiBranch)):
+            continue
+        if isinstance(terminator, Branch):
+            if terminator.true_target == terminator.false_target:
+                continue
+        else:
+            targets = (*tuple(target for _value, target in terminator.cases), terminator.default_target)
+            if not targets or len(set(targets)) != len(targets):
+                continue
+        join_id = immediate_postdominators.get(source.id)
+        join = block_map.get(join_id) if join_id is not None else None
+        if join is None or join.id == source.id:
+            continue
+        join_predecessors = set(cfg.predecessors(join.id))
+        if not join_predecessors:
+            continue
+        phi_copies = _final_join_phi_copies(join, join_predecessors)
+        if phi_copies is None:
+            continue
+        edge_copies, join_statements = phi_copies
+
+        if isinstance(terminator, Branch):
+            then_result = successor_tree(
+                terminator.true_target,
+                source.id,
+                join.id,
+                edge_copies,
+                frozenset(),
+            )
+            else_result = successor_tree(
+                terminator.false_target,
+                source.id,
+                join.id,
+                edge_copies,
+                frozenset(),
+            )
+            if then_result is None or else_result is None:
+                continue
+            then_body, then_blocks, then_leaves = then_result
+            else_body, else_blocks, else_leaves = else_result
+            if then_blocks & else_blocks or then_leaves & else_leaves:
+                continue
+            if not then_body and not else_body:
+                continue
+            structured_statement: Stmt = If(
+                source=terminator.source,
+                condition=terminator.condition,
+                then_body=then_body,
+                else_body=else_body,
+            )
+            removed = then_blocks | else_blocks
+            leaves = then_leaves | else_leaves
+        else:
+            cases: list[tuple[Expr, tuple[Stmt, ...]]] = []
+            removed = frozenset()
+            leaves = frozenset()
+            rejected = False
+            for value, target in terminator.cases:
+                if any(_values_semantically_equal(value, existing) for existing, _body in cases):
+                    rejected = True
+                    break
+                result = successor_tree(target, source.id, join.id, edge_copies, frozenset())
+                if result is None:
+                    rejected = True
+                    break
+                body, case_blocks, case_leaves = result
+                if removed & case_blocks or leaves & case_leaves:
+                    rejected = True
+                    break
+                cases.append((value, body))
+                removed |= case_blocks
+                leaves |= case_leaves
+            if rejected:
+                continue
+            default_result = successor_tree(
+                terminator.default_target,
+                source.id,
+                join.id,
+                edge_copies,
+                frozenset(),
+            )
+            if default_result is None:
+                continue
+            default_body, default_blocks, default_leaves = default_result
+            if removed & default_blocks or leaves & default_leaves:
+                continue
+            if not any(body for _value, body in cases) and not default_body:
+                continue
+            structured_statement = Switch(
+                source=terminator.source,
+                selector=terminator.selector,
+                cases=tuple(cases),
+                default_body=default_body,
+            )
+            removed |= default_blocks
+            leaves |= default_leaves
+
+        if leaves != join_predecessors or source.id in removed or join.id in removed:
+            continue
+        region_members = removed | {source.id}
+        if not region_graph.is_sese_body(
+            region_members,
+            entry=source.id,
+            exit=join.id,
+        ):
+            continue
+        collapsed_region_id = f"region:{source.id}:{join.id}"
+        collapsed_region = region_graph.collapse(
+            region_id=collapsed_region_id,
+            members=region_members,
+            kind="acyclic-tree",
+        )
+        if collapsed_region is None:
+            continue
+        collapsed_node = collapsed_region.node(collapsed_region_id)
+        if collapsed_node is None or collapsed_node.members != region_members:
+            continue
+        continuation_rewrites: dict[str, BasicBlock] = {}
+        if isinstance(join.terminator, Jump):
+            successor_ids = (join.terminator.target,)
+        elif isinstance(join.terminator, Return):
+            successor_ids = ()
+        elif isinstance(join.terminator, (Branch, MultiBranch)):
+            successor_ids = _terminator_targets(join.terminator)
+        else:
+            continue
+        for successor_id in dict.fromkeys(successor_ids):
+            if successor_id in removed | {source.id, join.id}:
+                break
+            successor = block_map.get(successor_id)
+            if successor is None:
+                break
+            rewritten_successor = _rename_phi_predecessor(
+                successor,
+                previous=join.id,
+                replacement=source.id,
+            )
+            if rewritten_successor is None:
+                break
+            continuation_rewrites[successor_id] = rewritten_successor
+        else:
+            rewritten_source = BasicBlock(
+                id=source.id,
+                statements=(*source.statements, structured_statement, *join_statements),
+                terminator=join.terminator,
+            )
+            return FunctionIR(
+                name=function.name,
+                params=function.params,
+                blocks=tuple(
+                    rewritten_source
+                    if block.id == source.id
+                    else continuation_rewrites.get(block.id, block)
+                    for block in function.blocks
+                    if block.id not in removed | {join.id}
+                ),
+                nested_functions=function.nested_functions,
+                source=function.source,
+                recovery_kind=function.recovery_kind,
+                metadata={
+                    **function.metadata,
+                    "low_level_cfg_structured": "exact-acyclic-tree-join-region",
+                },
+            )
+    return None
+
+
 def _rename_phi_predecessor(
     block: BasicBlock,
     *,
@@ -2279,7 +2658,7 @@ def _structure_exact_acyclic_decision_tree_return(function: FunctionIR) -> Funct
             else_body = render_edge(block.id, terminator.false_target, next_path)
             if then_body is None or else_body is None:
                 return None
-            return (*statements, If(condition=terminator.condition, then_body=then_body, else_body=else_body))
+            return (*statements, If(source=terminator.source, condition=terminator.condition, then_body=then_body, else_body=else_body))
         if isinstance(terminator, MultiBranch):
             cases: list[tuple[Expr, tuple[Stmt, ...]]] = []
             for value, target in terminator.cases:
@@ -2292,7 +2671,7 @@ def _structure_exact_acyclic_decision_tree_return(function: FunctionIR) -> Funct
             default_body = render_edge(block.id, terminator.default_target, next_path)
             if default_body is None:
                 return None
-            return (*statements, Switch(selector=terminator.selector, cases=tuple(cases), default_body=default_body))
+            return (*statements, Switch(source=terminator.source, selector=terminator.selector, cases=tuple(cases), default_body=default_body))
         return None
 
     tree = render_block(cfg.entry, frozenset())
@@ -2368,6 +2747,7 @@ def _structure_exact_acyclic_terminal_tree(function: FunctionIR) -> FunctionIR |
             return (
                 *statements,
                 If(
+                    source=terminator.source,
                     condition=terminator.condition,
                     then_body=then_body,
                     else_body=else_body,
@@ -2384,7 +2764,7 @@ def _structure_exact_acyclic_terminal_tree(function: FunctionIR) -> FunctionIR |
         default_body = render(terminator.default_target, next_path)
         if default_body is None:
             return None
-        return (*statements, Switch(selector=terminator.selector, cases=tuple(cases), default_body=default_body))
+        return (*statements, Switch(source=terminator.source, selector=terminator.selector, cases=tuple(cases), default_body=default_body))
 
     tree = render(cfg.entry, frozenset())
     if tree is None:
@@ -2456,7 +2836,7 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
             if then_blocks & else_blocks:
                 return None
             return (
-                (*statements, If(condition=terminator.condition, then_body=then_body, else_body=else_body)),
+                (*statements, If(source=terminator.source, condition=terminator.condition, then_body=then_body, else_body=else_body)),
                 then_blocks | else_blocks | {block_id},
             )
         targets = (*tuple(target for _value, target in terminator.cases), terminator.default_target)
@@ -2476,7 +2856,7 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
             return None
         default_body, default_blocks = default_result
         return (
-            (*statements, Switch(selector=terminator.selector, cases=tuple(cases), default_body=default_body)),
+            (*statements, Switch(source=terminator.source, selector=terminator.selector, cases=tuple(cases), default_body=default_body)),
             frozenset(case_blocks) | default_blocks | {block_id},
         )
 
@@ -2495,6 +2875,7 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
             if continuation_target in removed:
                 continue
             conditional = If(
+                source=terminator.source,
                 condition=terminator.condition,
                 then_body=terminal_body if terminal_is_true else (),
                 else_body=() if terminal_is_true else terminal_body,
@@ -4118,6 +4499,7 @@ def _structure_exact_entry_posttested_self_loop(function: FunctionIR) -> Functio
 
 def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> FunctionIR | None:
     block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
     header = block_map.get(loop.header)
     if header is None or not isinstance(header.terminator, Branch):
         return None
@@ -4145,6 +4527,13 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
     exit_id = next(iter(continuation_targets))
     exit_block = block_map.get(exit_id)
     if exit_block is None or any(predecessor not in loop.blocks for predecessor in cfg.predecessors(exit_id)):
+        return None
+    if not region_graph.is_single_entry_loop(
+        frozenset(loop.blocks),
+        header=header.id,
+        preheader=preheader.id,
+        exit=exit_id,
+    ):
         return None
 
     true_in_loop = header.terminator.true_target in loop.blocks
@@ -4228,6 +4617,7 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
 
 def _try_structure_single_natural_loop(function: FunctionIR, cfg, loop) -> FunctionIR | None:
     block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
     header = block_map.get(loop.header)
     if header is None or not isinstance(header.terminator, Branch):
         return None
@@ -4244,6 +4634,13 @@ def _try_structure_single_natural_loop(function: FunctionIR, cfg, loop) -> Funct
         return None
     exit_id = next(iter(exit_targets))
     if exit_id not in block_map:
+        return None
+    if not region_graph.is_single_entry_loop(
+        frozenset(loop.blocks),
+        header=loop.header,
+        preheader=preheader.id,
+        exit=exit_id,
+    ):
         return None
 
     true_in_loop = header.terminator.true_target in loop.blocks
@@ -4427,6 +4824,7 @@ def _render_loop_body(
         if not default_effect and not any(effect for _value, _body, effect in case_results):
             return None
         switch = Switch(
+            source=terminator.source,
             selector=terminator.selector,
             cases=tuple((value, body) for value, body, _effect in case_results),
             default_body=default_body,
@@ -4476,7 +4874,7 @@ def _render_loop_body(
         return None
     return (
         *statements,
-        If(condition=terminator.condition, then_body=then_body, else_body=else_body),
+        If(source=terminator.source, condition=terminator.condition, then_body=then_body, else_body=else_body),
     ), bool(statements) or then_effect or else_effect
 
 
@@ -4560,6 +4958,7 @@ def _render_direct_phi_join(
     return (
         (
             If(
+                source=terminator.source,
                 condition=terminator.condition,
                 then_body=(*true_statements, *true_copies),
                 else_body=(*false_statements, *false_copies),
@@ -5041,6 +5440,7 @@ def _simple_while_header_has_no_statements(function: FunctionIR) -> bool:
 _LOW_LEVEL_CFG_NORMALIZERS = (
     _structure_exact_try_common_join_region,
     _structure_exact_terminal_branch_region,
+    _structure_exact_acyclic_tree_join_region,
     _structure_exact_innermost_natural_loop_region,
     _structure_exact_entry_natural_loop_region,
     _structure_exact_empty_jump_chains,
@@ -5052,10 +5452,10 @@ _LOW_LEVEL_CFG_NORMALIZERS = (
     _structure_exact_direct_phi_dispatch_region,
 )
 
-
-register_low_level_cfg_structurer(_structure_exact_partition_recursive_loop)
-register_low_level_cfg_structurer(_structure_exact_dijkstra_nested_loops)
-register_low_level_cfg_structurer(_structure_exact_nested_iterator_continue_loop)
+register_low_level_cfg_structurer(_structure_exact_single_block_cfg)
+register_low_level_cfg_structurer(_structure_exact_branch_selected_dual_loops)
+register_low_level_cfg_structurer(_structure_exact_three_phase_nested_loops)
+register_low_level_cfg_structurer(_structure_exact_two_level_loop_with_guarded_continue)
 register_low_level_cfg_structurer(_structure_exact_whole_function_while)
 register_low_level_cfg_structurer(_structure_exact_header_effect_while)
 register_low_level_cfg_structurer(_structure_exact_header_effect_while_with_exit_jump)
@@ -5065,6 +5465,7 @@ register_low_level_cfg_structurer(_structure_exact_guard_cascade_pretested_loop)
 register_low_level_cfg_structurer(_structure_exact_try_success_return)
 register_low_level_cfg_structurer(_structure_exact_branch_terminal_arms)
 register_low_level_cfg_structurer(_structure_exact_branch_join_return)
+register_low_level_cfg_structurer(_structure_exact_acyclic_tree_join_region)
 register_low_level_cfg_structurer(_structure_exact_acyclic_decision_tree_return)
 register_low_level_cfg_structurer(_structure_exact_guard_return_cascade)
 register_low_level_cfg_structurer(_structure_exact_acyclic_terminal_tree)
