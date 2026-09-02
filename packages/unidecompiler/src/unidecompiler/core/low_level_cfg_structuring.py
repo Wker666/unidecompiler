@@ -93,32 +93,16 @@ def apply_low_level_cfg_structuring(
         return function
     if is_safe is None:
         return function
-    current = function
-    while True:
-        structured = structure_low_level_cfg(current)
-        if structured is None or not is_safe(structured):
-            return current
-        # An exact structurer has completed the preservation-floor rewrite.
-        # Do not feed its one-block structured view back through the registry:
-        # doing so can replace a proven result with a later presentation rule
-        # (for example, exact-branch-terminal-arms becoming single-block CFG).
-        # Lossless normalizers retain the low-level recovery kind and continue
-        # through the fixed-point loop below.
-        if structured.recovery_kind == "generic-vm-low-level-cfg-structured":
-            return structured
-        # Exact structurers must make tangible CFG progress (an edge or a
-        # block disappears).  This prevents a registry error from creating an
-        # unbounded rewrite cycle while still allowing an inner-region
-        # reduction to expose a newly provable outer region on the next pass.
-        if (
-            _low_level_edge_count(structured) >= _low_level_edge_count(current)
-            and len(structured.blocks) >= len(current.blocks)
-        ):
-            return current
-        current = structured
+    from unidecompiler.core.recovery_refinement import refine_recovered_function
+
+    return refine_recovered_function(function, is_safe=is_safe)
 
 
-def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
+def structure_low_level_cfg(
+    function: FunctionIR,
+    *,
+    is_safe: Callable[[FunctionIR], bool] | None = None,
+) -> FunctionIR | None:
     """Run exact structurers after any lossless CFG normalization.
 
     Empty-jump threading and linear-block merging keep the low-level recovery
@@ -177,6 +161,8 @@ def structure_low_level_cfg(function: FunctionIR) -> FunctionIR | None:
                         )
                     ),
                 )
+            if is_safe is not None and not is_safe(structured):
+                continue
             if structurer in _LOW_LEVEL_CFG_NORMALIZERS:
                 current = structured
                 normalized = True
@@ -332,11 +318,18 @@ def _structure_exact_empty_jump_chains(function: FunctionIR) -> FunctionIR | Non
     )
     if not kept:
         return None
-    if kept[0].statements == () and isinstance(kept[0].terminator, Jump):
-        entry_target = redirect(kept[0].terminator.target)
-        entry = block_map.get(entry_target)
-        if entry is not None and entry.id != kept[0].id:
-            kept = tuple(block for block in kept if block.id != kept[0].id)
+    # The first block defines the FunctionIR entry.  An empty entry jump can
+    # be removed only when its target is already the next retained block;
+    # otherwise deleting it would silently change which block executes first
+    # (notably for post-tested loops whose target is later in the tuple).
+    if (
+        kept[0].id == function.blocks[0].id
+        and kept[0].statements == ()
+        and isinstance(kept[0].terminator, Jump)
+        and len(kept) > 1
+        and kept[1].id == redirect(kept[0].terminator.target)
+    ):
+        kept = kept[1:]
     return FunctionIR(
         name=function.name,
         params=function.params,
@@ -349,6 +342,253 @@ def _structure_exact_empty_jump_chains(function: FunctionIR) -> FunctionIR | Non
             "low_level_cfg_structured": "exact-empty-jump-chains",
         },
     )
+
+
+def _structure_exact_empty_jump_splices(function: FunctionIR) -> FunctionIR | None:
+    """Remove one empty jump block while preserving every incoming edge.
+
+    Empty blocks occur both as ordinary fall-through placeholders and inside
+    natural loops.  The older jump-chain normalizer intentionally leaves loop
+    members alone because a blind redirect can invalidate edge-local Phi
+    values.  This rule handles the missing generic case: it expands an empty
+    block's incoming edge labels at its successor, and declines the rewrite if
+    any Phi or exceptional/irreducible edge cannot be expanded exactly.
+    """
+
+    if not function.blocks:
+        return None
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    block_map = cfg.blocks
+    loop_headers = frozenset(loop.header for loop in find_natural_loops(cfg))
+
+    for empty in function.blocks:
+        if (
+            empty.id == cfg.entry
+            or empty.statements
+            or not isinstance(empty.terminator, Jump)
+            or empty.terminator.target == empty.id
+            or empty.exception_edge is not None
+            or empty.active_exception_handlers
+        ):
+            continue
+        successor_id = empty.terminator.target
+        # A block that is the last hop into a natural-loop header carries the
+        # backedge topology used by later loop proofs.  Redirecting it can
+        # merge distinct backedges (or turn an unmatched loop into a simple
+        # one), changing which structured rule is applicable.  Keep that
+        # boundary explicit; ordinary in-loop jump placeholders remain safe to
+        # splice below.
+        if successor_id in loop_headers:
+            continue
+        successor = block_map.get(successor_id)
+        if successor is None:
+            continue
+        predecessors = cfg.predecessors(empty.id)
+        if not predecessors:
+            continue
+        incoming_edges = tuple(
+            edge
+            for edge in region_graph.edges
+            if edge.target == empty.id and edge.source in predecessors
+        )
+        if len(incoming_edges) != len(predecessors) or any(
+            edge.kind == "fallthrough"
+            or edge.roles & {"exceptional", "irreducible"}
+            for edge in incoming_edges
+        ):
+            continue
+        if any(
+            block_map.get(predecessor) is None
+            or block_map[predecessor].exception_edge is not None
+            or block_map[predecessor].active_exception_handlers
+            for predecessor in predecessors
+        ):
+            continue
+        outgoing_edges = tuple(
+            edge
+            for edge in region_graph.edges
+            if edge.source == empty.id and edge.target == successor_id
+        )
+        if any(edge.roles & {"exceptional", "irreducible"} for edge in outgoing_edges):
+            continue
+
+        # A malformed/stale Phi edge elsewhere cannot be repaired by removing
+        # this block.  The successor is handled below, one replacement edge at
+        # a time, with collision checks in _rename_phi_predecessor.
+        if any(
+            isinstance(statement, Assign)
+            and isinstance(statement.value, Phi)
+            and any(predecessor == empty.id for predecessor, _value in statement.value.incoming)
+            for block in function.blocks
+            if block.id != successor_id
+            for statement in block.statements
+        ):
+            continue
+
+        rewritten_successor = _expand_phi_predecessor(
+            successor,
+            previous=empty.id,
+            replacements=predecessors,
+        )
+        if rewritten_successor is None:
+            continue
+
+        rewritten_blocks: list[BasicBlock] = []
+        for block in function.blocks:
+            if block.id == empty.id:
+                continue
+            if block.id == successor_id:
+                rewritten_blocks.append(rewritten_successor)
+                continue
+            rewritten_blocks.append(
+                replace(
+                    block,
+                    terminator=_retarget_terminator_target(
+                        block.terminator,
+                        previous=empty.id,
+                        replacement=successor_id,
+                    ),
+                )
+            )
+
+        rewritten = replace(
+            function,
+            blocks=tuple(rewritten_blocks),
+            metadata={
+                **function.metadata,
+                "low_level_cfg_structured": "exact-empty-jump-splice",
+            },
+        )
+        if build_cfg(rewritten).diagnostics:
+            continue
+        return rewritten
+    return None
+
+
+def _structure_exact_loop_linear_block_merges(function: FunctionIR) -> FunctionIR | None:
+    """Merge a unique-predecessor linear block inside a natural loop.
+
+    Linear merging is already available for acyclic regions, but loop members
+    were deliberately excluded because header Phi edges and backedges are
+    observable CFG facts.  This companion rule handles only a successor that
+    is not a loop header, has one explicit predecessor, and has a concrete
+    terminator.  Any Phi at its outgoing edge is renamed to the surviving
+    predecessor; a collision rejects the candidate instead of guessing.
+    """
+
+    if not function.blocks:
+        return None
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if not loops:
+        return None
+    loop_headers = frozenset(loop.header for loop in loops)
+    block_loops: dict[str, frozenset[str]] = {
+        block_id: frozenset(
+            loop.header for loop in loops if block_id in loop.blocks
+        )
+        for block_id in cfg.blocks
+    }
+    block_map = cfg.blocks
+
+    for source in function.blocks:
+        if not isinstance(source.terminator, Jump):
+            continue
+        successor_id = source.terminator.target
+        successor = block_map.get(successor_id)
+        if successor is None or successor_id in loop_headers:
+            continue
+        if cfg.predecessors(successor_id) != (source.id,):
+            continue
+        if not block_loops.get(source.id) & block_loops.get(successor_id, frozenset()):
+            continue
+        if successor.terminator is None:
+            # An implicit fallthrough depends on physical block order.  Keep
+            # that edge explicit rather than moving it across the source block.
+            continue
+        if (
+            source.exception_edge is not None
+            or source.active_exception_handlers
+            or successor.exception_edge is not None
+            or successor.active_exception_handlers
+            or _contains_terminal_statement(successor.statements)
+            or _contains_unscoped_loop_control(successor.statements)
+        ):
+            continue
+        successor_statements = _statements_without_trivial_phi_assignments(
+            successor.statements,
+            incoming_blocks=(source.id,),
+        )
+        if successor_statements is None:
+            continue
+
+        outgoing_targets = set(_terminator_targets(successor.terminator))
+        if any(
+            isinstance(statement, Assign)
+            and isinstance(statement.value, Phi)
+            and any(predecessor == successor.id for predecessor, _value in statement.value.incoming)
+            for block in function.blocks
+            if block.id not in outgoing_targets
+            for statement in block.statements
+        ):
+            # A Phi mentioning the removed block must belong to one of its
+            # actual outgoing successors.  Reject malformed/stale edge facts
+            # instead of silently leaving an unresolvable predecessor label.
+            continue
+        rewritten_outgoing: dict[str, BasicBlock] = {}
+        valid = True
+        for target_id in outgoing_targets:
+            target = block_map.get(target_id)
+            if target is None:
+                valid = False
+                break
+            renamed = _rename_phi_predecessor(
+                target,
+                previous=successor.id,
+                replacement=source.id,
+            )
+            if renamed is None:
+                valid = False
+                break
+            rewritten_outgoing[target_id] = renamed
+        if not valid:
+            continue
+
+        rewritten_blocks: list[BasicBlock] = []
+        for block in function.blocks:
+            if block.id == successor.id:
+                continue
+            if block.id in rewritten_outgoing:
+                rewritten_blocks.append(rewritten_outgoing[block.id])
+                continue
+            if block.id == source.id:
+                rewritten_blocks.append(
+                    replace(
+                        block,
+                        statements=(*block.statements, *successor_statements),
+                        terminator=successor.terminator,
+                    )
+                )
+                continue
+            rewritten_blocks.append(block)
+
+        rewritten = replace(
+            function,
+            blocks=tuple(rewritten_blocks),
+            metadata={
+                **function.metadata,
+                "low_level_cfg_structured": "exact-loop-linear-block-merge",
+            },
+        )
+        if build_cfg(rewritten).diagnostics:
+            continue
+        return rewritten
+    return None
 
 
 def _structure_exact_linear_block_merges(function: FunctionIR) -> FunctionIR | None:
@@ -372,6 +612,13 @@ def _structure_exact_linear_block_merges(function: FunctionIR) -> FunctionIR | N
                 continue
             if cfg.predecessors(successor.id) != (block.id,):
                 continue
+            # The target's implicit fallthrough depends on its physical
+            # position.  Removing it can redirect the surviving source to a
+            # different tuple neighbour.  The sole safe exception is a final
+            # block: it has no physical successor, so merging it cannot create
+            # a new edge.
+            if successor.terminator is None and successor.id != current.blocks[-1].id:
+                continue
             incoming = (block.id,)
             merged_statements = _statements_without_trivial_phi_assignments(
                 successor.statements,
@@ -392,6 +639,35 @@ def _structure_exact_linear_block_merges(function: FunctionIR) -> FunctionIR | N
         )
         if merged_phi_free is None:
             return None if not changed else current
+
+        # Removing ``target`` changes the predecessor identity seen by every
+        # successor of that block.  Rewrite those edge-labelled Phi inputs
+        # before committing the merge; otherwise a later analysis could read
+        # a value from a block that no longer exists.  Reject collisions and
+        # stale Phi labels conservatively instead of dropping data-flow facts.
+        outgoing_targets = set(_terminator_targets(target.terminator))
+        if any(
+            isinstance(statement, Assign)
+            and isinstance(statement.value, Phi)
+            and any(predecessor == target.id for predecessor, _value in statement.value.incoming)
+            for block in current.blocks
+            if block.id not in outgoing_targets
+            for statement in block.statements
+        ):
+            return None if not changed else current
+        rewritten_outgoing: dict[str, BasicBlock] = {}
+        for successor_id in outgoing_targets:
+            successor = block_map.get(successor_id)
+            if successor is None:
+                return None if not changed else current
+            rewritten_successor = _rename_phi_predecessor(
+                successor,
+                previous=target.id,
+                replacement=source.id,
+            )
+            if rewritten_successor is None:
+                return None if not changed else current
+            rewritten_outgoing[successor_id] = rewritten_successor
         current = FunctionIR(
             name=current.name,
             params=current.params,
@@ -402,6 +678,8 @@ def _structure_exact_linear_block_merges(function: FunctionIR) -> FunctionIR | N
                     terminator=target.terminator,
                 )
                 if block.id == source.id
+                else rewritten_outgoing[block.id]
+                if block.id in rewritten_outgoing
                 else block
                 for block in current.blocks
                 if block.id != target.id
@@ -1405,6 +1683,269 @@ def _structure_exact_branch_join_return(function: FunctionIR) -> FunctionIR | No
     )
 
 
+def _structure_exact_optional_phi_diamond_region(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a diamond where one branch enters the join directly.
+
+    The source shape is ``branch -> join`` on one edge and
+    ``branch -> single-entry arm -> join`` on the other.  This is the
+    VM-neutral optional-arm form of Ghidra's if collapse.  The join's Phi
+    copies are placed on the corresponding mutually-exclusive edge, and every
+    other incoming edge or non-linear continuation rejects the rewrite.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    loop_headers = frozenset(loop.header for loop in loops)
+
+    def loop_membership(block_id: str) -> frozenset[str]:
+        return frozenset(loop.header for loop in loops if block_id in loop.blocks)
+
+    loop_headers = frozenset(loop.header for loop in loops)
+    for source in function.blocks:
+        if not isinstance(source.terminator, Branch):
+            continue
+        true_block = block_map.get(source.terminator.true_target)
+        false_block = block_map.get(source.terminator.false_target)
+        if true_block is None or false_block is None or true_block.id == false_block.id:
+            continue
+        if source.id in loop_headers or any(source.id in loop.blocks for loop in loops):
+            continue
+
+        if true_block.id == false_block.id:
+            continue
+        direct_is_true: bool | None = None
+        if true_block.terminator is not None and isinstance(true_block.terminator, Jump):
+            if true_block.terminator.target == false_block.id and cfg.predecessors(true_block.id) == (source.id,):
+                arm = true_block
+                join = false_block
+                direct_is_true = False
+            else:
+                arm = None
+                join = None
+        else:
+            arm = None
+            join = None
+        if arm is None:
+            if (
+                isinstance(false_block.terminator, Jump)
+                and false_block.terminator.target == true_block.id
+                and cfg.predecessors(false_block.id) == (source.id,)
+            ):
+                arm = false_block
+                join = true_block
+                direct_is_true = True
+            else:
+                continue
+        if arm is None or join is None or direct_is_true is None:
+            continue
+        if join.id in loop_headers:
+            continue
+        if loop_membership(source.id) != loop_membership(arm.id) or loop_membership(source.id) != loop_membership(join.id):
+            continue
+        if set(cfg.predecessors(join.id)) != {source.id, arm.id}:
+            continue
+        if (
+            _contains_unscoped_loop_control(source.statements)
+            or _contains_unscoped_loop_control(arm.statements)
+        ):
+            continue
+
+        source_statements = _statements_without_trivial_phi_assignments(
+            source.statements,
+            incoming_blocks=cfg.predecessors(source.id),
+        )
+        arm_statements = _statements_without_trivial_phi_assignments(
+            arm.statements,
+            incoming_blocks=(source.id,),
+        )
+        phi_copies = _direct_phi_join_copies(join, source.id, arm.id)
+        if source_statements is None or arm_statements is None or phi_copies is None:
+            continue
+        direct_copies, arm_copies, join_statements = phi_copies
+
+        if direct_is_true:
+            then_body = direct_copies
+            else_body = (*arm_statements, *arm_copies)
+        else:
+            then_body = (*arm_statements, *arm_copies)
+            else_body = direct_copies
+
+        rewritten_continuation: BasicBlock | None = None
+        if isinstance(join.terminator, Jump):
+            continuation_id = join.terminator.target
+            if continuation_id in {source.id, arm.id, join.id}:
+                continue
+            continuation = block_map.get(continuation_id)
+            if continuation is None:
+                continue
+            rewritten_continuation = _rename_phi_predecessor(
+                continuation,
+                previous=join.id,
+                replacement=source.id,
+            )
+            if rewritten_continuation is None:
+                continue
+            rewritten_terminator: Terminator = Jump(
+                source=join.terminator.source,
+                target=continuation_id,
+            )
+        elif isinstance(join.terminator, Return):
+            rewritten_terminator = join.terminator
+        else:
+            continue
+
+        rewritten_source = BasicBlock(
+            id=source.id,
+            statements=(
+                *source_statements,
+                If(
+                    source=source.terminator.source,
+                    condition=source.terminator.condition,
+                    then_body=then_body,
+                    else_body=else_body,
+                ),
+                *join_statements,
+            ),
+            terminator=rewritten_terminator,
+        )
+        removed = {arm.id, join.id}
+        return FunctionIR(
+            name=function.name,
+            params=function.params,
+            blocks=tuple(
+                rewritten_source
+                if block.id == source.id
+                else rewritten_continuation
+                if rewritten_continuation is not None and block.id == rewritten_continuation.id
+                else block
+                for block in function.blocks
+                if block.id not in removed
+            ),
+            nested_functions=function.nested_functions,
+            source=function.source,
+            recovery_kind=function.recovery_kind,
+            metadata={
+                **function.metadata,
+                "low_level_cfg_structured": "exact-optional-phi-diamond-region",
+            },
+        )
+    return None
+
+
+def _structure_exact_optional_terminal_diamond_region(function: FunctionIR) -> FunctionIR | None:
+    """Collapse an optional arm whose common join terminates the function.
+
+    The source shape is ``branch -> join`` on one edge and
+    ``branch -> arm -> join`` on the other.  Unlike the Phi-diamond rule, the
+    join here is a terminal block (including a block ending in a statement
+    level raise).  The arm may already contain structured statements, but its
+    CFG edge to the join must be unique so moving those statements under the
+    branch cannot duplicate or skip an execution path.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    loop_headers = frozenset(loop.header for loop in loops)
+
+    def loop_membership(block_id: str) -> frozenset[str]:
+        return frozenset(loop.header for loop in loops if block_id in loop.blocks)
+
+    def is_terminal(block: BasicBlock) -> bool:
+        return isinstance(block.terminator, (Return,)) or (
+            block.terminator is None
+            and bool(block.statements)
+            and isinstance(block.statements[-1], (Raise, Reraise))
+        )
+
+    for source in function.blocks:
+        if not isinstance(source.terminator, Branch):
+            continue
+        true_block = block_map.get(source.terminator.true_target)
+        false_block = block_map.get(source.terminator.false_target)
+        if true_block is None or false_block is None or true_block.id == false_block.id:
+            continue
+
+        arm: BasicBlock | None = None
+        join: BasicBlock | None = None
+        arm_is_true: bool | None = None
+        if (
+            isinstance(true_block.terminator, Jump)
+            and true_block.terminator.target == false_block.id
+            and cfg.predecessors(true_block.id) == (source.id,)
+        ):
+            arm, join, arm_is_true = true_block, false_block, True
+        elif (
+            isinstance(false_block.terminator, Jump)
+            and false_block.terminator.target == true_block.id
+            and cfg.predecessors(false_block.id) == (source.id,)
+        ):
+            arm, join, arm_is_true = false_block, true_block, False
+        if arm is None or join is None or arm_is_true is None:
+            continue
+        if not is_terminal(join):
+            continue
+        if set(cfg.predecessors(join.id)) != {source.id, arm.id}:
+            continue
+        if any(loop_membership(block.id) for block in (source, arm, join)):
+            continue
+        if _contains_unscoped_loop_control(source.statements):
+            continue
+
+        source_statements = _statements_without_trivial_phi_assignments(
+            source.statements,
+            incoming_blocks=cfg.predecessors(source.id),
+        )
+        arm_statements = _statements_without_trivial_phi_assignments(
+            arm.statements,
+            incoming_blocks=(source.id,),
+        )
+        phi_copies = _direct_phi_join_copies(join, source.id, arm.id)
+        if source_statements is None or arm_statements is None or phi_copies is None:
+            continue
+        direct_copies, arm_copies, join_statements = phi_copies
+
+        arm_body = (*arm_statements, *arm_copies)
+        rewritten_source = BasicBlock(
+            id=source.id,
+            statements=(
+                *source_statements,
+                If(
+                    source=source.terminator.source,
+                    condition=source.terminator.condition,
+                    then_body=arm_body if arm_is_true else direct_copies,
+                    else_body=direct_copies if arm_is_true else arm_body,
+                ),
+                *join_statements,
+            ),
+            terminator=join.terminator,
+        )
+        removed = {arm.id, join.id}
+        return FunctionIR(
+            name=function.name,
+            params=function.params,
+            blocks=tuple(
+                rewritten_source if block.id == source.id else block
+                for block in function.blocks
+                if block.id not in removed
+            ),
+            nested_functions=function.nested_functions,
+            source=function.source,
+            recovery_kind="generic-vm-low-level-cfg-structured",
+            metadata={
+                **function.metadata,
+                "structured_lift": "generic-vm-low-level-cfg-structured",
+                "low_level_cfg_structured": "exact-optional-terminal-diamond-region",
+            },
+        )
+    return None
+
+
 def _structure_exact_direct_phi_diamond_region(function: FunctionIR) -> FunctionIR | None:
     """Collapse one two-arm phi diamond without requiring a whole function.
 
@@ -2212,6 +2753,345 @@ def _structure_exact_direct_phi_dispatch_region(function: FunctionIR) -> Functio
     return None
 
 
+def _structure_exact_partial_multiway_arm_splice(function: FunctionIR) -> FunctionIR | None:
+    """Inline exclusive multiway arms while retaining a shared join block.
+
+    Ghidra collapses switch cases locally even when the common continuation is
+    also reached from outside the switch.  The full-region dispatch matcher
+    intentionally requires an exact join predecessor set, so it cannot apply
+    to that shape.  This rule removes only case blocks whose sole predecessor
+    is the dispatch block and whose sole successor is the same join.  The join
+    remains in the CFG, preserving every external entry and its terminator.
+
+    A Phi at the retained join is rewritten only when all removed case edges
+    carry the same value (and an existing dispatch edge, when present, carries
+    that value too).  Distinct edge values cannot be represented by one new
+    predecessor without adding a language-specific carrier, so the candidate
+    is rejected and the original goto form is preserved.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    loop_headers = frozenset(loop.header for loop in loops)
+
+    def loop_membership(block_id: str) -> frozenset[str]:
+        return frozenset(loop.header for loop in loops if block_id in loop.blocks)
+
+    for source in function.blocks:
+        terminator = source.terminator
+        if not isinstance(terminator, MultiBranch):
+            continue
+        targets = tuple(target for _value, target in terminator.cases) + (
+            terminator.default_target,
+        )
+        if not targets or any(target == source.id for target in targets):
+            continue
+        if any(
+            any(_values_semantically_equal(value, other) for other, _target in terminator.cases[:index])
+            for index, (value, _target) in enumerate(terminator.cases)
+        ):
+            # Duplicate case values make the selected arm ambiguous in the
+            # generic IR, even if a particular frontend normally forbids them.
+            continue
+
+        target_blocks = {target: block_map.get(target) for target in set(targets)}
+        if any(block is None for block in target_blocks.values()):
+            continue
+        join_candidates: set[str] = set()
+        arm_by_target: dict[str, BasicBlock] = {}
+        valid = True
+        for target in dict.fromkeys(targets):
+            block = target_blocks[target]
+            if block is None:
+                valid = False
+                break
+            if target == source.id:
+                valid = False
+                break
+            if (
+                isinstance(block.terminator, Jump)
+                and block.terminator.target != source.id
+                # Several distinct case labels may intentionally enter one
+                # physical arm.  The CFG records one predecessor occurrence
+                # per label, so accept repeated occurrences only when every
+                # one is still this dispatch source.
+                and cfg.predecessors(block.id)
+                and set(cfg.predecessors(block.id)) == {source.id}
+            ):
+                join_candidates.add(block.terminator.target)
+                arm_by_target[target] = block
+            else:
+                # A direct target is the retained join candidate.  It may have
+                # arbitrary external predecessors and need not be an arm.
+                join_candidates.add(target)
+        if not valid or len(join_candidates) != 1:
+            continue
+        join_id = next(iter(join_candidates))
+        join = block_map.get(join_id)
+        if join is None or join.id == source.id:
+            continue
+        # A partial splice that targets a natural-loop header can erase the
+        # distinction between a loop backedge and an ordinary branch.  Leave
+        # that topology for the loop-specific exact matchers below.
+        if source.id in loop_headers or join.id in loop_headers:
+            continue
+
+        # Every non-join dispatch target must be an exclusive jump-only arm
+        # into the selected join.  A target used by both a direct edge and an
+        # arm is not removable without changing the edge identity.
+        removable: dict[str, BasicBlock] = {}
+        case_bodies: dict[str, tuple[Stmt, ...]] = {}
+        valid = True
+        for target in dict.fromkeys(targets):
+            if target == join_id:
+                case_bodies[target] = ()
+                continue
+            if target not in arm_by_target:
+                valid = False
+                break
+            arm = arm_by_target[target]
+            if arm.terminator is None or not isinstance(arm.terminator, Jump):
+                valid = False
+                break
+            if (
+                arm.terminator.target != join_id
+                or not cfg.predecessors(arm.id)
+                or set(cfg.predecessors(arm.id)) != {source.id}
+            ):
+                valid = False
+                break
+            if arm.exception_edge is not None or arm.active_exception_handlers:
+                valid = False
+                break
+            statements = _statements_without_trivial_phi_assignments(
+                arm.statements,
+                incoming_blocks=(source.id,),
+            )
+            if (
+                statements is None
+                or _contains_terminal_statement(statements)
+                or _contains_unscoped_loop_control(statements)
+            ):
+                valid = False
+                break
+            if loop_membership(arm.id) != loop_membership(source.id):
+                valid = False
+                break
+            removable[target] = arm
+            case_bodies[target] = statements
+        if not valid or not removable:
+            # No block would disappear, so this is not a splice.  Keeping this
+            # guard also avoids replacing a dispatch with an equivalent empty
+            # Switch/Jump pair indefinitely.
+            continue
+        if loop_membership(join.id) != loop_membership(source.id):
+            continue
+
+        old_join_predecessors = set(cfg.predecessors(join.id))
+        if not old_join_predecessors:
+            continue
+        removed_ids = frozenset(removable)
+        if not removed_ids <= old_join_predecessors:
+            continue
+        rewritten_join = _merge_phi_predecessors(
+            join,
+            previous=removed_ids,
+            replacement=source.id,
+            expected_predecessors=old_join_predecessors,
+        )
+        if rewritten_join is None:
+            continue
+
+        cases: list[tuple[Expr, tuple[Stmt, ...]]] = []
+        rejected = False
+        for value, target in terminator.cases:
+            body = case_bodies.get(target)
+            if body is None:
+                rejected = True
+                break
+            cases.append((value, body))
+        if rejected:
+            continue
+        default_body = case_bodies.get(terminator.default_target)
+        if default_body is None:
+            continue
+        rewritten_source = replace(
+            source,
+            statements=(
+                *source.statements,
+                Switch(
+                    source=terminator.source,
+                    selector=terminator.selector,
+                    cases=tuple(cases),
+                    default_body=default_body,
+                ),
+            ),
+            terminator=Jump(source=terminator.source, target=join_id),
+        )
+        rewritten_blocks = tuple(
+            rewritten_source
+            if block.id == source.id
+            else rewritten_join
+            if block.id == join.id
+            else block
+            for block in function.blocks
+            if block.id not in removed_ids
+        )
+        rewritten = replace(
+            function,
+            blocks=rewritten_blocks,
+            metadata={
+                **function.metadata,
+                "low_level_cfg_structured": "exact-partial-multiway-arm-splice",
+            },
+        )
+        if build_cfg(rewritten).diagnostics:
+            continue
+        return rewritten
+    return None
+
+
+def _structure_exact_partial_branch_arm_splice(function: FunctionIR) -> FunctionIR | None:
+    """Inline exclusive binary arms while retaining a shared join block.
+
+    This is the binary counterpart of
+    :func:`_structure_exact_partial_multiway_arm_splice` and mirrors
+    Ghidra's local proper-if/if-else collapse.  Each non-direct branch target
+    must be a single-entry block that jumps to the same retained join.  The
+    join may have additional predecessors; only equivalent Phi values from
+    removed arms may be merged into the source predecessor.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    loop_headers = frozenset(loop.header for loop in loops)
+
+    def loop_membership(block_id: str) -> frozenset[str]:
+        return frozenset(loop.header for loop in loops if block_id in loop.blocks)
+
+    for source in function.blocks:
+        terminator = source.terminator
+        if not isinstance(terminator, Branch):
+            continue
+        targets = (terminator.true_target, terminator.false_target)
+        if targets[0] == targets[1] or any(target == source.id for target in targets):
+            continue
+
+        join_candidates: set[str] = set()
+        arm_by_target: dict[str, BasicBlock] = {}
+        for target in targets:
+            block = block_map.get(target)
+            if block is None:
+                join_candidates.clear()
+                break
+            if (
+                isinstance(block.terminator, Jump)
+                and block.terminator.target != source.id
+                and cfg.predecessors(block.id) == (source.id,)
+            ):
+                join_candidates.add(block.terminator.target)
+                arm_by_target[target] = block
+            else:
+                join_candidates.add(target)
+        if len(join_candidates) != 1:
+            continue
+        join_id = next(iter(join_candidates))
+        join = block_map.get(join_id)
+        if join is None or join.id == source.id:
+            continue
+        if source.id in loop_headers or join.id in loop_headers:
+            continue
+
+        removable: dict[str, BasicBlock] = {}
+        bodies: dict[str, tuple[Stmt, ...]] = {}
+        valid = True
+        for target in targets:
+            if target == join_id:
+                bodies[target] = ()
+                continue
+            arm = arm_by_target.get(target)
+            if arm is None or arm.terminator is None or not isinstance(arm.terminator, Jump):
+                valid = False
+                break
+            if arm.terminator.target != join_id or cfg.predecessors(arm.id) != (source.id,):
+                valid = False
+                break
+            if arm.exception_edge is not None or arm.active_exception_handlers:
+                valid = False
+                break
+            statements = _statements_without_trivial_phi_assignments(
+                arm.statements,
+                incoming_blocks=(source.id,),
+            )
+            if (
+                statements is None
+                or _contains_terminal_statement(statements)
+                or _contains_unscoped_loop_control(statements)
+            ):
+                valid = False
+                break
+            if loop_membership(arm.id) != loop_membership(source.id):
+                valid = False
+                break
+            removable[target] = arm
+            bodies[target] = statements
+        if not valid or not removable or loop_membership(join.id) != loop_membership(source.id):
+            continue
+
+        old_join_predecessors = set(cfg.predecessors(join.id))
+        if not old_join_predecessors or not set(removable) <= old_join_predecessors:
+            continue
+        rewritten_join = _merge_phi_predecessors(
+            join,
+            previous=frozenset(removable),
+            replacement=source.id,
+            expected_predecessors=old_join_predecessors,
+        )
+        if rewritten_join is None:
+            continue
+
+        rewritten_source = replace(
+            source,
+            statements=(
+                *source.statements,
+                If(
+                    source=terminator.source,
+                    condition=terminator.condition,
+                    then_body=bodies[terminator.true_target],
+                    else_body=bodies[terminator.false_target],
+                ),
+            ),
+            terminator=Jump(source=terminator.source, target=join_id),
+        )
+        removed_ids = frozenset(removable)
+        rewritten = replace(
+            function,
+            blocks=tuple(
+                rewritten_source
+                if block.id == source.id
+                else rewritten_join
+                if block.id == join.id
+                else block
+                for block in function.blocks
+                if block.id not in removed_ids
+            ),
+            metadata={
+                **function.metadata,
+                "low_level_cfg_structured": "exact-partial-branch-arm-splice",
+            },
+        )
+        if build_cfg(rewritten).diagnostics:
+            continue
+        return rewritten
+    return None
+
+
 def _structure_exact_acyclic_tree_join_region(function: FunctionIR) -> FunctionIR | None:
     """Collapse one proven acyclic branch tree with a single postdominating join.
 
@@ -2544,6 +3424,8 @@ def _rename_phi_predecessor(
             statements.append(statement)
             continue
         incoming = list(statement.value.incoming)
+        if len({block_id for block_id, _value in incoming}) != len(incoming):
+            return None
         if not any(block_id == previous for block_id, _value in incoming):
             statements.append(statement)
             continue
@@ -2561,6 +3443,294 @@ def _rename_phi_predecessor(
             )
         )
     return BasicBlock(id=block.id, statements=tuple(statements), terminator=block.terminator)
+
+
+def _merge_phi_predecessors(
+    block: BasicBlock,
+    *,
+    previous: frozenset[str],
+    replacement: str,
+    expected_predecessors: set[str],
+) -> BasicBlock | None:
+    """Merge equivalent Phi edges into one retained CFG predecessor.
+
+    The caller removes several blocks that all enter ``block`` from the same
+    dispatch source.  A single predecessor cannot carry case-dependent Phi
+    values, so every removed edge must agree exactly with one another and with
+    an existing replacement edge, if present.  Requiring a complete old
+    predecessor set also rejects malformed/stale Phi metadata instead of
+    silently dropping a value.
+    """
+
+    if not previous or replacement in previous:
+        return None
+    statements: list[Stmt] = []
+    for statement in block.statements:
+        if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
+            statements.append(statement)
+            continue
+        incoming = tuple(statement.value.incoming)
+        incoming_ids = {predecessor for predecessor, _value in incoming}
+        if len(incoming_ids) != len(incoming):
+            return None
+        if not expected_predecessors <= incoming_ids:
+            return None
+        if incoming_ids - expected_predecessors - {"existing"}:
+            return None
+        removed_values = tuple(
+            value for predecessor, value in incoming if predecessor in previous
+        )
+        if not removed_values:
+            statements.append(statement)
+            continue
+        if any(
+            not _values_semantically_equal(removed_values[0], value)
+            for value in removed_values[1:]
+        ):
+            return None
+        replacement_values = tuple(
+            value for predecessor, value in incoming if predecessor == replacement
+        )
+        if replacement_values and not _values_semantically_equal(
+            replacement_values[0], removed_values[0]
+        ):
+            return None
+        if len(replacement_values) > 1:
+            return None
+
+        merged: list[tuple[str, Expr]] = []
+        inserted = False
+        for predecessor, value in incoming:
+            if predecessor in previous:
+                if not inserted and not replacement_values:
+                    merged.append((replacement, removed_values[0]))
+                    inserted = True
+                continue
+            merged.append((predecessor, value))
+        if replacement_values:
+            inserted = True
+        if not inserted:
+            return None
+        statements.append(replace(statement, value=replace(statement.value, incoming=tuple(merged))))
+    return replace(block, statements=tuple(statements))
+
+
+def _expand_phi_predecessor(
+    block: BasicBlock,
+    *,
+    previous: str,
+    replacements: tuple[str, ...],
+) -> BasicBlock | None:
+    """Expand one removed edge label into several equivalent predecessor edges."""
+
+    if not replacements or len(replacements) != len(set(replacements)):
+        return None
+    statements: list[Stmt] = []
+    for statement in block.statements:
+        if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
+            statements.append(statement)
+            continue
+        if len({predecessor for predecessor, _value in statement.value.incoming}) != len(statement.value.incoming):
+            return None
+        previous_values = tuple(
+            value
+            for predecessor, value in statement.value.incoming
+            if predecessor == previous
+        )
+        if not previous_values:
+            statements.append(statement)
+            continue
+        if len(previous_values) != 1:
+            return None
+        previous_value = previous_values[0]
+        incoming_by_predecessor = dict(statement.value.incoming)
+        for replacement in replacements:
+            existing = incoming_by_predecessor.get(replacement)
+            if existing is not None and not _values_semantically_equal(
+                existing,
+                previous_value,
+            ):
+                return None
+
+        expanded: list[tuple[str, Expr]] = []
+        for predecessor, value in statement.value.incoming:
+            if predecessor != previous:
+                expanded.append((predecessor, value))
+                continue
+            expanded.extend(
+                (replacement, previous_value)
+                for replacement in replacements
+                if replacement not in incoming_by_predecessor
+            )
+        statements.append(
+            replace(
+                statement,
+                value=replace(statement.value, incoming=tuple(expanded)),
+            )
+        )
+    return replace(block, statements=tuple(statements))
+
+
+def _structure_exact_acyclic_shared_linear_block(function: FunctionIR) -> FunctionIR | None:
+    """Split a shared linear block so an acyclic branch DAG becomes a tree.
+
+    Ghidra's region collapse can duplicate a side-effecting leaf when several
+    mutually exclusive paths converge on that leaf before a common
+    continuation.  This is exact for an acyclic CFG: each execution reaches at
+    most one clone, so the statements and their order are unchanged.  Phi
+    incoming values at the continuation are copied for every new predecessor;
+    any Phi ambiguity, exceptional edge, loop, or duplicate case declines the
+    rewrite and leaves the original CFG intact.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or find_natural_loops(cfg):
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    block_map = cfg.blocks
+    existing_ids = set(block_map)
+    for shared in function.blocks:
+        if shared.id == cfg.entry or not isinstance(shared.terminator, Jump):
+            continue
+        predecessors = cfg.predecessors(shared.id)
+        if len(predecessors) < 2:
+            continue
+        if _region_loop_edges_are_reducible(region_graph, frozenset({shared.id})) is False:
+            continue
+        if any(
+            isinstance(statement, Assign)
+            and isinstance(statement.target, Var)
+            and isinstance(statement.value, Phi)
+            for statement in shared.statements
+        ):
+            continue
+        if not shared.statements or _contains_terminal_statement(shared.statements):
+            continue
+        successor = block_map.get(shared.terminator.target)
+        if successor is None or successor.id == shared.id:
+            continue
+        predecessor_blocks = [block_map.get(predecessor) for predecessor in predecessors]
+        if any(block is None or block.exception_edge is not None for block in predecessor_blocks):
+            continue
+        if any(
+            edge.source in predecessors
+            and edge.target == shared.id
+            and edge.roles & {"exceptional", "irreducible"}
+            for edge in region_graph.edges
+        ):
+            continue
+
+        # Keep the original block for the first incoming edge and create one
+        # clone for each remaining edge.  The order follows CFG predecessor
+        # order, which is deterministic for build_cfg.
+        clone_by_predecessor: dict[str, str] = {}
+        for index, predecessor in enumerate(predecessors[1:], start=1):
+            clone_id = f"{shared.id}__shared_{index}"
+            if clone_id in existing_ids:
+                clone_by_predecessor = {}
+                break
+            clone_by_predecessor[predecessor] = clone_id
+        if not clone_by_predecessor:
+            continue
+
+        rewritten_blocks: list[BasicBlock] = []
+        for block in function.blocks:
+            target_id = clone_by_predecessor.get(block.id)
+            if target_id is not None:
+                rewritten_terminator = _retarget_terminator_target(
+                    block.terminator,
+                    previous=shared.id,
+                    replacement=target_id,
+                )
+                if rewritten_terminator is None:
+                    rewritten_blocks = []
+                    break
+                rewritten_blocks.append(replace(block, terminator=rewritten_terminator))
+            else:
+                rewritten_blocks.append(block)
+        if not rewritten_blocks:
+            continue
+
+        rewritten_successor = _add_shared_block_phi_incomings(
+            successor,
+            shared_id=shared.id,
+            clone_ids=tuple(clone_by_predecessor.values()),
+        )
+        if rewritten_successor is None:
+            continue
+        rewritten_blocks = [
+            rewritten_successor if block.id == successor.id else block
+            for block in rewritten_blocks
+        ]
+        rewritten_blocks.extend(
+            replace(shared, id=clone_id)
+            for clone_id in clone_by_predecessor.values()
+        )
+        split = replace(function, blocks=tuple(rewritten_blocks))
+        structured = _structure_exact_acyclic_tree_join_region(split)
+        if structured is None:
+            continue
+        return replace(
+            structured,
+            metadata={
+                **structured.metadata,
+                "low_level_cfg_structured": "exact-acyclic-shared-linear-block",
+            },
+        )
+    return None
+
+
+def _retarget_terminator_target(
+    terminator: Terminator | None,
+    *,
+    previous: str,
+    replacement: str,
+) -> Terminator | None:
+    if isinstance(terminator, Jump):
+        return replace(terminator, target=replacement if terminator.target == previous else terminator.target)
+    if isinstance(terminator, Branch):
+        return replace(
+            terminator,
+            true_target=replacement if terminator.true_target == previous else terminator.true_target,
+            false_target=replacement if terminator.false_target == previous else terminator.false_target,
+        )
+    if isinstance(terminator, MultiBranch):
+        return replace(
+            terminator,
+            cases=tuple(
+                (value, replacement if target == previous else target)
+                for value, target in terminator.cases
+            ),
+            default_target=replacement if terminator.default_target == previous else terminator.default_target,
+        )
+    return terminator
+
+
+def _add_shared_block_phi_incomings(
+    block: BasicBlock,
+    *,
+    shared_id: str,
+    clone_ids: tuple[str, ...],
+) -> BasicBlock | None:
+    statements: list[Stmt] = []
+    for statement in block.statements:
+        if not (isinstance(statement, Assign) and isinstance(statement.value, Phi)):
+            statements.append(statement)
+            continue
+        incoming = dict(statement.value.incoming)
+        if shared_id not in incoming:
+            return None
+        if any(clone_id in incoming for clone_id in clone_ids):
+            return None
+        rewritten_incoming = [*statement.value.incoming]
+        rewritten_incoming.extend((clone_id, incoming[shared_id]) for clone_id in clone_ids)
+        statements.append(
+            replace(
+                statement,
+                value=replace(statement.value, incoming=tuple(rewritten_incoming)),
+            )
+        )
+    return replace(block, statements=tuple(statements))
 
 
 def _structure_exact_acyclic_decision_tree_return(function: FunctionIR) -> FunctionIR | None:
@@ -2792,7 +3962,19 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
     if cfg.entry is None or cfg.diagnostics:
         return None
     block_map = cfg.blocks
-    loop_blocks = frozenset(block_id for loop in find_natural_loops(cfg) for block_id in loop.blocks)
+    natural_loops = find_natural_loops(cfg)
+    loop_blocks = frozenset(block_id for loop in natural_loops for block_id in loop.blocks)
+
+    def has_distinct_terminal_returns() -> bool:
+        returns = [
+            block.terminator
+            for block in function.blocks
+            if isinstance(block.terminator, Return)
+        ]
+        if len(returns) < 2:
+            return False
+        first = returns[0]
+        return any(not _returns_semantically_equal(first, candidate) for candidate in returns[1:])
 
     def render_terminal(
         block_id: str,
@@ -2874,6 +4056,11 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
             terminal_body, removed = rendered
             if continuation_target in removed:
                 continue
+            # Keep a guard before a loop on the CFG floor when the function
+            # has distinct terminal values.  Inlining that guard would erase
+            # the exit partition needed by a global loop proof.
+            if natural_loops and has_distinct_terminal_returns():
+                continue
             conditional = If(
                 source=terminator.source,
                 condition=terminator.condition,
@@ -2901,6 +4088,266 @@ def _structure_exact_terminal_branch_region(function: FunctionIR) -> FunctionIR 
                     "low_level_cfg_structured": "exact-terminal-branch-region",
                 },
             )
+    return None
+
+
+def _structure_exact_terminal_guarded_loop_region(function: FunctionIR) -> FunctionIR | None:
+    """Nest a proven terminal guard around one complete natural loop.
+
+    The generic shape is ``entry -> terminal`` or ``entry -> setup -> loop``.
+    The setup path is a single-predecessor chain, and the loop is the exact
+    terminal-body form handled by :func:`_structure_exact_loop_with_terminal_body_branch`.
+    This is the composition of two ordinary region collapses: no block is
+    duplicated, and the outer terminal tree and inner loop must cover every
+    reachable block exactly once.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    if cfg.entry != function.blocks[0].id:
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    loop_blocks = frozenset(loop.blocks)
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+        return None
+
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    source = block_map.get(cfg.entry)
+    if (
+        header is None
+        or source is None
+        or not isinstance(source.terminator, Branch)
+        or not isinstance(header.terminator, Branch)
+        or source.terminator.true_target == source.terminator.false_target
+    ):
+        return None
+
+    loop_preheaders = tuple(
+        predecessor
+        for predecessor in cfg.predecessors(header.id)
+        if predecessor not in loop_blocks
+    )
+    if len(loop_preheaders) != 1:
+        return None
+    loop_preheader_id = loop_preheaders[0]
+    loop_preheader = block_map.get(loop_preheader_id)
+    if loop_preheader is None:
+        return None
+
+    true_in_loop = header.terminator.true_target in loop_blocks
+    false_in_loop = header.terminator.false_target in loop_blocks
+    if true_in_loop == false_in_loop:
+        return None
+
+    def render_terminal(
+        start: str,
+        predecessor_id: str,
+        path: frozenset[str],
+    ) -> tuple[tuple[Stmt | Terminator, ...], frozenset[str]] | None:
+        """Render one acyclic terminal tree with exact edge ownership."""
+
+        if start in path or start in loop_blocks:
+            return None
+        block = block_map.get(start)
+        if block is None or cfg.predecessors(start) != (predecessor_id,):
+            return None
+        statements = _statements_without_trivial_phi_assignments(
+            block.statements,
+            incoming_blocks=(predecessor_id,),
+        )
+        if (
+            statements is None
+            or _contains_terminal_statement(statements)
+            or _contains_unscoped_loop_control(statements)
+        ):
+            return None
+        visited = path | {start}
+        terminator = block.terminator
+        if isinstance(terminator, (Return, Raise, Reraise)):
+            return (*statements, terminator), frozenset({start})
+        if terminator is None:
+            if statements and isinstance(statements[-1], (Raise, Reraise)):
+                return statements, frozenset({start})
+            return None
+        if isinstance(terminator, Jump):
+            child = render_terminal(terminator.target, start, visited)
+            if child is None:
+                return None
+            child_body, child_nodes = child
+            return (*statements, *child_body), frozenset({start}) | child_nodes
+        if isinstance(terminator, Branch):
+            if terminator.true_target == terminator.false_target:
+                return None
+            then_result = render_terminal(terminator.true_target, start, visited)
+            else_result = render_terminal(terminator.false_target, start, visited)
+            if then_result is None or else_result is None:
+                return None
+            then_body, then_nodes = then_result
+            else_body, else_nodes = else_result
+            if then_nodes & else_nodes:
+                return None
+            return (
+                *statements,
+                If(
+                    source=terminator.source,
+                    condition=terminator.condition,
+                    then_body=then_body,
+                    else_body=else_body,
+                ),
+            ), frozenset({start}) | then_nodes | else_nodes
+        if not isinstance(terminator, MultiBranch):
+            return None
+        targets = tuple(target for _value, target in terminator.cases) + (
+            terminator.default_target,
+        )
+        if not targets or len(set(targets)) != len(targets):
+            return None
+        cases: list[tuple[Expr, tuple[Stmt | Terminator, ...]]] = []
+        used_nodes: set[str] = set()
+        for value, target in terminator.cases:
+            if any(_values_semantically_equal(value, existing) for existing, _body in cases):
+                return None
+            result = render_terminal(target, start, visited)
+            if result is None:
+                return None
+            body, nodes = result
+            if used_nodes & set(nodes):
+                return None
+            used_nodes.update(nodes)
+            cases.append((value, body))
+        default_result = render_terminal(terminator.default_target, start, visited)
+        if default_result is None:
+            return None
+        default_body, default_nodes = default_result
+        if used_nodes & set(default_nodes):
+            return None
+        return (
+            *statements,
+            Switch(
+                source=terminator.source,
+                selector=terminator.selector,
+                cases=tuple(cases),
+                default_body=default_body,
+            ),
+        ), frozenset({start}) | frozenset(used_nodes) | default_nodes
+
+    def render_setup(
+        start: str,
+    ) -> tuple[tuple[Stmt, ...], frozenset[str]] | None:
+        """Render the single-entry setup chain ending at the loop preheader."""
+
+        statements: list[Stmt] = []
+        nodes: set[str] = set()
+        current = start
+        predecessor = source.id
+        while True:
+            if current in loop_blocks or current in nodes:
+                return None
+            block = block_map.get(current)
+            if block is None or cfg.predecessors(current) != (predecessor,):
+                return None
+            block_statements = _statements_without_trivial_phi_assignments(
+                block.statements,
+                incoming_blocks=(predecessor,),
+            )
+            if (
+                block_statements is None
+                or _contains_terminal_statement(block_statements)
+                or _contains_unscoped_loop_control(block_statements)
+            ):
+                return None
+            statements.extend(block_statements)
+            nodes.add(current)
+            if current == loop_preheader_id:
+                if not isinstance(block.terminator, Jump) or block.terminator.target != header.id:
+                    return None
+                return tuple(statements), frozenset(nodes)
+            if not isinstance(block.terminator, Jump):
+                return None
+            predecessor, current = current, block.terminator.target
+
+    source_statements = _statements_without_trivial_phi_assignments(
+        source.statements,
+        incoming_blocks=(),
+    )
+    if (
+        source_statements is None
+        or _contains_terminal_statement(source_statements)
+        or _contains_unscoped_loop_control(source_statements)
+    ):
+        return None
+
+    for terminal_is_true in (True, False):
+        terminal_target = (
+            source.terminator.true_target
+            if terminal_is_true
+            else source.terminator.false_target
+        )
+        setup_target = (
+            source.terminator.false_target
+            if terminal_is_true
+            else source.terminator.true_target
+        )
+        terminal_result = render_terminal(
+            terminal_target,
+            source.id,
+            frozenset({source.id}),
+        )
+        setup_result = render_setup(setup_target)
+        if terminal_result is None or setup_result is None:
+            continue
+        terminal_body, terminal_nodes = terminal_result
+        setup_statements, setup_nodes = setup_result
+        if terminal_nodes & setup_nodes:
+            continue
+
+        inner_reachable = _reachable_block_ids(cfg, loop_preheader_id)
+        if (
+            source.id in inner_reachable
+            or terminal_nodes & inner_reachable
+            or not inner_reachable <= set(block_map)
+        ):
+            continue
+        reachable = _reachable_block_ids(cfg, cfg.entry)
+        if reachable != set(block_map):
+            continue
+        if reachable != {source.id} | set(terminal_nodes) | set(inner_reachable):
+            continue
+
+        inner_preheader = replace(loop_preheader, statements=setup_statements)
+        inner_blocks = (inner_preheader,) + tuple(
+            block
+            for block in function.blocks
+            if block.id in inner_reachable and block.id != loop_preheader_id
+        )
+        if {block.id for block in inner_blocks} != set(inner_reachable):
+            continue
+        inner_function = replace(function, blocks=inner_blocks)
+        structured_inner = _structure_exact_loop_with_terminal_body_branch(inner_function)
+        if structured_inner is None or len(structured_inner.blocks) != 1:
+            continue
+        inner_block = structured_inner.blocks[0]
+        if not isinstance(inner_block.terminator, (Return, Raise, Reraise)):
+            continue
+        inner_body = (*inner_block.statements, inner_block.terminator)
+        conditional = If(
+            source=source.terminator.source,
+            condition=source.terminator.condition,
+            then_body=terminal_body if terminal_is_true else inner_body,
+            else_body=inner_body if terminal_is_true else terminal_body,
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*source_statements, conditional),
+            None,
+            "exact-terminal-guarded-loop-region",
+        )
     return None
 
 
@@ -4140,13 +5587,569 @@ def _structure_exact_single_natural_loop(function: FunctionIR) -> FunctionIR | N
     return None
 
 
+def _structure_exact_terminal_natural_loop(function: FunctionIR) -> FunctionIR | None:
+    """Recover a loop with a direct terminal return on its unique backedge path.
+
+    A number of VM lowerings place the loop-exit return in a shared join block
+    and represent the non-return path as an unconditional jump back to the
+    header.  The CFG has no ordinary exit edge in that form because the return
+    is already a statement-level terminal.  This reducer accepts only the
+    fully linear, single-entry shape and materializes the branch-arm phi copies
+    before the shared return test.  Any additional entry, branch, or terminal
+    shape remains on the explicit CFG floor.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics:
+        return None
+    block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
+    loops = find_natural_loops(cfg)
+    for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
+        if loop.exits:
+            continue
+        header = block_map.get(loop.header)
+        if header is None or not isinstance(header.terminator, Branch):
+            continue
+        predecessors = cfg.predecessors(header.id)
+        preheaders = tuple(pred for pred in predecessors if pred not in loop.blocks)
+        if len(preheaders) != 1:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if (
+            preheader is None
+            or not isinstance(preheader.terminator, Jump)
+            or preheader.terminator.target != header.id
+            or _contains_unscoped_loop_control(preheader.statements)
+        ):
+            continue
+        # This reducer consumes the complete function region.  A surrounding
+        # continuation would require a distinct exit proof and is rejected.
+        if {block.id for block in function.blocks} != set(loop.blocks) | {preheader.id}:
+            continue
+        if not _region_loop_edges_are_reducible(region_graph, frozenset(loop.blocks)):
+            continue
+        true_target = header.terminator.true_target
+        false_target = header.terminator.false_target
+        if true_target == false_target or true_target not in loop.blocks or false_target not in loop.blocks:
+            continue
+        true_block = block_map.get(true_target)
+        false_block = block_map.get(false_target)
+        if true_block is None or false_block is None:
+            continue
+        if not isinstance(true_block.terminator, Jump) or not isinstance(false_block.terminator, Jump):
+            continue
+        if true_block.terminator.target != false_block.terminator.target:
+            continue
+        join_id = true_block.terminator.target
+        join = block_map.get(join_id)
+        if join is None or join_id not in loop.blocks:
+            continue
+        if set(cfg.predecessors(join_id)) != {true_block.id, false_block.id}:
+            continue
+        true_statements = _statements_without_trivial_phi_assignments(
+            true_block.statements,
+            incoming_blocks=(header.id,),
+        )
+        false_statements = _statements_without_trivial_phi_assignments(
+            false_block.statements,
+            incoming_blocks=(header.id,),
+        )
+        phi_copies = _direct_phi_join_copies(join, true_block.id, false_block.id)
+        if true_statements is None or false_statements is None or phi_copies is None:
+            continue
+        true_copies, false_copies, join_statements = phi_copies
+        if not join_statements or not isinstance(join.terminator, Jump):
+            continue
+        terminal = join_statements[-1]
+        if not isinstance(terminal, If):
+            continue
+        if not _is_direct_terminal_return_if(terminal):
+            continue
+        # Keep the existing conservative truthiness contract for short
+        # circuit phi loops: a non-return arm is only structurally safe to
+        # project when one incoming copy is an explicit falsey sentinel.  A
+        # truthy sentinel can carry VM-specific truthiness semantics that the
+        # generic reducer must leave on the CFG preservation floor.
+        has_falsey_sentinel = any(
+            isinstance(copy.value, Const)
+            and isinstance(copy.value.value, (bool, int, float))
+            and (copy.value.value is False or copy.value.value == 0)
+            for copy in (*true_copies, *false_copies)
+            if isinstance(copy, Assign)
+        )
+        if not has_falsey_sentinel:
+            if not _is_explicit_scalar_comparison(terminal.condition):
+                continue
+            if not _phi_copies_are_statically_boolean(
+                (*true_copies, *false_copies),
+                (true_statements, false_statements),
+            ):
+                continue
+
+        tail_statements: list[Stmt] = []
+        current_id = join.terminator.target
+        visited = {header.id, true_block.id, false_block.id, join.id}
+        previous_id = join.id
+        while current_id != header.id:
+            if current_id in visited:
+                break
+            visited.add(current_id)
+            tail = block_map.get(current_id)
+            if tail is None or not isinstance(tail.terminator, Jump):
+                break
+            if set(cfg.predecessors(current_id)) != {previous_id}:
+                break
+            tail_without_phi = _statements_without_trivial_phi_assignments(
+                tail.statements,
+                incoming_blocks=tuple(cfg.predecessors(current_id)),
+            )
+            if tail_without_phi is None:
+                break
+            tail_statements.extend(tail_without_phi)
+            previous_id = current_id
+            current_id = tail.terminator.target
+        else:
+            # Every loop block must be represented exactly once by the two
+            # branch arms, the join, or the unique linear tail.
+            if visited != set(loop.blocks):
+                continue
+            branch = If(
+                source=header.terminator.source,
+                condition=header.terminator.condition,
+                then_body=(*true_statements, *true_copies),
+                else_body=(*false_statements, *false_copies),
+            )
+            loop_statement = While(
+                source=header.terminator.source,
+                condition=Const(source=header.terminator.source, value=True),
+                body=(branch, *join_statements, *tail_statements),
+            )
+            return _rewrite_while_structured_function(
+                function,
+                (*preheader.statements, loop_statement),
+                None,
+                "exact-terminal-natural-loop",
+            )
+    return None
+
+
+def _structure_exact_direct_join_terminal_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a loop whose branch has one direct edge to its terminal latch.
+
+    A common lowering shares the latch between the two outcomes of a loop
+    header: one outcome jumps directly to the latch, while the other executes
+    a single-entry arm and then jumps to that same latch.  The latch contains
+    the loop-carried Phi copies, a statement-level terminal guard, and the
+    backedge.  This is the direct-join counterpart of
+    ``_structure_exact_terminal_join_loop``.
+
+    The matcher is deliberately complete-graph only.  It accepts exactly one
+    preheader and three loop blocks, requires the direct latch and arm
+    predecessor sets to be exact, and leaves any extra entry, exit, nested
+    loop, exceptional edge, or ambiguous Phi on the low-level preservation
+    floor.  Moving the header branch and latch statements into one ``while
+    (true)`` body preserves their original evaluation order; no condition is
+    synthesized or combined.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    loop_blocks = frozenset(loop.blocks)
+    if loop.exits or len(loop_blocks) != 3:
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+        return None
+
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Branch):
+        return None
+    if header.terminator.true_target == header.terminator.false_target:
+        return None
+
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(pred for pred in predecessors if pred not in loop_blocks)
+    if len(preheaders) != 1 or preheaders[0] != cfg.entry:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or cfg.predecessors(preheader.id)
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_terminal_statement(preheader.statements)
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+    if set(block_map) != loop_blocks | {preheader.id}:
+        return None
+
+    # Try both branch orientations.  ``direct`` is the latch reached directly
+    # from the header; ``arm`` is the only intermediate block on the other
+    # edge.  Exact predecessor sets exclude hidden side entries.
+    for direct_id, arm_id in (
+        (header.terminator.true_target, header.terminator.false_target),
+        (header.terminator.false_target, header.terminator.true_target),
+    ):
+        direct = block_map.get(direct_id)
+        arm = block_map.get(arm_id)
+        if direct is None or arm is None or direct.id == arm.id:
+            continue
+        if direct.id not in loop_blocks or arm.id not in loop_blocks:
+            continue
+        if not isinstance(direct.terminator, Jump) or direct.terminator.target != header.id:
+            continue
+        if not isinstance(arm.terminator, Jump) or arm.terminator.target != direct.id:
+            continue
+        if set(cfg.predecessors(arm.id)) != {header.id}:
+            continue
+        if set(cfg.predecessors(direct.id)) != {header.id, arm.id}:
+            continue
+        if set(loop_blocks) != {header.id, direct.id, arm.id}:
+            continue
+
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=predecessors,
+        )
+        arm_statements = _statements_without_trivial_phi_assignments(
+            arm.statements,
+            incoming_blocks=(header.id,),
+        )
+        phi_copies = _direct_phi_join_copies(
+            direct,
+            arm.id,
+            header.id,
+        )
+        if header_statements is None or arm_statements is None or phi_copies is None:
+            continue
+        if (
+            _contains_terminal_statement(header_statements)
+            or _contains_terminal_statement(arm_statements)
+            or _contains_unscoped_loop_control(header_statements)
+            or _contains_unscoped_loop_control(arm_statements)
+        ):
+            continue
+
+        arm_copies, direct_copies, latch_statements = phi_copies
+        if (
+            _contains_terminal_statement(arm_copies)
+            or _contains_terminal_statement(direct_copies)
+            or _contains_unscoped_loop_control(arm_copies)
+            or _contains_unscoped_loop_control(direct_copies)
+            or not _contains_terminal_statement(latch_statements)
+            or _contains_unscoped_loop_control(latch_statements)
+        ):
+            continue
+
+        # A loop-carried value used by the terminal guard must have a
+        # language-neutral truthiness proof.  An explicit falsey incoming
+        # constant is sufficient.  Otherwise accept only a scalar comparison
+        # whose non-constant Phi inputs were produced by static comparisons;
+        # an arbitrary call result (or a truthy sentinel) stays on the CFG
+        # floor, matching the existing short-circuit loop contract.
+        has_falsey_sentinel = any(
+            isinstance(copy, Assign)
+            and isinstance(copy.value, Const)
+            and isinstance(copy.value.value, (bool, int, float))
+            and (copy.value.value is False or copy.value.value == 0)
+            for copy in (*arm_copies, *direct_copies)
+        )
+        if not has_falsey_sentinel:
+            terminal_conditions = tuple(
+                statement.condition
+                for statement in latch_statements
+                if isinstance(statement, If)
+                and _contains_terminal_statement(
+                    (*statement.then_body, *statement.else_body)
+                )
+            )
+            if (
+                len(terminal_conditions) != 1
+                or not _is_explicit_scalar_comparison(terminal_conditions[0])
+                or not _phi_copies_are_statically_boolean(
+                    (*arm_copies, *direct_copies),
+                    (arm_statements, ()),
+                )
+            ):
+                continue
+
+        arm_body = (*arm_statements, *arm_copies)
+        direct_body = direct_copies
+        branch = If(
+            source=header.terminator.source,
+            condition=header.terminator.condition,
+            then_body=arm_body if direct_id == header.terminator.false_target else direct_body,
+            else_body=direct_body if direct_id == header.terminator.false_target else arm_body,
+        )
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, branch, *latch_statements),
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader.statements, loop_statement),
+            None,
+            "exact-direct-join-terminal-loop",
+        )
+    return None
+
+
+def _structure_exact_pretested_loop_with_terminal_body_return(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a pretested loop with one terminal body arm.
+
+    The complete graph is ``preheader -> header``; the header branches to a
+    three-block loop body or to a terminal exit; and the body branches either
+    through one latch back to the header or to a second terminal block.  This
+    is the smallest generic form of a loop with an early return.  Requiring
+    the complete reachable graph and unique predecessors prevents a shared
+    continuation, hidden entry, or duplicated side effect from being folded.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    if len(loop.blocks) != 3 or len(loop.exits) != 2:
+        return None
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Branch):
+        return None
+
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(pred for pred in predecessors if pred not in loop.blocks)
+    if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+
+    reachable = _reachable_block_ids(cfg, cfg.entry)
+    if reachable != set(block_map):
+        return None
+    if not _region_loop_edges_are_reducible(RegionGraph.from_cfg(cfg), frozenset(loop.blocks)):
+        return None
+
+    # Header statements run before every condition evaluation.  Keeping only
+    # identity Phi copies proves there is no effect that would move across the
+    # pretested while condition.
+    header_statements = _statements_without_trivial_phi_assignments(
+        header.statements,
+        incoming_blocks=predecessors,
+    )
+    if header_statements is None or header_statements:
+        return None
+
+    body_targets = [target for target in _terminator_targets(header.terminator) if target in loop.blocks]
+    exit_targets = [target for target in _terminator_targets(header.terminator) if target not in loop.blocks]
+    if len(body_targets) != 1 or len(exit_targets) != 1:
+        return None
+    body_id = body_targets[0]
+    header_exit_id = exit_targets[0]
+    body = block_map.get(body_id)
+    header_exit = block_map.get(header_exit_id)
+    if body is None or header_exit is None or not isinstance(body.terminator, Branch):
+        return None
+    if cfg.predecessors(body.id) != (header.id,):
+        return None
+
+    latch_targets = [target for target in _terminator_targets(body.terminator) if target in loop.blocks]
+    body_exit_targets = [target for target in _terminator_targets(body.terminator) if target not in loop.blocks]
+    if len(latch_targets) != 1 or len(body_exit_targets) != 1:
+        return None
+    latch = block_map.get(latch_targets[0])
+    body_exit = block_map.get(body_exit_targets[0])
+    if latch is None or body_exit is None or latch.id == header.id or latch.id == body.id:
+        return None
+    if not isinstance(latch.terminator, Jump) or latch.terminator.target != header.id:
+        return None
+    if cfg.predecessors(latch.id) != (body.id,):
+        return None
+    if cfg.predecessors(header_exit.id) != (header.id,) or cfg.predecessors(body_exit.id) != (body.id,):
+        return None
+    if {header_exit.id, body_exit.id} & set(loop.blocks):
+        return None
+    if set(block_map) != set(loop.blocks) | {preheader.id, header_exit.id, body_exit.id}:
+        return None
+
+    body_statements = _statements_without_trivial_phi_assignments(
+        body.statements,
+        incoming_blocks=(header.id,),
+    )
+    latch_statements = _statements_without_trivial_phi_assignments(
+        latch.statements,
+        incoming_blocks=(body.id,),
+    )
+    if body_statements is None or latch_statements is None:
+        return None
+    if _contains_unscoped_loop_control(body_statements) or _contains_unscoped_loop_control(latch_statements):
+        return None
+
+    def terminal_body(block: BasicBlock, predecessor: str) -> tuple[Stmt, ...] | None:
+        statements = _statements_without_trivial_phi_assignments(
+            block.statements,
+            incoming_blocks=(predecessor,),
+        )
+        if statements is None or _contains_unscoped_loop_control(statements):
+            return None
+        if isinstance(block.terminator, Return):
+            return (*statements, block.terminator)
+        if block.terminator is None and statements and isinstance(statements[-1], (Raise, Reraise)):
+            return statements
+        return None
+
+    header_exit_body = terminal_body(header_exit, header.id)
+    body_exit_body = terminal_body(body_exit, body.id)
+    if header_exit_body is None or body_exit_body is None:
+        return None
+
+    backedge_body = (*latch_statements, Continue())
+    body_branch = body.terminator
+    if body_branch.true_target == latch.id:
+        then_body, else_body = backedge_body, body_exit_body
+    elif body_branch.false_target == latch.id:
+        then_body, else_body = body_exit_body, backedge_body
+    else:
+        return None
+    loop_body = (
+        *body_statements,
+        If(
+            source=body_branch.source,
+            condition=body_branch.condition,
+            then_body=then_body,
+            else_body=else_body,
+        ),
+    )
+    header_branch = header.terminator
+    if header_branch.true_target == body.id:
+        loop_condition = header_branch.condition
+    elif header_branch.false_target == body.id:
+        loop_condition = UnaryOp(
+            source=header_branch.condition.source,
+            type=header_branch.condition.type,
+            op="not ",
+            value=header_branch.condition,
+        )
+    else:
+        return None
+    header_exit_terminator = header_exit.terminator
+    if isinstance(header_exit_terminator, Return):
+        terminal_statements = (*header_exit_body[:-1],)
+        terminal_terminator: Terminator | None = header_exit_terminator
+    else:
+        terminal_statements = header_exit_body
+        terminal_terminator = None
+    return _rewrite_while_structured_function(
+        function,
+        (
+            *preheader.statements,
+            While(condition=loop_condition, body=loop_body),
+            *terminal_statements,
+        ),
+        terminal_terminator,
+        "exact-pretested-loop-with-terminal-body-return",
+    )
+
+
+def _is_direct_terminal_return_if(statement: If) -> bool:
+    """Accept one linear terminal-return arm and one empty arm.
+
+    A compiler may materialize the return value immediately before the
+    terminator.  That prefix is safe to retain in the same branch, provided it
+    contains no nested terminal or loop-control statement that would make the
+    surrounding CFG edge inaccurate.
+    """
+
+    def terminal_arm(body: tuple[Stmt, ...]) -> bool:
+        return bool(body) and isinstance(body[-1], Return) and not _contains_terminal_statement(body[:-1]) and not _contains_unscoped_loop_control(body[:-1])
+
+    return (terminal_arm(statement.then_body) and not statement.else_body) or (
+        terminal_arm(statement.else_body) and not statement.then_body
+    )
+
+
+def _is_explicit_scalar_comparison(condition: Expr) -> bool:
+    """Recognize a comparison whose result is tested explicitly.
+
+    This is distinct from a bare truthiness test: the loop reducer can retain
+    the exact comparison without relying on VM-specific truthiness of a Phi
+    value.  Requiring a constant operand keeps the proof scalar and neutral.
+    """
+
+    return (
+        isinstance(condition, BinaryOp)
+        and condition.op in {"==", "!=", "<", "<=", ">", ">="}
+        and (isinstance(condition.left, Const) or isinstance(condition.right, Const))
+    )
+
+
+def _phi_copies_are_statically_boolean(
+    copies: tuple[Stmt, ...],
+    arm_statements: tuple[tuple[Stmt, ...], tuple[Stmt, ...]],
+) -> bool:
+    """Prove non-constant Phi inputs came from explicit static comparisons."""
+
+    definitions = {
+        statement.target.name: statement.value
+        for statements in arm_statements
+        for statement in statements
+        if isinstance(statement, Assign)
+        and isinstance(statement.target, Var)
+    }
+    variable_copies = [
+        copy.value
+        for copy in copies
+        if isinstance(copy, Assign)
+        and isinstance(copy.value, Var)
+    ]
+    if not variable_copies:
+        return False
+    return all(
+        isinstance(definitions.get(value.name), BinaryOp)
+        and definitions[value.name].op in {"==", "!=", "<", "<=", ">", ">="}
+        and definitions[value.name].semantics == "static"
+        for value in variable_copies
+    )
+
+
+def _region_loop_edges_are_reducible(region_graph: RegionGraph, members: frozenset[str]) -> bool:
+    """Reject exceptional or irreducible edges touching a candidate loop."""
+
+    return not any(
+        edge.roles & {"exceptional", "irreducible"}
+        for edge in region_graph.edges
+        if edge.source in members or edge.target in members
+    )
+
+
 def _structure_exact_two_edge_header_phi_while(function: FunctionIR) -> FunctionIR | None:
     """Recover a simple pretested loop with explicit two-edge header phis."""
 
     if len(function.blocks) != 4:
         return None
     preheader, header, body, exit_block = function.blocks
-    if not isinstance(preheader.terminator, Jump) or preheader.terminator.target != header.id:
+    if (
+        not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
         return None
     if not isinstance(header.terminator, Branch):
         return None
@@ -4229,6 +6232,94 @@ def _two_edge_header_phi_copies(
     return tuple(entry), tuple(backedge), tuple(remaining)
 
 
+def _structure_exact_header_terminal_guard_loop(function: FunctionIR) -> FunctionIR | None:
+    """Recover a linear loop whose header guard returns on its false arm.
+
+    A lowering may keep a loop test as a statement-level ``If`` in the loop
+    header: the true arm falls through to a linear body and the false arm
+    returns the accumulated value.  The body then reaches an empty latch that
+    jumps back to the header.  This is equivalent to a pre-tested ``While``
+    followed by the header's terminal return, but only when the complete
+    natural-loop boundary is proven.  Matching is intentionally independent of
+    the condition's expression or callee so this remains VM-neutral.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics:
+        return None
+    block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
+    reachable = _reachable_block_ids(cfg, cfg.entry)
+    if reachable != set(block_map):
+        return None
+
+    loops = find_natural_loops(cfg)
+    for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
+        if loop.exits or len(loop.blocks) != 3:
+            continue
+        header = block_map.get(loop.header)
+        if header is None:
+            continue
+        if not _region_loop_edges_are_reducible(region_graph, frozenset(loop.blocks)):
+            continue
+        predecessors = cfg.predecessors(header.id)
+        preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop.blocks)
+        if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if preheader is None or not isinstance(preheader.terminator, Jump) or preheader.terminator.target != header.id:
+            continue
+        if (
+            _contains_unscoped_loop_control(preheader.statements)
+            or _contains_terminal_statement(preheader.statements)
+        ):
+            continue
+        if not isinstance(header.terminator, Jump):
+            continue
+        body_id = header.terminator.target
+        body = block_map.get(body_id)
+        if body is None or body_id not in loop.blocks or body_id == header.id:
+            continue
+        if set(cfg.predecessors(body_id)) != {header.id} or not isinstance(body.terminator, Jump):
+            continue
+        latch_id = body.terminator.target
+        latch = block_map.get(latch_id)
+        if latch is None or latch_id not in loop.blocks or latch_id in {header.id, body_id}:
+            continue
+        if set(cfg.predecessors(latch_id)) != {body.id} or not isinstance(latch.terminator, Jump):
+            continue
+        if latch.terminator.target != header.id or latch.statements:
+            continue
+        if set(loop.blocks) != {header.id, body.id, latch.id} or loop.backedge_source != latch.id:
+            continue
+        if len(header.statements) != 1 or not isinstance(header.statements[0], If):
+            continue
+        guard = header.statements[0]
+        if guard.then_body or len(guard.else_body) != 1 or not isinstance(guard.else_body[0], Return):
+            continue
+        body_statements = _statements_without_trivial_phi_assignments(
+            body.statements,
+            incoming_blocks=(header.id,),
+        )
+        if body_statements is None or _contains_unscoped_loop_control(body_statements):
+            continue
+        terminal_return = guard.else_body[0]
+        return _rewrite_while_structured_function(
+            function,
+            (
+                *preheader.statements,
+                While(
+                    source=guard.source,
+                    condition=guard.condition,
+                    body=body_statements,
+                ),
+            ),
+            terminal_return,
+            "exact-header-terminal-guard-loop",
+        )
+    return None
+
+
 def _structure_exact_multi_backedge_natural_loop_region(function: FunctionIR) -> FunctionIR | None:
     """Collapse a single-entry loop whose header has multiple backedges.
 
@@ -4285,6 +6376,1698 @@ def _structure_exact_multi_backedge_natural_loop_region(function: FunctionIR) ->
     return None
 
 
+def _structure_exact_multi_backedge_terminal_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a tree-shaped loop with several backedges and inline exits.
+
+    A VM can lower ``while true`` with an ``if``/``elseif`` cascade so every
+    successful arm jumps back to the same header while the final arm returns
+    directly from a statement-level branch.  Natural-loop discovery reports a
+    separate loop for each backedge, but the union is one executable region.
+    This reducer accepts only the strict tree form: one external preheader,
+    one header, no ordinary edge leaving the union, one predecessor for every
+    non-header member, and complete reachability from the header arms.  Those
+    conditions make rendering each arm independently equivalent to traversing
+    the original CFG; any shared node, phi ambiguity, exception edge, or
+    additional exit remains on the low-level preservation floor.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    groups: dict[str, list[object]] = {}
+    for loop in loops:
+        groups.setdefault(loop.header, []).append(loop)
+
+    for header_id, group in sorted(groups.items(), key=lambda item: (item[0], len(item[1]))):
+        if len(group) < 2:
+            continue
+        union = frozenset().union(*(loop.blocks for loop in group))
+        header = block_map.get(header_id)
+        if header is None or not isinstance(header.terminator, Branch):
+            continue
+        if header.terminator.true_target == header.terminator.false_target:
+            continue
+        if not {header.terminator.true_target, header.terminator.false_target} <= union:
+            continue
+
+        predecessors = cfg.predecessors(header_id)
+        preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in union)
+        if len(preheaders) != 1 or function.blocks[0].id != preheaders[0]:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if (
+            preheader is None
+            or not isinstance(preheader.terminator, Jump)
+            or preheader.terminator.target != header_id
+            or _contains_unscoped_loop_control(preheader.statements)
+        ):
+            continue
+        if set(block_map) != set(union) | {preheader.id}:
+            continue
+        if not _region_loop_edges_are_reducible(region_graph, union):
+            continue
+
+        # A tree-shaped arm has exactly one incoming edge.  This prevents a
+        # shared block from being rendered twice with different predecessor
+        # state and also makes every edge-local phi unambiguous.
+        if any(
+            block_id != header_id
+            and (
+                len(cfg.predecessors(block_id)) != 1
+                or cfg.predecessors(block_id)[0] not in union
+            )
+            for block_id in union
+        ):
+            continue
+        if any(
+            edge.source in union and edge.target not in union
+            for edge in cfg.edges
+        ):
+            continue
+        reachable = _reachable_block_ids(cfg, header_id) & set(union)
+        if reachable != set(union):
+            continue
+        if any(
+            not isinstance(block_map[block_id].terminator, (Jump, Branch, MultiBranch))
+            for block_id in union
+        ):
+            continue
+
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=predecessors,
+        )
+        if header_statements is None:
+            continue
+        true_target = header.terminator.true_target
+        false_target = header.terminator.false_target
+        true_result = _render_loop_body(
+            block_map,
+            true_target,
+            header_id=header_id,
+            exit_id="__no_loop_exit__",
+            loop_blocks=union,
+            path=frozenset({header_id}),
+        )
+        false_result = _render_loop_body(
+            block_map,
+            false_target,
+            header_id=header_id,
+            exit_id="__no_loop_exit__",
+            loop_blocks=union,
+            path=frozenset({header_id}),
+        )
+        if true_result is None or false_result is None:
+            continue
+        true_body, true_effect = true_result
+        false_body, false_effect = false_result
+        body = (
+            If(
+                source=header.terminator.source,
+                condition=header.terminator.condition,
+                then_body=true_body,
+                else_body=false_body,
+            ),
+        )
+        if not true_effect or not false_effect:
+            continue
+        if _statements_contain_break(body) or not _contains_terminal_statement(body):
+            continue
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, *body),
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader.statements, loop_statement),
+            None,
+            "exact-multi-backedge-terminal-loop",
+        )
+    return None
+
+
+def _structure_exact_multiway_terminal_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a dispatch-headed loop with only terminal or header arms.
+
+    This is the multi-way counterpart of the strict terminal-arm loop rule.
+    It models the common CFG shape ``header -> switch -> ... -> header`` where
+    each dispatch arm is an independent tree and every non-backedge leaf
+    returns or raises.  The proof deliberately rejects shared nodes, nontrivial
+    Phi values, exceptional edges, nested/crossing loops, and nonterminal
+    exits.  A failed proof leaves the original CFG untouched.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    groups: dict[str, list[object]] = {}
+    for loop in loops:
+        groups.setdefault(loop.header, []).append(loop)
+
+    for header_id, group in sorted(groups.items(), key=lambda item: (item[0], len(item[1]))):
+        header = block_map.get(header_id)
+        if header is None or not isinstance(header.terminator, MultiBranch):
+            continue
+        loop_blocks = frozenset().union(*(loop.blocks for loop in group))
+        if not loop_blocks or header_id not in loop_blocks:
+            continue
+        if any(
+            other.header != header_id
+            and other.blocks & loop_blocks
+            and not (other.blocks <= loop_blocks or loop_blocks <= other.blocks)
+            for other in loops
+        ):
+            continue
+        if not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+            continue
+
+        predecessors = cfg.predecessors(header_id)
+        preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop_blocks)
+        if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if (
+            preheader is None
+            or not isinstance(preheader.terminator, Jump)
+            or preheader.terminator.target != header_id
+            or cfg.predecessors(preheader.id)
+            or _contains_terminal_statement(preheader.statements)
+            or _contains_unscoped_loop_control(preheader.statements)
+        ):
+            continue
+
+        # Non-header loop members must be entered only from the loop itself.
+        # A single predecessor alone is insufficient: an external block could
+        # otherwise be folded into an arm and silently change loop-entry
+        # semantics.  The header is the only member with an external
+        # preheader entry.
+        if any(
+            member != header_id
+            and (
+                len(cfg.predecessors(member)) != 1
+                or cfg.predecessors(member)[0] not in loop_blocks
+            )
+            for member in loop_blocks
+        ):
+            continue
+        if any(
+            edge.source in loop_blocks and edge.target in loop_blocks
+            and edge.target == header_id and edge.roles & {"exceptional", "irreducible"}
+            for edge in region_graph.edges
+        ):
+            continue
+
+        targets = tuple(target for _value, target in header.terminator.cases) + (
+            header.terminator.default_target,
+        )
+        if not targets or len(set(targets)) != len(targets):
+            continue
+
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=predecessors,
+        )
+        if header_statements is None:
+            continue
+
+        rendered_nodes: set[str] = {header_id}
+        terminal_nodes: set[str] = set()
+        rendered_arms: dict[str, tuple[tuple[Stmt, ...], bool]] = {}
+        valid = True
+        for target in targets:
+            result = _render_terminal_dispatch_path(
+                block_map,
+                cfg,
+                target,
+                header_id=header_id,
+                loop_blocks=loop_blocks,
+                path=frozenset({header_id}),
+                allow_header=True,
+            )
+            if result is None:
+                valid = False
+                break
+            body, effect, nodes = result
+            node_set = set(nodes)
+            # Every node in an arm must be reached from the arm itself or the
+            # dispatch header.  Without this boundary check, an unrelated
+            # predecessor could enter a rendered terminal tree (or a loop
+            # member) and make the arm's execution context incomplete.
+            if any(
+                set(cfg.predecessors(node_id)) - node_set - {header_id}
+                for node_id in node_set
+            ):
+                valid = False
+                break
+            if rendered_nodes & nodes or terminal_nodes & nodes:
+                valid = False
+                break
+            rendered_arms[target] = (body, effect)
+            rendered_nodes.update(nodes & set(loop_blocks))
+            terminal_nodes.update(nodes - set(loop_blocks))
+        if not valid:
+            continue
+
+        reachable = _reachable_block_ids(cfg, cfg.entry)
+        if reachable != {preheader.id} | rendered_nodes | terminal_nodes:
+            continue
+        if rendered_nodes != set(loop_blocks) or not terminal_nodes:
+            continue
+        if any(
+            block_id not in loop_blocks | {preheader.id}
+            and any(
+                edge.source == block_id
+                and edge.target in loop_blocks | terminal_nodes
+                and edge.roles & {"exceptional", "irreducible"}
+                for edge in region_graph.edges
+            )
+            for block_id in reachable
+        ):
+            continue
+
+        cases = tuple(
+            (value, rendered_arms[target][0])
+            for value, target in header.terminator.cases
+        )
+        default_body = rendered_arms[header.terminator.default_target][0]
+        if not any(effect for _body, effect in rendered_arms.values()):
+            continue
+        switch = Switch(
+            source=header.terminator.source,
+            selector=header.terminator.selector,
+            cases=cases,
+            default_body=default_body,
+        )
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, switch),
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader.statements, loop_statement),
+            None,
+            "exact-multiway-terminal-loop",
+        )
+    return None
+
+
+def _render_terminal_dispatch_path(
+    block_map: dict[str, BasicBlock],
+    cfg,
+    start: str,
+    *,
+    header_id: str,
+    loop_blocks: frozenset[str],
+    path: frozenset[str],
+    allow_header: bool,
+) -> tuple[tuple[Stmt, ...], bool, frozenset[str]] | None:
+    """Render one disjoint dispatch arm, including terminal leaves."""
+
+    if start == header_id:
+        if not allow_header:
+            return None
+        # The header is owned by the enclosing loop and is already accounted
+        # for by the caller.  A backedge contributes only the structured
+        # control outcome, not another rendered node.
+        return ((Continue(),), False, frozenset())
+    if start in path:
+        return None
+    block = block_map.get(start)
+    if block is None:
+        return None
+    predecessors = cfg.predecessors(start)
+    if start in loop_blocks:
+        if len(predecessors) != 1 or predecessors[0] not in loop_blocks:
+            return None
+    statements = _statements_without_trivial_phi_assignments(
+        block.statements,
+        incoming_blocks=predecessors,
+    )
+    if statements is None or _contains_unscoped_loop_control(statements):
+        return None
+    next_path = path | {start}
+    nodes = frozenset({start})
+    terminator = block.terminator
+    if isinstance(terminator, Return):
+        return (*statements, terminator), True, nodes
+    if terminator is None:
+        if statements and isinstance(statements[-1], (Raise, Reraise)):
+            return statements, True, nodes
+        return None
+    if isinstance(terminator, Jump):
+        child = _render_terminal_dispatch_path(
+            block_map,
+            cfg,
+            terminator.target,
+            header_id=header_id,
+            loop_blocks=loop_blocks,
+            path=next_path,
+            allow_header=start in loop_blocks,
+        )
+        if child is None:
+            return None
+        child_body, child_effect, child_nodes = child
+        return (*statements, *child_body), bool(statements) or child_effect, nodes | child_nodes
+    if isinstance(terminator, Branch):
+        if terminator.true_target == terminator.false_target:
+            return None
+        then_result = _render_terminal_dispatch_path(
+            block_map,
+            cfg,
+            terminator.true_target,
+            header_id=header_id,
+            loop_blocks=loop_blocks,
+            path=next_path,
+            allow_header=start in loop_blocks,
+        )
+        else_result = _render_terminal_dispatch_path(
+            block_map,
+            cfg,
+            terminator.false_target,
+            header_id=header_id,
+            loop_blocks=loop_blocks,
+            path=next_path,
+            allow_header=start in loop_blocks,
+        )
+        if then_result is None or else_result is None:
+            return None
+        then_body, then_effect, then_nodes = then_result
+        else_body, else_effect, else_nodes = else_result
+        if then_nodes & else_nodes:
+            return None
+        return (
+            *statements,
+            If(
+                source=terminator.source,
+                condition=terminator.condition,
+                then_body=then_body,
+                else_body=else_body,
+            ),
+        ), bool(statements) or then_effect or else_effect, nodes | then_nodes | else_nodes
+    if not isinstance(terminator, MultiBranch):
+        return None
+    targets = tuple(target for _value, target in terminator.cases) + (terminator.default_target,)
+    if not targets or len(set(targets)) != len(targets):
+        return None
+    case_results: list[tuple[Expr, tuple[Stmt, ...], bool, frozenset[str]]] = []
+    used_nodes = set(nodes)
+    for value, target in terminator.cases:
+        result = _render_terminal_dispatch_path(
+            block_map,
+            cfg,
+            target,
+            header_id=header_id,
+            loop_blocks=loop_blocks,
+            path=next_path,
+            allow_header=start in loop_blocks,
+        )
+        if result is None:
+            return None
+        body, effect, child_nodes = result
+        if used_nodes & set(child_nodes):
+            return None
+        used_nodes.update(child_nodes)
+        case_results.append((value, body, effect, child_nodes))
+    default_result = _render_terminal_dispatch_path(
+        block_map,
+        cfg,
+        terminator.default_target,
+        header_id=header_id,
+        loop_blocks=loop_blocks,
+        path=next_path,
+        allow_header=start in loop_blocks,
+    )
+    if default_result is None:
+        return None
+    default_body, default_effect, default_nodes = default_result
+    if used_nodes & set(default_nodes):
+        return None
+    return (
+        *statements,
+        Switch(
+            source=terminator.source,
+            selector=terminator.selector,
+            cases=tuple((value, body) for value, body, _effect, _nodes in case_results),
+            default_body=default_body,
+        ),
+    ), bool(statements) or default_effect or any(effect for _value, _body, effect, _nodes in case_results), nodes | frozenset(used_nodes) | default_nodes
+
+
+def _structure_exact_multiway_shared_linear_join_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a dispatch loop with a single linear shared continuation.
+
+    This is the deliberately small switch-loop subset of Ghidra's region
+    collapse: every case arm is a disjoint jump-only chain into one join, and
+    the join's suffix is another jump-only chain ending at the header or a
+    terminal block.  No arm branch, shared interior node, nontrivial Phi,
+    exceptional edge, or alternate exit is guessed here.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    groups: dict[str, list[object]] = {}
+    for loop in loops:
+        groups.setdefault(loop.header, []).append(loop)
+
+    for header_id, group in sorted(groups.items(), key=lambda item: (item[0], len(item[1]))):
+        header = block_map.get(header_id)
+        if header is None or not isinstance(header.terminator, MultiBranch):
+            continue
+        loop_blocks = frozenset().union(*(loop.blocks for loop in group))
+        if header_id not in loop_blocks or not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+            continue
+        if any(
+            other.header != header_id
+            and other.blocks & loop_blocks
+            and not (other.blocks <= loop_blocks or loop_blocks <= other.blocks)
+            for other in loops
+        ):
+            continue
+
+        predecessors = cfg.predecessors(header_id)
+        preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop_blocks)
+        if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if (
+            preheader is None
+            or cfg.predecessors(preheader.id)
+            or not isinstance(preheader.terminator, Jump)
+            or preheader.terminator.target != header_id
+            or _contains_terminal_statement(preheader.statements)
+            or _contains_unscoped_loop_control(preheader.statements)
+        ):
+            continue
+
+        targets = tuple(target for _value, target in header.terminator.cases) + (
+            header.terminator.default_target,
+        )
+        if not targets or len(set(targets)) != len(targets):
+            continue
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=predecessors,
+        )
+        if header_statements is None:
+            continue
+
+        joins = sorted(
+            (
+                member
+                for member in loop_blocks
+                if member != header_id and len(set(cfg.predecessors(member))) > 1
+            ),
+            key=lambda member: (-len(set(cfg.predecessors(member))), member),
+        )
+        for join_id in joins:
+            join_predecessors = tuple(dict.fromkeys(cfg.predecessors(join_id)))
+            if len(join_predecessors) != len(cfg.predecessors(join_id)):
+                continue
+            if not set(join_predecessors) <= set(loop_blocks):
+                continue
+
+            arm_nodes: set[str] = set()
+            arm_bodies: dict[str, tuple[Stmt, ...]] = {}
+            arm_sources: set[str] = set()
+            valid = True
+            for target in targets:
+                result = _render_linear_dispatch_arm(
+                    block_map,
+                    cfg,
+                    target,
+                    join_id=join_id,
+                    header_id=header_id,
+                    loop_blocks=loop_blocks,
+                    path=frozenset({header_id}),
+                    predecessor_id=header_id,
+                )
+                if result is None:
+                    valid = False
+                    break
+                body, nodes, sources = result
+                if arm_nodes & set(nodes):
+                    valid = False
+                    break
+                arm_nodes.update(nodes)
+                arm_sources.update(sources)
+                arm_bodies[target] = body
+            if not valid or arm_sources != set(join_predecessors):
+                continue
+
+            tail = _render_linear_join_tail(
+                block_map,
+                cfg,
+                join_id,
+                header_id=header_id,
+                loop_blocks=loop_blocks,
+                path=frozenset(),
+                allow_header=True,
+                predecessor_id=None,
+            )
+            if tail is None:
+                continue
+            tail_body, tail_nodes, tail_effect = tail
+            if arm_nodes & set(tail_nodes):
+                continue
+            rendered_loop_nodes = arm_nodes | (set(tail_nodes) & set(loop_blocks)) | {header_id}
+            if rendered_loop_nodes != set(loop_blocks):
+                continue
+            reachable = _reachable_block_ids(cfg, cfg.entry)
+            external_nodes = set(tail_nodes) - set(loop_blocks)
+            if reachable != {preheader.id} | rendered_loop_nodes | external_nodes:
+                continue
+            if not arm_nodes and not tail_effect:
+                continue
+
+            switch = Switch(
+                source=header.terminator.source,
+                selector=header.terminator.selector,
+                cases=tuple(
+                    (value, arm_bodies[target])
+                    for value, target in header.terminator.cases
+                ),
+                default_body=arm_bodies[header.terminator.default_target],
+            )
+            loop_statement = While(
+                source=header.terminator.source,
+                condition=Const(source=header.terminator.source, value=True),
+                body=(*header_statements, switch, *tail_body),
+            )
+            return _rewrite_while_structured_function(
+                function,
+                (*preheader.statements, loop_statement),
+                None,
+                "exact-multiway-shared-linear-join-loop",
+            )
+    return None
+
+
+def _render_linear_dispatch_arm(
+    block_map: dict[str, BasicBlock],
+    cfg,
+    start: str,
+    *,
+    join_id: str,
+    header_id: str,
+    loop_blocks: frozenset[str],
+    path: frozenset[str],
+    predecessor_id: str,
+) -> tuple[tuple[Stmt, ...], frozenset[str], frozenset[str]] | None:
+    """Render one jump-only case arm up to the shared join."""
+
+    if start == join_id:
+        return (), frozenset(), frozenset({predecessor_id})
+    if start == header_id or start in path or start not in loop_blocks:
+        return None
+    if cfg.predecessors(start) != (predecessor_id,):
+        return None
+    block = block_map.get(start)
+    if block is None or not isinstance(block.terminator, Jump):
+        return None
+    statements = _statements_without_trivial_phi_assignments(
+        block.statements,
+        incoming_blocks=(predecessor_id,),
+    )
+    if (
+        statements is None
+        or _contains_terminal_statement(statements)
+        or _contains_unscoped_loop_control(statements)
+    ):
+        return None
+    child = _render_linear_dispatch_arm(
+        block_map,
+        cfg,
+        block.terminator.target,
+        join_id=join_id,
+        header_id=header_id,
+        loop_blocks=loop_blocks,
+        path=path | {start},
+        predecessor_id=start,
+    )
+    if child is None:
+        return None
+    child_body, child_nodes, child_sources = child
+    return (*statements, *child_body), frozenset({start}) | child_nodes, child_sources
+
+
+def _render_linear_join_tail(
+    block_map: dict[str, BasicBlock],
+    cfg,
+    start: str,
+    *,
+    header_id: str,
+    loop_blocks: frozenset[str],
+    path: frozenset[str],
+    allow_header: bool,
+    predecessor_id: str | None,
+) -> tuple[tuple[Stmt, ...], frozenset[str], bool] | None:
+    """Render a jump-only shared suffix to the header or a terminal block."""
+
+    if start == header_id:
+        if not allow_header:
+            return None
+        return (Continue(),), frozenset(), False
+    if start in path:
+        return None
+    block = block_map.get(start)
+    if block is None:
+        return None
+    # The join is entered by all dispatch arms and is checked by the caller.
+    # Every subsequent tail node must have exactly the edge from the node that
+    # rendered it; otherwise a hidden side entry could change the structured
+    # execution order or data-flow state.
+    if predecessor_id is None:
+        if path:
+            return None
+    elif cfg.predecessors(start) != (predecessor_id,):
+        return None
+    statements = _statements_without_trivial_phi_assignments(
+        block.statements,
+        incoming_blocks=cfg.predecessors(start),
+    )
+    if (
+        statements is None
+        or _contains_terminal_statement(statements)
+        or _contains_unscoped_loop_control(statements)
+    ):
+        return None
+    nodes = frozenset({start})
+    terminator = block.terminator
+    if isinstance(terminator, Return):
+        return (*statements, terminator), nodes, True
+    if terminator is None:
+        if statements and isinstance(statements[-1], (Raise, Reraise)):
+            return statements, nodes, True
+        return None
+    if not isinstance(terminator, Jump):
+        return None
+    child = _render_linear_join_tail(
+        block_map,
+        cfg,
+        terminator.target,
+        header_id=header_id,
+        loop_blocks=loop_blocks,
+        path=path | {start},
+        allow_header=start in loop_blocks,
+        predecessor_id=start,
+    )
+    if child is None:
+        return None
+    child_body, child_nodes, child_effect = child
+    return (*statements, *child_body), nodes | child_nodes, bool(statements) or child_effect
+
+
+def _structure_exact_terminal_join_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a single loop with a shared join before its backedge.
+
+    The loop body may begin with a binary diamond (for example, an error path
+    and a normal path) whose arms converge at one join.  After that join the
+    CFG must be a single linear chain back to the header.  This is the shape
+    Ghidra handles by collapsing the diamond first and then the loop; keeping
+    the two proofs separate lets the generic join renderer materialize any
+    safe edge-local Phi values without making the loop matcher language aware.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    if loop.exits:
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, frozenset(loop.blocks)):
+        return None
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Branch):
+        return None
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop.blocks)
+    if len(preheaders) != 1 or function.blocks[0].id != preheaders[0]:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+    if set(block_map) != set(loop.blocks) | {preheader.id}:
+        return None
+    true_block = block_map.get(header.terminator.true_target)
+    false_block = block_map.get(header.terminator.false_target)
+    if (
+        true_block is None
+        or false_block is None
+        or true_block.id == false_block.id
+        or true_block.id not in loop.blocks
+        or false_block.id not in loop.blocks
+        or not isinstance(true_block.terminator, Jump)
+        or not isinstance(false_block.terminator, Jump)
+        or true_block.terminator.target != false_block.terminator.target
+    ):
+        return None
+    join_id = true_block.terminator.target
+    join = block_map.get(join_id)
+    if join is None or join_id not in loop.blocks:
+        return None
+    if set(cfg.predecessors(join_id)) != {true_block.id, false_block.id}:
+        return None
+
+    # Prove that the post-join portion is one linear chain ending at the
+    # header.  Any second branch, side entry, or alternate cycle would need a
+    # different structuring proof and is deliberately left as CFG/goto.
+    chain = {header.id, true_block.id, false_block.id}
+    current_id = join_id
+    while current_id != header.id:
+        if current_id in chain:
+            return None
+        current = block_map.get(current_id)
+        if current is None:
+            return None
+        if current_id == join_id:
+            if set(cfg.predecessors(current_id)) != {true_block.id, false_block.id}:
+                return None
+        elif len(cfg.predecessors(current_id)) != 1:
+            return None
+        if not isinstance(current.terminator, Jump):
+            return None
+        chain.add(current_id)
+        current_id = current.terminator.target
+    if chain != set(loop.blocks):
+        return None
+
+    header_statements = _statements_without_trivial_phi_assignments(
+        header.statements,
+        incoming_blocks=predecessors,
+    )
+    if header_statements is None:
+        return None
+    join_phi = _direct_phi_join_copies(join, true_block.id, false_block.id)
+    if join_phi is None:
+        # _direct_phi_join_copies accepts only constant or variable incoming
+        # values, rejects cyclic phi dependencies, and emits each non-identity
+        # copy at the end of its mutually-exclusive arm.  That is an exact
+        # representation of the original join assignment, including a
+        # loop-carried ``existing`` value when it is semantically identical to
+        # one arm.  Any richer value or ambiguous incoming set remains on the
+        # preservation CFG floor.
+        return None
+    if any(
+        isinstance(statement, Assign)
+        and isinstance(statement.value, Phi)
+        and not any(
+            isinstance(incoming, Const)
+            and isinstance(incoming.value, (bool, int, float))
+            and (incoming.value is False or incoming.value == 0)
+            for predecessor in (true_block.id, false_block.id)
+            for source_id, incoming in statement.value.incoming
+            if source_id == predecessor
+        )
+        for statement in join.statements
+    ):
+        # A truthy sentinel does not define a language-neutral short-circuit
+        # value.  Keep the join explicit until a VM-neutral truthiness fact is
+        # available instead of guessing that it behaves like false.
+        return None
+    rendered = _render_direct_phi_join(
+        block_map,
+        header,
+        header_id=header.id,
+        exit_id="__no_loop_exit__",
+        loop_blocks=frozenset(loop.blocks),
+        path=frozenset({header.id}),
+    )
+    if rendered is None:
+        return None
+    body, has_effect = rendered
+    if (
+        not has_effect
+        or _statements_contain_break(body)
+        or not _contains_terminal_statement(body)
+    ):
+        return None
+    loop_statement = While(
+        source=header.terminator.source,
+        condition=Const(source=header.terminator.source, value=True),
+        body=(*header_statements, *body),
+    )
+    return _rewrite_while_structured_function(
+        function,
+        (*preheader.statements, loop_statement),
+        None,
+        "exact-terminal-join-loop",
+    )
+
+
+def _structure_exact_loop_with_terminal_body_branch(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a loop whose body branch either terminates or continues.
+
+    The generic CFG shape is ``header -> body``/``exit`` followed by a body
+    branch with one linear terminal arm and one linear backedge arm.  Every
+    path is checked independently so distinct terminal values are preserved.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    loop_blocks = frozenset(loop.blocks)
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+        return None
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Branch):
+        return None
+
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop_blocks)
+    if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_terminal_statement(preheader.statements)
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+
+    true_in_loop = header.terminator.true_target in loop_blocks
+    false_in_loop = header.terminator.false_target in loop_blocks
+    if true_in_loop == false_in_loop and not (true_in_loop and not loop.exits):
+        return None
+    body_start = header.terminator.true_target if true_in_loop else header.terminator.false_target
+    header_exit = None if true_in_loop and false_in_loop else (
+        header.terminator.false_target if true_in_loop else header.terminator.true_target
+    )
+    if body_start == header.id or (header_exit is not None and header_exit in loop_blocks):
+        return None
+
+    if any(
+        member != header.id
+        and any(predecessor not in loop_blocks for predecessor in cfg.predecessors(member))
+        for member in loop_blocks
+    ):
+        return None
+
+    def terminal_path(
+        start: str,
+        predecessor_id: str,
+    ) -> tuple[tuple[Stmt, ...], Terminator, frozenset[str]] | None:
+        statements: list[Stmt] = []
+        nodes: set[str] = set()
+        current = start
+        previous = predecessor_id
+        while True:
+            if current in loop_blocks or current in nodes:
+                return None
+            block = block_map.get(current)
+            if block is None or cfg.predecessors(current) != (previous,):
+                return None
+            block_statements = _statements_without_trivial_phi_assignments(
+                block.statements,
+                incoming_blocks=(previous,),
+            )
+            if (
+                block_statements is None
+                or _contains_terminal_statement(block_statements)
+                or _contains_unscoped_loop_control(block_statements)
+            ):
+                return None
+            statements.extend(block_statements)
+            nodes.add(current)
+            terminator = block.terminator
+            if isinstance(terminator, (Return, Raise, Reraise)):
+                return tuple(statements), terminator, frozenset(nodes)
+            if not isinstance(terminator, Jump):
+                return None
+            previous, current = current, terminator.target
+
+    def continue_path(
+        start: str,
+        predecessor_id: str,
+    ) -> tuple[tuple[Stmt, ...], frozenset[str]] | None:
+        statements: list[Stmt] = []
+        nodes: set[str] = set()
+        current = start
+        previous = predecessor_id
+        while current != header.id:
+            if current not in loop_blocks or current in nodes:
+                return None
+            block = block_map.get(current)
+            if block is None or cfg.predecessors(current) != (previous,):
+                return None
+            block_statements = _statements_without_trivial_phi_assignments(
+                block.statements,
+                incoming_blocks=(previous,),
+            )
+            if (
+                block_statements is None
+                or _contains_terminal_statement(block_statements)
+                or _contains_unscoped_loop_control(block_statements)
+            ):
+                return None
+            statements.extend(block_statements)
+            nodes.add(current)
+            terminator = block.terminator
+            if not isinstance(terminator, Jump):
+                return None
+            previous, current = current, terminator.target
+        return (*statements, Continue()), frozenset(nodes)
+
+    def terminal_continue_branch(block: BasicBlock) -> tuple[If, frozenset[str]] | None:
+        terminator = block.terminator
+        if not isinstance(terminator, Branch) or terminator.true_target == terminator.false_target:
+            return None
+        terminal_result = terminal_path(terminator.true_target, block.id)
+        continue_result = continue_path(terminator.false_target, block.id)
+        terminal_is_true = True
+        if terminal_result is None or continue_result is None:
+            terminal_result = terminal_path(terminator.false_target, block.id)
+            continue_result = continue_path(terminator.true_target, block.id)
+            terminal_is_true = False
+        if terminal_result is None or continue_result is None:
+            return None
+        terminal_statements, terminal_terminator, terminal_nodes = terminal_result
+        continue_statements, continue_nodes = continue_result
+        if terminal_nodes & continue_nodes:
+            return None
+        branch = If(
+            source=terminator.source,
+            condition=terminator.condition,
+            then_body=(
+                (*terminal_statements, terminal_terminator)
+                if terminal_is_true
+                else continue_statements
+            ),
+            else_body=(
+                continue_statements
+                if terminal_is_true
+                else (*terminal_statements, terminal_terminator)
+            ),
+        )
+        return branch, frozenset({block.id}) | terminal_nodes | continue_nodes
+
+    def statement_guard_continue(
+        block: BasicBlock,
+        statements: tuple[Stmt, ...],
+    ) -> tuple[If, frozenset[str]] | None:
+        """Render a statement-level terminal guard followed by a backedge."""
+
+        if not isinstance(block.terminator, Jump) or len(statements) != 1:
+            return None
+        guard = statements[0]
+        if not isinstance(guard, If):
+            return None
+        if len(guard.then_body) == 0 and guard.else_body:
+            terminal_body = guard.else_body
+            terminal_is_true = False
+        elif len(guard.else_body) == 0 and guard.then_body:
+            terminal_body = guard.then_body
+            terminal_is_true = True
+        else:
+            return None
+        if not isinstance(terminal_body[-1], (Return, Raise, Reraise)):
+            return None
+        if _contains_unscoped_loop_control(terminal_body):
+            return None
+        continue_result = continue_path(block.terminator.target, block.id)
+        if continue_result is None:
+            return None
+        continue_statements, continue_nodes = continue_result
+        branch = If(
+            source=guard.source,
+            condition=guard.condition,
+            then_body=terminal_body if terminal_is_true else continue_statements,
+            else_body=continue_statements if terminal_is_true else terminal_body,
+        )
+        return branch, frozenset({block.id}) | continue_nodes
+
+    def optional_body_entry(
+        block: BasicBlock,
+    ) -> tuple[tuple[Stmt, ...], frozenset[str]] | None:
+        """Render an in-loop optional-arm diamond ending in a terminal guard."""
+
+        terminator = block.terminator
+        if not isinstance(terminator, Branch) or terminator.true_target == terminator.false_target:
+            return None
+        true_block = block_map.get(terminator.true_target)
+        false_block = block_map.get(terminator.false_target)
+        if (
+            true_block is None
+            or false_block is None
+            or true_block.id == false_block.id
+            or true_block.id not in loop_blocks
+            or false_block.id not in loop_blocks
+            or not isinstance(true_block.terminator, Jump)
+            or not isinstance(false_block.terminator, Jump)
+            or true_block.terminator.target != false_block.terminator.target
+            or cfg.predecessors(true_block.id) != (block.id,)
+            or cfg.predecessors(false_block.id) != (block.id,)
+        ):
+            return None
+        join = block_map.get(true_block.terminator.target)
+        if (
+            join is None
+            or join.id not in loop_blocks
+            or set(cfg.predecessors(join.id)) != {true_block.id, false_block.id}
+        ):
+            return None
+        true_statements = _statements_without_trivial_phi_assignments(
+            true_block.statements,
+            incoming_blocks=(block.id,),
+        )
+        false_statements = _statements_without_trivial_phi_assignments(
+            false_block.statements,
+            incoming_blocks=(block.id,),
+        )
+        if true_statements is None or false_statements is None:
+            return None
+        phi_copies = _direct_phi_join_copies(join, true_block.id, false_block.id)
+        if phi_copies is None:
+            return None
+        if not any(
+            isinstance(copy.value, Const)
+            and isinstance(copy.value.value, (bool, int, float))
+            and (copy.value.value is False or copy.value.value == 0)
+            for copy in (*phi_copies[0], *phi_copies[1])
+            if isinstance(copy, Assign)
+        ):
+            # Without an explicit falsey incoming value, projecting a Phi
+            # into a short-circuit guard depends on VM-specific truthiness.
+            return None
+        join_statements = phi_copies[2]
+        join_branch = terminal_continue_branch(join)
+        if join_branch is None:
+            join_branch = statement_guard_continue(join, join_statements)
+            if join_branch is not None:
+                join_statements = ()
+        if join_branch is None:
+            return None
+        rendered_join, join_nodes = join_branch
+        true_copies, false_copies, _ = phi_copies
+        arm_if = If(
+            source=terminator.source,
+            condition=terminator.condition,
+            then_body=(*true_statements, *true_copies),
+            else_body=(*false_statements, *false_copies),
+        )
+        return (
+            (arm_if, *join_statements, rendered_join),
+            frozenset({block.id, true_block.id, false_block.id, join.id}) | join_nodes,
+        )
+
+    def body_path(
+        start: str,
+        predecessor_id: str,
+    ) -> tuple[tuple[Stmt, ...], frozenset[str]] | None:
+        statements: list[Stmt] = []
+        nodes: set[str] = set()
+        current = start
+        previous = predecessor_id
+        while True:
+            if current not in loop_blocks or current == header.id or current in nodes:
+                return None
+            block = block_map.get(current)
+            if block is None or cfg.predecessors(current) != (previous,):
+                return None
+            block_statements = _statements_without_trivial_phi_assignments(
+                block.statements,
+                incoming_blocks=(previous,),
+            )
+            if (
+                block_statements is None
+                or _contains_terminal_statement(block_statements)
+                or _contains_unscoped_loop_control(block_statements)
+            ):
+                return None
+            statements.extend(block_statements)
+            nodes.add(current)
+            terminator = block.terminator
+            if isinstance(terminator, Jump):
+                if terminator.target == header.id:
+                    return (*statements, Continue()), frozenset(nodes)
+                previous, current = current, terminator.target
+                continue
+            if not isinstance(terminator, Branch) or terminator.true_target == terminator.false_target:
+                return None
+            direct = terminal_continue_branch(block)
+            if direct is not None:
+                branch, branch_nodes = direct
+                return (*statements, branch), frozenset(nodes | branch_nodes)
+
+            # The body may begin with a small optional-arm diamond.  Both
+            # arms must enter one join, and only the join may decide between
+            # the terminal path and the backedge.  Materialize the join Phi
+            # copies on the mutually exclusive arms before rendering it.
+            true_block = block_map.get(terminator.true_target)
+            false_block = block_map.get(terminator.false_target)
+            if (
+                true_block is None
+                or false_block is None
+                or true_block.id == false_block.id
+                or true_block.id not in loop_blocks
+                or false_block.id not in loop_blocks
+                or not isinstance(true_block.terminator, Jump)
+                or not isinstance(false_block.terminator, Jump)
+                or true_block.terminator.target != false_block.terminator.target
+                or cfg.predecessors(true_block.id) != (block.id,)
+                or cfg.predecessors(false_block.id) != (block.id,)
+            ):
+                return None
+            join = block_map.get(true_block.terminator.target)
+            if (
+                join is None
+                or join.id not in loop_blocks
+                or set(cfg.predecessors(join.id)) != {true_block.id, false_block.id}
+            ):
+                return None
+            true_statements = _statements_without_trivial_phi_assignments(
+                true_block.statements,
+                incoming_blocks=(block.id,),
+            )
+            false_statements = _statements_without_trivial_phi_assignments(
+                false_block.statements,
+                incoming_blocks=(block.id,),
+            )
+            phi_copies = _direct_phi_join_copies(join, true_block.id, false_block.id)
+            if (
+                true_statements is None
+                or false_statements is None
+                or phi_copies is None
+            ):
+                return None
+            join_statements = phi_copies[2]
+            join_branch = terminal_continue_branch(join)
+            if join_branch is None:
+                join_branch = statement_guard_continue(join, join_statements)
+                if join_branch is not None:
+                    join_statements = ()
+            if join_branch is None:
+                return None
+            rendered_join, join_nodes = join_branch
+            true_copies, false_copies, _ = phi_copies
+            arm_if = If(
+                source=terminator.source,
+                condition=terminator.condition,
+                then_body=(*true_statements, *true_copies),
+                else_body=(*false_statements, *false_copies),
+            )
+            return (
+                (*statements, arm_if, *join_statements, rendered_join),
+                frozenset(nodes | {true_block.id, false_block.id, join.id} | join_nodes),
+            )
+
+    header_statements = _statements_without_trivial_phi_assignments(
+        header.statements,
+        incoming_blocks=predecessors,
+    )
+    if header_statements is None:
+        return None
+    if true_in_loop and false_in_loop:
+        if loop.exits:
+            return None
+        if body_start != header.terminator.true_target:
+            return None
+        entry_body = optional_body_entry(header)
+        if entry_body is None:
+            return None
+        body_statements, body_nodes = entry_body
+        if (body_nodes & loop_blocks) != loop_blocks:
+            return None
+        body_terminal_nodes = body_nodes - loop_blocks
+        reachable = _reachable_block_ids(cfg, cfg.entry)
+        if reachable != {preheader.id, *loop_blocks, *body_terminal_nodes}:
+            return None
+        return _rewrite_while_structured_function(
+            function,
+            (
+                *preheader.statements,
+                While(
+                    source=header.terminator.source,
+                    condition=Const(source=header.terminator.source, value=True),
+                    body=(*header_statements, *body_statements),
+                ),
+            ),
+            None,
+            "exact-loop-with-terminal-body-branch",
+        )
+    body_result = body_path(body_start, header.id)
+    if body_result is None:
+        return None
+    body_statements, body_nodes = body_result
+    if (body_nodes & loop_blocks) != loop_blocks - {header.id}:
+        return None
+    body_terminal_nodes = body_nodes - loop_blocks
+    if not body_terminal_nodes:
+        return None
+    header_exit_result = terminal_path(header_exit, header.id)
+    if header_exit_result is None:
+        return None
+    header_exit_statements, header_exit_terminator, header_exit_nodes = header_exit_result
+    if body_terminal_nodes & set(header_exit_nodes):
+        return None
+    reachable = _reachable_block_ids(cfg, cfg.entry)
+    if reachable != {preheader.id, *loop_blocks, *body_terminal_nodes, *header_exit_nodes}:
+        return None
+
+    body_if = If(
+        source=header.terminator.source,
+        condition=header.terminator.condition,
+        then_body=body_statements if true_in_loop else (Break(),),
+        else_body=(Break(),) if true_in_loop else body_statements,
+    )
+    loop_statement = While(
+        source=header.terminator.source,
+        condition=Const(source=header.terminator.source, value=True),
+        body=(*header_statements, body_if),
+    )
+    return _rewrite_while_structured_function(
+        function,
+        (*preheader.statements, loop_statement, *header_exit_statements),
+        header_exit_terminator,
+        "exact-loop-with-terminal-body-branch",
+    )
+
+
+def _structure_exact_tree_loop_with_terminal_exits(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a loop whose body is a disjoint decision tree.
+
+    Each tree leaf is either a terminal instruction outside the loop or a
+    linear path back to the header.  The proof rejects joins and Phi values;
+    consequently every execution visits each rendered node at most once and
+    branch-local effects remain in their original order.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    loop_blocks = frozenset(loop.blocks)
+    if not loop.exits:
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, loop_blocks):
+        return None
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Branch):
+        return None
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop_blocks)
+    if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_terminal_statement(preheader.statements)
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+    true_in_loop = header.terminator.true_target in loop_blocks
+    false_in_loop = header.terminator.false_target in loop_blocks
+    if true_in_loop == false_in_loop:
+        return None
+    body_start = header.terminator.true_target if true_in_loop else header.terminator.false_target
+    header_exit = header.terminator.false_target if true_in_loop else header.terminator.true_target
+    if body_start == header.id or header_exit in loop_blocks:
+        return None
+    if any(
+        member != header.id
+        and (
+            len(cfg.predecessors(member)) != 1
+            or cfg.predecessors(member)[0] not in loop_blocks
+        )
+        for member in loop_blocks
+    ):
+        return None
+
+    def terminal_path(
+        start: str,
+        predecessor_id: str,
+    ) -> tuple[tuple[Stmt, ...], Terminator, frozenset[str]] | None:
+        statements: list[Stmt] = []
+        nodes: set[str] = set()
+        current = start
+        previous = predecessor_id
+        while True:
+            if current in loop_blocks or current in nodes:
+                return None
+            block = block_map.get(current)
+            if block is None or cfg.predecessors(current) != (previous,):
+                return None
+            block_statements = _statements_without_trivial_phi_assignments(
+                block.statements,
+                incoming_blocks=(previous,),
+            )
+            if (
+                block_statements is None
+                or _contains_terminal_statement(block_statements)
+                or _contains_unscoped_loop_control(block_statements)
+            ):
+                return None
+            statements.extend(block_statements)
+            nodes.add(current)
+            terminator = block.terminator
+            if isinstance(terminator, (Return, Raise, Reraise)):
+                return tuple(statements), terminator, frozenset(nodes)
+            if not isinstance(terminator, Jump):
+                return None
+            previous, current = current, terminator.target
+
+    def render_tree(
+        start: str,
+        predecessor_id: str,
+        path: frozenset[str],
+    ) -> tuple[tuple[Stmt, ...], frozenset[str], frozenset[str]] | None:
+        if start == header.id:
+            return (Continue(),), frozenset(), frozenset({"continue"})
+        if start not in loop_blocks or start in path:
+            return None
+        block = block_map.get(start)
+        if block is None or cfg.predecessors(start) != (predecessor_id,):
+            return None
+        statements = _statements_without_trivial_phi_assignments(
+            block.statements,
+            incoming_blocks=(predecessor_id,),
+        )
+        if (
+            statements is None
+            or _contains_terminal_statement(statements)
+            or _contains_unscoped_loop_control(statements)
+        ):
+            return None
+        next_path = path | {start}
+        terminator = block.terminator
+        if isinstance(terminator, Jump):
+            if terminator.target == header.id:
+                return (*statements, Continue()), frozenset({start}), frozenset({"continue"})
+            child = render_tree(terminator.target, start, next_path)
+            if child is None:
+                terminal = terminal_path(terminator.target, start)
+                if terminal is None:
+                    return None
+                terminal_statements, terminal_terminator, terminal_nodes = terminal
+                return (
+                    (*statements, *terminal_statements, terminal_terminator),
+                    frozenset({start}) | terminal_nodes,
+                    frozenset({"terminal"}),
+                )
+            child_statements, child_nodes, child_outcomes = child
+            return (
+                (*statements, *child_statements),
+                frozenset({start}) | child_nodes,
+                child_outcomes,
+            )
+        if not isinstance(terminator, Branch) or terminator.true_target == terminator.false_target:
+            return None
+
+        def render_target(target: str) -> tuple[tuple[Stmt, ...], frozenset[str], frozenset[str]] | None:
+            if target in loop_blocks:
+                return render_tree(target, start, next_path)
+            terminal = terminal_path(target, start)
+            if terminal is None:
+                return None
+            terminal_statements, terminal_terminator, terminal_nodes = terminal
+            return (
+                (*terminal_statements, terminal_terminator),
+                terminal_nodes,
+                frozenset({"terminal"}),
+            )
+
+        then_result = render_target(terminator.true_target)
+        else_result = render_target(terminator.false_target)
+        if then_result is None or else_result is None:
+            return None
+        then_body, then_nodes, then_outcomes = then_result
+        else_body, else_nodes, else_outcomes = else_result
+        if then_nodes & else_nodes or then_nodes & set(path) or else_nodes & set(path):
+            return None
+        branch = If(
+            source=terminator.source,
+            condition=terminator.condition,
+            then_body=then_body,
+            else_body=else_body,
+        )
+        return (
+            (*statements, branch),
+            frozenset({start}) | then_nodes | else_nodes,
+            then_outcomes | else_outcomes,
+        )
+
+    header_statements = _statements_without_trivial_phi_assignments(
+        header.statements,
+        incoming_blocks=predecessors,
+    )
+    if header_statements is None:
+        return None
+    body_result = render_tree(body_start, header.id, frozenset({header.id}))
+    if body_result is None:
+        return None
+    body_statements, body_nodes, outcomes = body_result
+    if not {"terminal", "continue"} <= outcomes:
+        return None
+    if (body_nodes & loop_blocks) != loop_blocks - {header.id}:
+        return None
+    body_terminal_nodes = body_nodes - loop_blocks
+    header_exit_result = terminal_path(header_exit, header.id)
+    if header_exit_result is None:
+        return None
+    header_exit_statements, header_exit_terminator, header_exit_nodes = header_exit_result
+    if body_terminal_nodes & set(header_exit_nodes):
+        return None
+    reachable = _reachable_block_ids(cfg, cfg.entry)
+    if reachable != {preheader.id, *loop_blocks, *body_terminal_nodes, *header_exit_nodes}:
+        return None
+    body_if = If(
+        source=header.terminator.source,
+        condition=header.terminator.condition,
+        then_body=body_statements if true_in_loop else (Break(),),
+        else_body=(Break(),) if true_in_loop else body_statements,
+    )
+    loop_statement = While(
+        source=header.terminator.source,
+        condition=Const(source=header.terminator.source, value=True),
+        body=(*header_statements, body_if),
+    )
+    return _rewrite_while_structured_function(
+        function,
+        (*preheader.statements, loop_statement, *header_exit_statements),
+        header_exit_terminator,
+        "exact-tree-loop-with-terminal-exits",
+    )
+
+
+def _structure_exact_statement_guard_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a linear loop whose pretest is already a statement-level guard.
+
+    Some VM lifters recover a conditional terminator inside a basic block before
+    the low-level CFG pass runs.  The resulting shape is still generic:
+    ``preheader -> header(if guard; jump body) -> linear body -> header``.
+    This reducer moves only the proven terminal arm after a ``while`` and keeps
+    every body statement in its original order.  It deliberately rejects
+    multiple backedges, exits, exceptional edges, side entries, and any guard
+    arm that is not exactly a terminal statement.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    loops = find_natural_loops(cfg)
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    if loop.exits:
+        return None
+    region_graph = RegionGraph.from_cfg(cfg)
+    if not _region_loop_edges_are_reducible(region_graph, frozenset(loop.blocks)):
+        return None
+
+    block_map = cfg.blocks
+    header = block_map.get(loop.header)
+    if header is None or not isinstance(header.terminator, Jump):
+        return None
+    if not header.statements or not isinstance(header.statements[-1], If):
+        return None
+    guard = header.statements[-1]
+    header_prefix = _statements_without_trivial_phi_assignments(
+        header.statements[:-1],
+        incoming_blocks=cfg.predecessors(header.id),
+    )
+    if (
+        header_prefix is None
+        or _contains_terminal_statement(header_prefix)
+        or _contains_unscoped_loop_control(header_prefix)
+    ):
+        return None
+    if len(guard.then_body) == 0 and len(guard.else_body) == 1:
+        body_condition = guard.condition
+        terminal_body = guard.else_body
+    elif len(guard.else_body) == 0 and len(guard.then_body) == 1:
+        body_condition = UnaryOp(
+            source=guard.condition.source,
+            type=guard.condition.type,
+            op="not ",
+            value=guard.condition,
+        )
+        terminal_body = guard.then_body
+    else:
+        return None
+    terminal = terminal_body[0]
+    if not isinstance(terminal, (Return, Raise, Reraise)):
+        return None
+
+    predecessors = cfg.predecessors(header.id)
+    preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop.blocks)
+    if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
+        return None
+    preheader = block_map.get(preheaders[0])
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
+        return None
+    if set(block_map) != set(loop.blocks) | {preheader.id}:
+        return None
+
+    # The loop body is one exact predecessor chain.  This proves that moving
+    # the guard to a while condition neither duplicates a shared block nor
+    # drops a hidden side entry.
+    body_statements: list[Stmt] = []
+    visited: set[str] = {header.id}
+    previous_id = header.id
+    current_id = header.terminator.target
+    while current_id != header.id:
+        if current_id in visited or current_id not in loop.blocks:
+            return None
+        block = block_map.get(current_id)
+        if block is None or cfg.predecessors(current_id) != (previous_id,):
+            return None
+        statements = _statements_without_trivial_phi_assignments(
+            block.statements,
+            incoming_blocks=(previous_id,),
+        )
+        if (
+            statements is None
+            or _contains_unscoped_loop_control(statements)
+            or not isinstance(block.terminator, Jump)
+        ):
+            return None
+        body_statements.extend(statements)
+        visited.add(current_id)
+        previous_id = current_id
+        current_id = block.terminator.target
+    if visited != set(loop.blocks) or not body_statements:
+        return None
+
+    if header_prefix:
+        # Keep per-iteration preparation before the guard.  Hoisting it into
+        # the while condition would change evaluation order for non-pure
+        # generic expressions.
+        if body_condition is guard.condition:
+            guard_then = tuple(body_statements)
+            guard_else = (terminal,)
+        else:
+            guard_then = (terminal,)
+            guard_else = tuple(body_statements)
+        loop_statement = While(
+            source=guard.source,
+            condition=Const(source=guard.source, value=True),
+            body=(
+                *header_prefix,
+                If(
+                    source=guard.source,
+                    condition=guard.condition,
+                    then_body=guard_then,
+                    else_body=guard_else,
+                ),
+            ),
+        )
+        terminal = None
+    else:
+        loop_statement = While(
+            source=guard.source,
+            condition=body_condition,
+            body=tuple(body_statements),
+        )
+    return _rewrite_while_structured_function(
+        function,
+        (*preheader.statements, loop_statement),
+        terminal,
+        "exact-statement-guard-loop",
+    )
+
+
+def _structure_exact_nested_loop_flattening(function: FunctionIR) -> FunctionIR | None:
+    """Flatten a guarded child loop whose backedge is equivalent to outer continue.
+
+    Ghidra can collapse a child loop before deciding whether its exits belong to
+    the containing loop.  The generic renderer cannot represent labelled
+    ``continue`` directly, so this pass handles the narrower equivalent shape
+    proven by :func:`_safe_nested_loop_continue_aliases`.  It is a normalizer:
+    the resulting function remains on the low-level CFG floor so a subsequent
+    pass can structure the containing loop.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics:
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
+        header = block_map.get(loop.header)
+        if header is None or not isinstance(header.terminator, Branch):
+            continue
+        true_in_loop = header.terminator.true_target in loop.blocks
+        false_in_loop = header.terminator.false_target in loop.blocks
+        if true_in_loop == false_in_loop:
+            continue
+        body_start = header.terminator.true_target if true_in_loop else header.terminator.false_target
+        aliases = _safe_nested_loop_continue_aliases(
+            cfg,
+            loop,
+            header=header,
+            body_start=body_start,
+            condition=header.terminator.condition,
+            body_on_true=true_in_loop,
+        )
+        if not aliases:
+            continue
+        structured = _collapse_exact_natural_loop_region(function, cfg, loop)
+        if structured is not None and _low_level_edge_count(structured) < _low_level_edge_count(function):
+            return structured
+    return None
+
+
 def _structure_exact_innermost_natural_loop_region(function: FunctionIR) -> FunctionIR | None:
     """Collapse one proven single-entry/single-exit innermost loop in place.
 
@@ -4332,6 +8115,7 @@ def _structure_exact_entry_natural_loop_region(function: FunctionIR) -> Function
     if cfg.entry is None or cfg.diagnostics:
         return None
     block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
     loops = find_natural_loops(cfg)
     for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
         if loop.header != cfg.entry:
@@ -4361,6 +8145,13 @@ def _structure_exact_entry_natural_loop_region(function: FunctionIR) -> Function
         exit_id = next(iter(exit_targets))
         exit_block = block_map.get(exit_id)
         if exit_block is None or any(predecessor not in loop.blocks for predecessor in cfg.predecessors(exit_id)):
+            continue
+        if not region_graph.is_single_entry_loop(
+            frozenset(loop.blocks),
+            header=header.id,
+            preheader=None,
+            exit=exit_id,
+        ):
             continue
         true_in_loop = header.terminator.true_target in loop.blocks
         false_in_loop = header.terminator.false_target in loop.blocks
@@ -4497,6 +8288,856 @@ def _structure_exact_entry_posttested_self_loop(function: FunctionIR) -> Functio
     )
 
 
+def _structure_exact_infinite_loop_with_optional_arm(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a single-entry infinite loop with one optional linear arm.
+
+    This is the smallest non-trivial form of Ghidra's infinite-loop collapse:
+    the loop header evaluates a branch, one edge executes an exclusive arm,
+    both edges meet at a latch, and the latch jumps back to the header.  The
+    loop has no exits, so the exact structured form is ``while (true)`` with
+    the header condition represented as an inner ``if``.  Keeping the inner
+    test (rather than projecting it into the while condition) preserves the
+    header's per-iteration statements and evaluation order.
+
+    The matcher deliberately accepts only a complete, three-node loop body
+    with one optional preheader.  Any extra entry, nested loop, terminal
+    statement, exceptional edge, or non-identity Phi keeps the low-level CFG
+    intact for a later, more capable proof.
+    """
+
+    if not function.blocks:
+        return None
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
+        if loop.exits or len(loop.blocks) != 3:
+            continue
+        if any(other is not loop and other.blocks < loop.blocks for other in loops):
+            continue
+        if any(
+            other is not loop
+            and other.blocks & loop.blocks
+            and not (other.blocks <= loop.blocks or loop.blocks <= other.blocks)
+            for other in loops
+        ):
+            continue
+
+        header = block_map.get(loop.header)
+        if header is None or not isinstance(header.terminator, Branch):
+            continue
+        outside = tuple(predecessor for predecessor in cfg.predecessors(header.id) if predecessor not in loop.blocks)
+        if len(outside) > 1:
+            continue
+        preheader = block_map.get(outside[0]) if outside else None
+        if preheader is None and cfg.entry != header.id:
+            continue
+        if preheader is not None:
+            if cfg.entry != preheader.id or not isinstance(preheader.terminator, Jump):
+                continue
+            if preheader.terminator.target != header.id or set(cfg.predecessors(preheader.id)):
+                continue
+
+        expected_header_predecessors = (
+            {loop.backedge_source}
+            if preheader is None
+            else {preheader.id, loop.backedge_source}
+        )
+        if set(cfg.predecessors(header.id)) != expected_header_predecessors:
+            continue
+        targets = (header.terminator.true_target, header.terminator.false_target)
+        if targets[0] == targets[1] or any(target not in loop.blocks for target in targets):
+            continue
+        first = block_map.get(targets[0])
+        second = block_map.get(targets[1])
+        if first is None or second is None:
+            continue
+
+        arm: BasicBlock | None = None
+        latch: BasicBlock | None = None
+        arm_is_true = False
+        for candidate_arm, candidate_latch, is_true in (
+            (first, second, True),
+            (second, first, False),
+        ):
+            if (
+                isinstance(candidate_arm.terminator, Jump)
+                and candidate_arm.terminator.target == candidate_latch.id
+                and candidate_latch.terminator is not None
+                and isinstance(candidate_latch.terminator, Jump)
+                and candidate_latch.terminator.target == header.id
+                and set(cfg.predecessors(candidate_arm.id)) == {header.id}
+                and set(cfg.predecessors(candidate_latch.id)) == {header.id, candidate_arm.id}
+            ):
+                arm, latch, arm_is_true = candidate_arm, candidate_latch, is_true
+                break
+        if arm is None or latch is None:
+            continue
+
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=cfg.predecessors(header.id),
+        )
+        arm_statements = _statements_without_trivial_phi_assignments(
+            arm.statements,
+            incoming_blocks=(header.id,),
+        )
+        latch_statements = _statements_without_trivial_phi_assignments(
+            latch.statements,
+            incoming_blocks=(header.id, arm.id),
+        )
+        preheader_statements = (
+            _statements_without_trivial_phi_assignments(
+                preheader.statements,
+                incoming_blocks=cfg.predecessors(preheader.id),
+            )
+            if preheader is not None
+            else ()
+        )
+        if any(statements is None for statements in (header_statements, arm_statements, latch_statements, preheader_statements)):
+            continue
+        if not arm_statements:
+            # With an empty optional arm the branch still evaluates its
+            # condition, but replacing it with an empty structured ``If``
+            # adds no recovered structure and is easy for a renderer to erase
+            # or misread. Keep that shape on the explicit CFG floor.
+            continue
+        if any(
+            isinstance(statement, (Return, Raise, Reraise))
+            for statements in (header_statements, arm_statements, latch_statements)
+            for statement in statements
+        ):
+            continue
+        if any(
+            _contains_unscoped_loop_control(statements)
+            for statements in (header_statements, arm_statements, latch_statements, preheader_statements)
+        ):
+            continue
+
+        branch = If(
+            source=header.terminator.source,
+            condition=header.terminator.condition,
+            then_body=arm_statements if arm_is_true else (),
+            else_body=() if arm_is_true else arm_statements,
+        )
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, branch, *latch_statements),
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader_statements, loop_statement),
+            None,
+            "exact-infinite-loop-with-optional-arm",
+        )
+    return None
+
+
+def _structure_exact_posttested_natural_loop(function: FunctionIR) -> FunctionIR | None:
+    """Recover a single-entry post-tested loop with an unconditional header.
+
+    Some bytecode layouts execute a loop header's assignments and terminal
+    checks before an unconditional jump into the body.  The body has one
+    backedge to that header, so the header is executed once per iteration but
+    has no branch terminator of its own.  This is a neutral CFG property: the
+    rewrite is accepted only for a complete, innermost natural loop with one
+    preheader, one backedge, no external exits, and simple two-edge phi
+    values.  The backedge phi copies are materialized immediately before each
+    structured ``continue`` so the next header execution observes the exact
+    edge value.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics:
+        return None
+    block_map = cfg.blocks
+    region_graph = RegionGraph.from_cfg(cfg)
+    loops = find_natural_loops(cfg)
+    for loop in sorted(loops, key=lambda item: (len(item.blocks), item.header, item.backedge_source)):
+        if any(other is not loop and other.blocks < loop.blocks for other in loops):
+            continue
+        if any(
+            other is not loop
+            and other.blocks & loop.blocks
+            and not (other.blocks <= loop.blocks or loop.blocks <= other.blocks)
+            for other in loops
+        ):
+            continue
+        if loop.exits:
+            continue
+        header = block_map.get(loop.header)
+        if header is None or not isinstance(header.terminator, Jump):
+            continue
+        predecessors = cfg.predecessors(header.id)
+        preheaders = tuple(predecessor for predecessor in predecessors if predecessor not in loop.blocks)
+        if len(preheaders) != 1:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if preheader is None or not isinstance(preheader.terminator, Jump) or preheader.terminator.target != header.id:
+            continue
+        # A terminal guard in the preheader may select a result that differs
+        # from the loop's terminal arms.  Keeping that surrounding CFG avoids
+        # conflating distinct return paths when the loop itself has no normal
+        # exit edge.
+        if _contains_terminal_statement(preheader.statements) or _contains_unscoped_loop_control(preheader.statements):
+            continue
+        backedges = tuple(predecessor for predecessor in predecessors if predecessor in loop.blocks)
+        if len(backedges) != 1 or backedges[0] != loop.backedge_source:
+            continue
+        if not _region_loop_edges_are_reducible(region_graph, frozenset(loop.blocks)):
+            continue
+        body_start = header.terminator.target
+        if body_start not in loop.blocks or body_start == header.id:
+            continue
+        # This rule deliberately consumes a complete reachable function.  A
+        # normal continuation would need a separate exit proof; without one,
+        # projecting the loop to a carrier Return could invent termination.
+        reachable = _reachable_block_ids(cfg, cfg.entry)
+        if reachable != set(loop.blocks) | {preheader.id} or reachable != set(block_map):
+            continue
+
+        phi_copies = _direct_phi_join_copies(header, preheader.id, backedges[0])
+        if phi_copies is None:
+            continue
+        preheader_copies, backedge_copies, header_statements = phi_copies
+        body_result = _render_loop_body(
+            block_map,
+            body_start,
+            header_id=header.id,
+            exit_id=header.id,
+            loop_blocks=loop.blocks,
+            path=frozenset(),
+        )
+        if body_result is None:
+            continue
+        body, body_effect = body_result
+        if backedge_copies and _contains_continue_in_exception_scope(body):
+            # A Continue reached from an exception handler does not identify
+            # the same normal CFG edge as a loop backedge.  Do not inject the
+            # normal-edge Phi copies into that handler or guess its state.
+            continue
+        body = _prepend_before_continues(body, backedge_copies)
+        if not header_statements and not body_effect and not _contains_terminal_statement(body):
+            continue
+        if not _contains_terminal_statement((*header_statements, *body)):
+            continue
+
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, *body),
+        )
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader.statements, *preheader_copies, loop_statement),
+            Return(source=header.terminator.source),
+            "exact-posttested-natural-loop",
+        )
+    return None
+
+
+def _prepend_before_continues(
+    statements: tuple[Stmt, ...],
+    prefix: tuple[Stmt, ...],
+) -> tuple[Stmt, ...]:
+    """Place edge copies immediately before loop-local Continue statements."""
+
+    if not prefix:
+        return statements
+    rewritten: list[Stmt] = []
+    for statement in statements:
+        if isinstance(statement, Continue):
+            rewritten.extend((*prefix, statement))
+        elif isinstance(statement, If):
+            rewritten.append(
+                replace(
+                    statement,
+                    then_body=_prepend_before_continues(statement.then_body, prefix),
+                    else_body=_prepend_before_continues(statement.else_body, prefix),
+                )
+            )
+        elif isinstance(statement, Switch):
+            rewritten.append(
+                replace(
+                    statement,
+                    cases=tuple(
+                        (value, _prepend_before_continues(body, prefix))
+                        for value, body in statement.cases
+                    ),
+                    default_body=_prepend_before_continues(statement.default_body, prefix),
+                )
+            )
+        elif isinstance(statement, Try):
+            # Exception handlers have distinct control-flow and Phi incoming
+            # edges.  They are rejected by the caller when a normal backedge
+            # prefix is required, so leave the subtree opaque here.
+            rewritten.append(statement)
+        else:
+            # A nested loop owns its Continue targets.  Do not inject outer
+            # edge copies into that loop's body.
+            rewritten.append(statement)
+    return tuple(rewritten)
+
+
+def _contains_continue_in_exception_scope(statements: tuple[Stmt, ...]) -> bool:
+    """Return whether a Continue occurs inside a Try body or handler.
+
+    Nested loop bodies own their Continue statements and therefore stop the
+    search; ordinary If/Switch nesting does not introduce a new loop scope.
+    """
+
+    for statement in statements:
+        if isinstance(statement, Try):
+            if _contains_unscoped_continue(statement.body) or any(
+                _contains_unscoped_continue(handler.body)
+                for handler in statement.handlers
+            ):
+                return True
+            if _contains_continue_in_exception_scope(statement.body) or any(
+                _contains_continue_in_exception_scope(handler.body)
+                for handler in statement.handlers
+            ):
+                return True
+        elif isinstance(statement, If):
+            if _contains_continue_in_exception_scope(statement.then_body) or _contains_continue_in_exception_scope(
+                statement.else_body
+            ):
+                return True
+        elif isinstance(statement, Switch):
+            if any(
+                _contains_continue_in_exception_scope(body)
+                for _value, body in statement.cases
+            ) or _contains_continue_in_exception_scope(statement.default_body):
+                return True
+        # While/For bodies own their Continue statements.
+    return False
+
+
+def _contains_unscoped_continue(statements: tuple[Stmt, ...]) -> bool:
+    """Find Continue statements without descending into nested loop scopes."""
+
+    for statement in statements:
+        if isinstance(statement, Continue):
+            return True
+        if isinstance(statement, If) and (
+            _contains_unscoped_continue(statement.then_body)
+            or _contains_unscoped_continue(statement.else_body)
+        ):
+            return True
+        if isinstance(statement, Switch) and (
+            any(_contains_unscoped_continue(body) for _value, body in statement.cases)
+            or _contains_unscoped_continue(statement.default_body)
+        ):
+            return True
+        if isinstance(statement, Try) and (
+            _contains_unscoped_continue(statement.body)
+            or any(_contains_unscoped_continue(handler.body) for handler in statement.handlers)
+        ):
+            return True
+    return False
+
+
+def _contains_terminal_statement(statements: tuple[Stmt, ...]) -> bool:
+    for statement in statements:
+        if isinstance(statement, (Return, Raise, Reraise)):
+            return True
+        if isinstance(statement, If) and (
+            _contains_terminal_statement(statement.then_body)
+            or _contains_terminal_statement(statement.else_body)
+        ):
+            return True
+        if isinstance(statement, Switch) and (
+            any(_contains_terminal_statement(body) for _value, body in statement.cases)
+            or _contains_terminal_statement(statement.default_body)
+        ):
+            return True
+        if isinstance(statement, Try) and (
+            _contains_terminal_statement(statement.body)
+            or any(_contains_terminal_statement(handler.body) for handler in statement.handlers)
+        ):
+            return True
+    return False
+
+
+def _contains_unscoped_loop_control(statements: tuple[Stmt, ...]) -> bool:
+    """Find break/continue that would be outside a loop after a rewrite.
+
+    ``If``, ``Switch`` and ``Try`` do not introduce loop scope, while a nested
+    loop owns its own control statements.  The helper therefore descends only
+    through the former constructs.  It is used as a fail-closed preheader
+    guard before statements are moved outside the newly materialized loop.
+    """
+
+    for statement in statements:
+        if isinstance(statement, (Break, Continue)):
+            return True
+        if isinstance(statement, If) and (
+            _contains_unscoped_loop_control(statement.then_body)
+            or _contains_unscoped_loop_control(statement.else_body)
+        ):
+            return True
+        if isinstance(statement, Switch) and (
+            any(_contains_unscoped_loop_control(body) for _value, body in statement.cases)
+            or _contains_unscoped_loop_control(statement.default_body)
+        ):
+            return True
+        if isinstance(statement, Try) and (
+            _contains_unscoped_loop_control(statement.body)
+            or any(_contains_unscoped_loop_control(handler.body) for handler in statement.handlers)
+        ):
+            return True
+    return False
+
+
+def _structure_exact_natural_loop_with_shared_exit(function: FunctionIR) -> FunctionIR | None:
+    """Recover a natural loop whose distinct exits share one linear tail.
+
+    Ghidra first collapses loop bodies and then folds exit paths that
+    reconverge at one block.  This matcher implements the conservative subset
+    that can be proven from generic IR alone: every non-loop exit follows a
+    disjoint, jump-only path to one terminal join, and leading join phis can be
+    copied on the corresponding path.  The loop condition is kept in a
+    ``while (true)`` carrier so statements on a header-exit path execute at
+    the exact point where the low-level branch leaves the loop.
+    """
+
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+        return None
+    block_map = cfg.blocks
+    loops = find_natural_loops(cfg)
+    groups: dict[str, list[object]] = {}
+    for loop in loops:
+        groups.setdefault(loop.header, []).append(loop)
+
+    candidates: list[tuple[str, frozenset[str], tuple[object, ...]]] = []
+    for header_id, group in groups.items():
+        unions = [frozenset(loop.blocks) for loop in group]
+        if len(group) > 1:
+            unions.append(frozenset().union(*unions))
+        for members in dict.fromkeys(unions):
+            if not members:
+                continue
+            exits = tuple(
+                edge
+                for edge in cfg.edges
+                if edge.source in members and edge.target not in members
+            )
+            if exits:
+                candidates.append((header_id, members, exits))
+
+    for header_id, loop_blocks, exits in sorted(
+        candidates,
+        key=lambda item: (len(item[1]), item[0], tuple((edge.source, edge.target) for edge in item[2])),
+    ):
+        header = block_map.get(header_id)
+        if header is None or not isinstance(header.terminator, Branch):
+            continue
+        if any(
+            other.header != header_id
+            and other.blocks & loop_blocks
+            and not (other.blocks <= loop_blocks or loop_blocks <= other.blocks)
+            for other in loops
+        ):
+            continue
+        predecessors = cfg.predecessors(header_id)
+        preheaders = tuple(pred for pred in predecessors if pred not in loop_blocks)
+        if len(preheaders) != 1:
+            continue
+        preheader = block_map.get(preheaders[0])
+        if preheader is None or not isinstance(preheader.terminator, Jump):
+            continue
+        if (
+            preheader.terminator.target != header_id
+            or _contains_terminal_statement(preheader.statements)
+            or _contains_unscoped_loop_control(preheader.statements)
+        ):
+            continue
+        if any(
+            block_id != header_id
+            and any(pred not in loop_blocks for pred in cfg.predecessors(block_id))
+            for block_id in loop_blocks
+        ):
+            continue
+        if len({edge.target for edge in exits}) < 2:
+            continue
+
+        # Trace each exit through a linear, disjoint tail.  The first common
+        # block among all paths is the only permitted continuation join.
+        paths: list[tuple[object, tuple[str, ...]]] = []
+        for edge in exits:
+            current = edge.target
+            path: list[str] = []
+            seen: set[str] = set()
+            while current not in seen and current not in loop_blocks:
+                seen.add(current)
+                block = block_map.get(current)
+                if block is None:
+                    break
+                path.append(current)
+                if not isinstance(block.terminator, Jump):
+                    break
+                current = block.terminator.target
+            else:
+                continue
+            if not path:
+                continue
+            paths.append((edge, tuple(path)))
+        if len(paths) != len(exits):
+            continue
+        common = set(paths[0][1])
+        for _edge, path in paths[1:]:
+            common &= set(path)
+        if not common:
+            continue
+        join_id = min(common, key=lambda block_id: (max(path.index(block_id) for _edge, path in paths), block_id))
+        join = block_map.get(join_id)
+        if join is None or not isinstance(join.terminator, (Return, Raise, Reraise)):
+            continue
+
+        join_predecessors = set(cfg.predecessors(join_id))
+        if not join_predecessors:
+            continue
+        phi_result = _final_join_phi_copies(join, join_predecessors)
+        if phi_result is None:
+            continue
+        edge_copies, join_statements = phi_result
+
+        exit_paths: dict[str, tuple[Stmt, ...]] = {}
+        path_blocks: set[str] = set()
+        path_predecessors: set[str] = set()
+        valid_paths = True
+        for edge, path in paths:
+            try:
+                join_index = path.index(join_id)
+            except ValueError:
+                valid_paths = False
+                break
+            prefix_ids = path[:join_index]
+            if path_blocks & set(prefix_ids):
+                valid_paths = False
+                break
+            if prefix_ids and cfg.predecessors(prefix_ids[0]) != (edge.source,):
+                valid_paths = False
+                break
+            statements: list[Stmt] = []
+            previous = edge.source
+            for block_id in prefix_ids:
+                block = block_map.get(block_id)
+                if block is None or not isinstance(block.terminator, Jump):
+                    valid_paths = False
+                    break
+                if cfg.predecessors(block_id) != (previous,):
+                    valid_paths = False
+                    break
+                block_statements = _statements_without_trivial_phi_assignments(
+                    block.statements,
+                    incoming_blocks=(previous,),
+                )
+                if block_statements is None or _statements_contain_break(block_statements):
+                    valid_paths = False
+                    break
+                statements.extend(block_statements)
+                previous = block_id
+            if not valid_paths:
+                break
+            predecessor_to_join = previous
+            if predecessor_to_join not in join_predecessors:
+                valid_paths = False
+                break
+            statements.extend(edge_copies.get(predecessor_to_join, ()))
+            if edge.target in exit_paths:
+                valid_paths = False
+                break
+            exit_paths[edge.target] = tuple(statements)
+            path_blocks.update(prefix_ids)
+            path_predecessors.add(predecessor_to_join)
+        if not valid_paths or path_predecessors != join_predecessors:
+            continue
+
+        true_target = header.terminator.true_target
+        false_target = header.terminator.false_target
+        true_in_loop = true_target in loop_blocks
+        false_in_loop = false_target in loop_blocks
+        if true_in_loop == false_in_loop:
+            continue
+        body_start = true_target if true_in_loop else false_target
+        header_exit_target = false_target if true_in_loop else true_target
+        if header_exit_target not in exit_paths:
+            continue
+        condition = header.terminator.condition
+        if not true_in_loop:
+            condition = UnaryOp(source=condition.source, type=condition.type, op="not ", value=condition)
+        body_result = _render_loop_body(
+            block_map,
+            body_start,
+            header_id=header_id,
+            exit_id="",
+            loop_blocks=loop_blocks,
+            path=frozenset(),
+            exit_paths=exit_paths,
+        )
+        if body_result is None:
+            continue
+        body, body_effect = body_result
+        header_statements = _statements_without_trivial_phi_assignments(
+            header.statements,
+            incoming_blocks=predecessors,
+        )
+        if header_statements is None:
+            continue
+        if not body_effect and not header_statements:
+            continue
+        guarded_body = If(
+            source=header.terminator.source,
+            condition=condition,
+            then_body=body,
+            else_body=(*exit_paths[header_exit_target], Break()),
+        )
+        loop_statement = While(
+            source=header.terminator.source,
+            condition=Const(source=header.terminator.source, value=True),
+            body=(*header_statements, guarded_body),
+        )
+        reachable = _reachable_block_ids(cfg, cfg.entry)
+        expected = set(loop_blocks) | {preheader.id, join_id} | path_blocks
+        if reachable != expected or reachable != set(block_map):
+            continue
+        return _rewrite_while_structured_function(
+            function,
+            (*preheader.statements, loop_statement, *join_statements),
+            join.terminator,
+            "exact-natural-loop-with-shared-exit",
+        )
+    return None
+
+
+def _prepare_collapsed_exit_statements(
+    exit_block: BasicBlock,
+    cfg,
+    *,
+    loop_exit_predecessors: frozenset[str],
+    replacement_predecessor: str,
+    outside_predecessors: tuple[str, ...],
+) -> tuple[Stmt, ...] | None:
+    """Rewrite an exit block's leading phis after collapsing a loop.
+
+    Collapsing a loop changes several outgoing CFG edges into one edge from the
+    preheader.  This is exact only when every edge leaving the loop contributes
+    the same phi value.  Values are restricted to constants or variables so
+    the rewrite never moves an expression with evaluation effects across the
+    loop boundary.  Outside predecessors retain their original incoming
+    values, while all loop predecessors are replaced by the new preheader edge.
+    """
+
+    original_predecessors = set(cfg.predecessors(exit_block.id))
+    if not loop_exit_predecessors <= original_predecessors:
+        return None
+    if replacement_predecessor in original_predecessors:
+        return None
+    expected_after = tuple((*outside_predecessors, replacement_predecessor))
+    if set(expected_after) != (original_predecessors - set(loop_exit_predecessors)) | {replacement_predecessor}:
+        return None
+
+    rewritten: list[Stmt] = []
+    saw_non_phi = False
+    for statement in exit_block.statements:
+        if not (
+            isinstance(statement, Assign)
+            and isinstance(statement.target, Var)
+            and isinstance(statement.value, Phi)
+        ):
+            saw_non_phi = True
+            rewritten.append(statement)
+            continue
+        if saw_non_phi:
+            return None
+        incoming = dict(statement.value.incoming)
+        if not original_predecessors <= set(incoming):
+            return None
+        if set(incoming) - original_predecessors - {"existing"}:
+            return None
+        loop_values = [incoming[predecessor] for predecessor in loop_exit_predecessors]
+        if not loop_values or not all(isinstance(value, (Const, Var)) for value in loop_values):
+            return None
+        representative = loop_values[0]
+        if not all(_values_semantically_equal(representative, value) for value in loop_values[1:]):
+            return None
+        existing = incoming.get("existing")
+        if existing is not None and not _values_semantically_equal(existing, representative):
+            return None
+
+        new_incoming: list[tuple[str, Expr]] = []
+        inserted_replacement = False
+        for predecessor, value in statement.value.incoming:
+            if predecessor in loop_exit_predecessors:
+                if not inserted_replacement:
+                    new_incoming.append((replacement_predecessor, representative))
+                    inserted_replacement = True
+                continue
+            if predecessor == "existing":
+                continue
+            new_incoming.append((predecessor, value))
+        if not inserted_replacement:
+            new_incoming.append((replacement_predecessor, representative))
+        if set(predecessor for predecessor, _value in new_incoming) != set(expected_after):
+            return None
+        rewritten.append(
+            Assign(
+                source=statement.source,
+                target=statement.target,
+                value=Phi(
+                    source=statement.value.source,
+                    type=statement.value.type,
+                    incoming=tuple(new_incoming),
+                ),
+            )
+        )
+
+    return _statements_without_trivial_phi_assignments(
+        tuple(rewritten),
+        incoming_blocks=expected_after,
+    )
+
+
+def _safe_nested_loop_continue_aliases(
+    cfg,
+    outer_loop,
+    *,
+    header: BasicBlock,
+    body_start: str,
+    condition: Expr,
+    body_on_true: bool,
+) -> frozenset[str]:
+    """Find a child-loop header whose guarded backedges can join the outer loop.
+
+    This is the conservative flattening used when a nested loop's only
+    non-header entry is a backedge guarded by the same pure condition as the
+    enclosing loop.  Re-routing that edge through the enclosing header adds no
+    observable work: the guard has just established the condition and all
+    intervening blocks are empty jumps.  Any phi, side effect, extra entry, or
+    polarity mismatch rejects the alias.
+    """
+
+    if header.statements or not _is_pure_cfg_condition(condition):
+        return frozenset()
+    block_map = cfg.blocks
+    aliases: set[str] = set()
+    for child in find_natural_loops(cfg):
+        if child.header != body_start or not child.blocks < outer_loop.blocks:
+            continue
+        child_header = block_map.get(child.header)
+        if child_header is None:
+            continue
+        child_predecessors = tuple(cfg.predecessors(child.header))
+        outside_entries = tuple(
+            predecessor for predecessor in child_predecessors if predecessor not in child.blocks
+        )
+        if outside_entries != (header.id,):
+            continue
+        child_header_statements = _statements_without_trivial_phi_assignments(
+            child_header.statements,
+            incoming_blocks=child_predecessors,
+        )
+        if child_header_statements is None or any(
+            isinstance(statement, Assign) and isinstance(statement.value, Phi)
+            for statement in child_header_statements
+        ):
+            continue
+        if any(
+            block_id != child.header
+            and any(predecessor not in child.blocks for predecessor in cfg.predecessors(block_id))
+            for block_id in child.blocks
+        ):
+            continue
+        backedge_sources = tuple(
+            predecessor for predecessor in child_predecessors if predecessor in child.blocks
+        )
+        if not backedge_sources:
+            continue
+        # A child loop that exits into another block of the containing loop is
+        # interleaved with the outer iteration (for example, one arm skips to
+        # the outer header while another arm leaves the outer region).  The
+        # alias would then collapse two distinct loop scopes and can move the
+        # outer guard across observable child-loop work.  Only child loops
+        # whose exits leave the entire outer region are eligible.
+        if any(
+            edge.target in outer_loop.blocks
+            for edge in child.exits
+            if edge.target not in child.blocks
+        ):
+            continue
+        if not all(
+            _backedge_rechecks_condition(
+                cfg,
+                source,
+                child.header,
+                condition=condition,
+                expected_true=body_on_true,
+            )
+            for source in backedge_sources
+        ):
+            continue
+        aliases.add(child.header)
+    return frozenset(aliases)
+
+
+def _is_pure_cfg_condition(condition: Expr) -> bool:
+    """Accept only conditions whose repeated evaluation is unconditionally safe.
+
+    A variable read may still be dynamic in a VM (globals, captured storage,
+    and metamethod-backed values can observe state or raise).  Constants are
+    the only expression kind whose value and evaluation effects are guaranteed
+    by the generic IR, so all other conditions stay on the CFG floor.
+    """
+
+    return isinstance(condition, Const)
+
+
+def _backedge_rechecks_condition(
+    cfg,
+    source: str,
+    target: str,
+    *,
+    condition: Expr,
+    expected_true: bool,
+) -> bool:
+    """Prove a child-loop backedge is immediately preceded by the outer guard."""
+
+    block_map = cfg.blocks
+    current = source
+    visited: set[str] = set()
+    while current not in visited:
+        visited.add(current)
+        predecessors = cfg.predecessors(current)
+        if len(predecessors) != 1:
+            return False
+        predecessor = block_map.get(predecessors[0])
+        if predecessor is None:
+            return False
+        terminator = predecessor.terminator
+        if isinstance(terminator, Branch):
+            selected_target = terminator.true_target if expected_true else terminator.false_target
+            if selected_target != current or not _values_semantically_equal(terminator.condition, condition):
+                return False
+            return _statements_without_trivial_phi_assignments(
+                block_map[current].statements,
+                incoming_blocks=(predecessor.id,),
+            ) == ()
+        if not isinstance(terminator, Jump):
+            return False
+        if _statements_without_trivial_phi_assignments(
+            block_map[current].statements,
+            incoming_blocks=(predecessor.id,),
+        ) != ():
+            return False
+        current = predecessor.id
+    return False
+
+
 def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> FunctionIR | None:
     block_map = cfg.blocks
     region_graph = RegionGraph.from_cfg(cfg)
@@ -4508,7 +9149,12 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
     if len(preheaders) != 1:
         return None
     preheader = block_map.get(preheaders[0])
-    if preheader is None or not isinstance(preheader.terminator, Jump) or preheader.terminator.target != header.id:
+    if (
+        preheader is None
+        or not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
         return None
     if any(
         block_id != header.id
@@ -4526,8 +9172,22 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
         return None
     exit_id = next(iter(continuation_targets))
     exit_block = block_map.get(exit_id)
-    if exit_block is None or any(predecessor not in loop.blocks for predecessor in cfg.predecessors(exit_id)):
+    if exit_block is None:
         return None
+    loop_exit_predecessors = frozenset(edge.source for edge in exits)
+    if not loop_exit_predecessors:
+        return None
+    if {
+        predecessor
+        for predecessor in cfg.predecessors(exit_id)
+        if predecessor in loop.blocks
+    } != set(loop_exit_predecessors):
+        return None
+    outside_exit_predecessors = tuple(
+        predecessor
+        for predecessor in cfg.predecessors(exit_id)
+        if predecessor not in loop.blocks
+    )
     if not region_graph.is_single_entry_loop(
         frozenset(loop.blocks),
         header=header.id,
@@ -4556,6 +9216,26 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
         path=frozenset(),
     )
     if body_result is None:
+        continue_targets = _safe_nested_loop_continue_aliases(
+            cfg,
+            loop,
+            header=header,
+            body_start=body_start,
+            condition=header.terminator.condition,
+            body_on_true=true_in_loop,
+        )
+        if continue_targets:
+            body_result = _render_loop_body(
+                block_map,
+                body_start,
+                header_id=header.id,
+                exit_id=exit_id,
+                loop_blocks=loop.blocks,
+                path=frozenset(),
+                continue_targets=continue_targets,
+                allow_continue_target_start=True,
+            )
+    if body_result is None:
         return None
     body, has_effect = body_result
     if not has_effect:
@@ -4564,9 +9244,12 @@ def _collapse_exact_natural_loop_region(function: FunctionIR, cfg, loop) -> Func
         header.statements,
         incoming_blocks=predecessors,
     )
-    exit_statements = _statements_without_trivial_phi_assignments(
-        exit_block.statements,
-        incoming_blocks=cfg.predecessors(exit_id),
+    exit_statements = _prepare_collapsed_exit_statements(
+        exit_block,
+        cfg,
+        loop_exit_predecessors=loop_exit_predecessors,
+        replacement_predecessor=preheader.id,
+        outside_predecessors=outside_exit_predecessors,
     )
     if header_statements is None or exit_statements is None:
         return None
@@ -4626,7 +9309,11 @@ def _try_structure_single_natural_loop(function: FunctionIR, cfg, loop) -> Funct
     if len(preheaders) != 1 or preheaders[0] != function.blocks[0].id:
         return None
     preheader = block_map[preheaders[0]]
-    if not isinstance(preheader.terminator, Jump) or preheader.terminator.target != header.id:
+    if (
+        not isinstance(preheader.terminator, Jump)
+        or preheader.terminator.target != header.id
+        or _contains_unscoped_loop_control(preheader.statements)
+    ):
         return None
     exits = tuple(edge for edge in loop.exits if edge.target not in loop.blocks)
     exit_targets = {edge.target for edge in exits}
@@ -4753,11 +9440,18 @@ def _render_loop_body(
     exit_id: str,
     loop_blocks: frozenset[str],
     path: frozenset[str],
+    exit_paths: dict[str, tuple[Stmt, ...]] | None = None,
+    continue_targets: frozenset[str] = frozenset(),
+    allow_continue_target_start: bool = False,
 ) -> tuple[tuple[Stmt, ...], bool] | None:
     if start == header_id:
         return (Continue(),), False
     if start == exit_id:
         return (Break(),), False
+    if start in continue_targets and not allow_continue_target_start:
+        return (Continue(),), False
+    if exit_paths is not None and start in exit_paths:
+        return (*exit_paths[start], Break()), bool(exit_paths[start])
     if start not in loop_blocks or start in path:
         return None
     block = block_map.get(start)
@@ -4785,6 +9479,8 @@ def _render_loop_body(
             exit_id=exit_id,
             loop_blocks=loop_blocks,
             path=next_path,
+            exit_paths=exit_paths,
+            continue_targets=continue_targets,
         )
         if child is None:
             return None
@@ -4802,6 +9498,8 @@ def _render_loop_body(
                 exit_id=exit_id,
                 loop_blocks=loop_blocks,
                 path=next_path,
+                exit_paths=exit_paths,
+                continue_targets=continue_targets,
             )
             if result is None:
                 return None
@@ -4813,6 +9511,8 @@ def _render_loop_body(
             exit_id=exit_id,
             loop_blocks=loop_blocks,
             path=next_path,
+            exit_paths=exit_paths,
+            continue_targets=continue_targets,
         )
         if default_result is None:
             return None
@@ -4841,6 +9541,8 @@ def _render_loop_body(
         exit_id=exit_id,
         loop_blocks=loop_blocks,
         path=next_path,
+        exit_paths=exit_paths,
+        continue_targets=continue_targets,
     )
     if phi_join is not None:
         join_statement, join_effect = phi_join
@@ -4852,6 +9554,8 @@ def _render_loop_body(
         exit_id=exit_id,
         loop_blocks=loop_blocks,
         path=next_path,
+        exit_paths=exit_paths,
+        continue_targets=continue_targets,
     )
     else_result = _render_loop_body(
         block_map,
@@ -4860,6 +9564,8 @@ def _render_loop_body(
         exit_id=exit_id,
         loop_blocks=loop_blocks,
         path=next_path,
+        exit_paths=exit_paths,
+        continue_targets=continue_targets,
     )
     if then_result is None or else_result is None:
         return None
@@ -4870,7 +9576,12 @@ def _render_loop_body(
     # making that choice.  Do not propagate this exception through an empty
     # jump chain: doing so could move a condition ahead of an intervening
     # effect and turn a post-tested loop into a pre-tested one.
-    if not then_effect and not else_effect and not (statements and not path):
+    if (
+        not then_effect
+        and not else_effect
+        and not (statements and not path)
+        and not {"break", "continue"} <= _loop_control_kinds((*then_body, *else_body))
+    ):
         return None
     return (
         *statements,
@@ -4895,6 +9606,29 @@ def _statements_contain_break(statements: tuple[Stmt, ...]) -> bool:
     return False
 
 
+def _loop_control_kinds(statements: tuple[Stmt, ...]) -> frozenset[str]:
+    """Collect direct loop-control outcomes from a rendered branch."""
+
+    kinds: set[str] = set()
+    for statement in statements:
+        if isinstance(statement, Break):
+            kinds.add("break")
+        elif isinstance(statement, Continue):
+            kinds.add("continue")
+        elif isinstance(statement, If):
+            kinds.update(_loop_control_kinds(statement.then_body))
+            kinds.update(_loop_control_kinds(statement.else_body))
+        elif isinstance(statement, Switch):
+            for _value, body in statement.cases:
+                kinds.update(_loop_control_kinds(body))
+            kinds.update(_loop_control_kinds(statement.default_body))
+        elif isinstance(statement, Try):
+            kinds.update(_loop_control_kinds(statement.body))
+            for handler in statement.handlers:
+                kinds.update(_loop_control_kinds(handler.body))
+    return frozenset(kinds)
+
+
 def _render_direct_phi_join(
     block_map: dict[str, BasicBlock],
     block: BasicBlock,
@@ -4903,6 +9637,8 @@ def _render_direct_phi_join(
     exit_id: str,
     loop_blocks: frozenset[str],
     path: frozenset[str],
+    exit_paths: dict[str, tuple[Stmt, ...]] | None = None,
+    continue_targets: frozenset[str] = frozenset(),
 ) -> tuple[tuple[Stmt, ...], bool] | None:
     """Render a two-arm diamond whose join has safe, explicit phi copies."""
 
@@ -4951,6 +9687,8 @@ def _render_direct_phi_join(
         exit_id=exit_id,
         loop_blocks=loop_blocks,
         path=path | {true_block.id, false_block.id},
+        exit_paths=exit_paths,
+        continue_targets=continue_targets,
     )
     if continuation is None:
         return None
@@ -4986,6 +9724,8 @@ def _direct_phi_join_copies(
     for statement in join.statements:
         if isinstance(statement, Assign) and isinstance(statement.target, Var) and isinstance(statement.value, Phi):
             if saw_non_phi:
+                return None
+            if len({block_id for block_id, _value in statement.value.incoming}) != len(statement.value.incoming):
                 return None
             incoming = dict(statement.value.incoming)
             if not {true_id, false_id} <= set(incoming) or set(incoming) - {true_id, false_id, "existing"}:
@@ -5441,6 +10181,9 @@ _LOW_LEVEL_CFG_NORMALIZERS = (
     _structure_exact_try_common_join_region,
     _structure_exact_terminal_branch_region,
     _structure_exact_acyclic_tree_join_region,
+    _structure_exact_acyclic_shared_linear_block,
+    _structure_exact_partial_branch_arm_splice,
+    _structure_exact_nested_loop_flattening,
     _structure_exact_innermost_natural_loop_region,
     _structure_exact_entry_natural_loop_region,
     _structure_exact_empty_jump_chains,
@@ -5450,6 +10193,9 @@ _LOW_LEVEL_CFG_NORMALIZERS = (
     _structure_exact_linear_arm_diamond_region,
     _structure_exact_optional_linear_arm_diamond_region,
     _structure_exact_direct_phi_dispatch_region,
+    _structure_exact_partial_multiway_arm_splice,
+    _structure_exact_empty_jump_splices,
+    _structure_exact_loop_linear_block_merges,
 )
 
 register_low_level_cfg_structurer(_structure_exact_single_block_cfg)
@@ -5465,7 +10211,10 @@ register_low_level_cfg_structurer(_structure_exact_guard_cascade_pretested_loop)
 register_low_level_cfg_structurer(_structure_exact_try_success_return)
 register_low_level_cfg_structurer(_structure_exact_branch_terminal_arms)
 register_low_level_cfg_structurer(_structure_exact_branch_join_return)
+register_low_level_cfg_structurer(_structure_exact_optional_phi_diamond_region)
+register_low_level_cfg_structurer(_structure_exact_optional_terminal_diamond_region)
 register_low_level_cfg_structurer(_structure_exact_acyclic_tree_join_region)
+register_low_level_cfg_structurer(_structure_exact_acyclic_shared_linear_block)
 register_low_level_cfg_structurer(_structure_exact_acyclic_decision_tree_return)
 register_low_level_cfg_structurer(_structure_exact_guard_return_cascade)
 register_low_level_cfg_structurer(_structure_exact_acyclic_terminal_tree)
@@ -5484,12 +10233,30 @@ register_low_level_cfg_structurer(_structure_exact_triple_condition_loop_with_pr
 register_low_level_cfg_structurer(_structure_exact_header_body_if_join_loop)
 register_low_level_cfg_structurer(_structure_exact_header_effect_body_if)
 register_low_level_cfg_structurer(_structure_exact_two_edge_header_phi_while)
+register_low_level_cfg_structurer(_structure_exact_header_terminal_guard_loop)
+register_low_level_cfg_structurer(_structure_exact_terminal_natural_loop)
+register_low_level_cfg_structurer(_structure_exact_direct_join_terminal_loop)
+register_low_level_cfg_structurer(_structure_exact_pretested_loop_with_terminal_body_return)
+register_low_level_cfg_structurer(_structure_exact_natural_loop_with_shared_exit)
+register_low_level_cfg_structurer(_structure_exact_posttested_natural_loop)
 register_low_level_cfg_structurer(_structure_exact_single_natural_loop)
+register_low_level_cfg_structurer(_structure_exact_multi_backedge_terminal_loop)
+register_low_level_cfg_structurer(_structure_exact_multiway_terminal_loop)
+register_low_level_cfg_structurer(_structure_exact_multiway_shared_linear_join_loop)
+register_low_level_cfg_structurer(_structure_exact_terminal_join_loop)
+register_low_level_cfg_structurer(_structure_exact_loop_with_terminal_body_branch)
+register_low_level_cfg_structurer(_structure_exact_terminal_guarded_loop_region)
+register_low_level_cfg_structurer(_structure_exact_tree_loop_with_terminal_exits)
+register_low_level_cfg_structurer(_structure_exact_statement_guard_loop)
+register_low_level_cfg_structurer(_structure_exact_nested_loop_flattening)
 register_low_level_cfg_structurer(_structure_exact_innermost_natural_loop_region)
 register_low_level_cfg_structurer(_structure_exact_entry_natural_loop_region)
 register_low_level_cfg_structurer(_structure_exact_entry_posttested_self_loop)
+register_low_level_cfg_structurer(_structure_exact_infinite_loop_with_optional_arm)
 register_low_level_cfg_structurer(_structure_exact_try_common_join_region)
 register_low_level_cfg_structurer(_structure_exact_empty_jump_chains)
+register_low_level_cfg_structurer(_structure_exact_empty_jump_splices)
+register_low_level_cfg_structurer(_structure_exact_loop_linear_block_merges)
 register_low_level_cfg_structurer(_structure_exact_linear_block_merges)
 register_low_level_cfg_structurer(_structure_exact_multi_backedge_natural_loop_region)
 register_low_level_cfg_structurer(_structure_exact_direct_phi_diamond_region)
@@ -5498,3 +10265,5 @@ register_low_level_cfg_structurer(_structure_exact_linear_arm_diamond_region)
 register_low_level_cfg_structurer(_structure_exact_optional_linear_arm_diamond_region)
 register_low_level_cfg_structurer(_structure_exact_direct_phi_dispatch_region)
 register_low_level_cfg_structurer(_structure_exact_terminal_branch_region)
+register_low_level_cfg_structurer(_structure_exact_partial_branch_arm_splice)
+register_low_level_cfg_structurer(_structure_exact_partial_multiway_arm_splice)

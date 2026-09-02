@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
+
 from unidecompiler.core.ast import (
     AssignManyStmt,
     ArrayLiteralExpr,
@@ -149,7 +151,11 @@ def function_to_ast(function: FunctionIR) -> FunctionDecl:
             name=function.name,
             params=tuple(_logical_name(param) for param in function.params),
             source=function.source,
-            metadata={**function.metadata, "ssa_index": _ssa_index_to_metadata(ssa_index)},
+            metadata={
+                **function.metadata,
+                "ssa_index": _ssa_index_to_metadata(ssa_index),
+                "predeclared_names": _predeclared_names(tuple(body)),
+            },
             body=tuple(body),
             nested_functions=tuple(function_to_ast(nested) for nested in function.nested_functions),
         )
@@ -162,9 +168,143 @@ def function_to_ast(function: FunctionIR) -> FunctionDecl:
         name=function.name,
         params=tuple(_logical_name(param) for param in function.params),
         source=function.source,
-        metadata={**function.metadata, "ssa_index": _ssa_index_to_metadata(ssa_index)},
+        metadata={
+            **function.metadata,
+            "ssa_index": _ssa_index_to_metadata(ssa_index),
+            "predeclared_names": _predeclared_names(tuple(body)),
+        },
         body=tuple(body),
         nested_functions=tuple(function_to_ast(nested) for nested in function.nested_functions),
+    )
+
+
+def _predeclared_names(statements: tuple[object, ...]) -> tuple[str, ...]:
+    """Return names that must be visible before a nested control statement.
+
+    This is a core data-flow fact used by renderers to keep temporaries in the
+    enclosing scope.  Computing it here avoids making a backend infer
+    liveness or control-flow semantics while printing already-recovered AST.
+    Only names assigned inside a control statement and read later in that
+    statement's sequence are included.
+    """
+
+    result: set[str] = set()
+
+    def names(value: object) -> set[str]:
+        if isinstance(value, VarRef):
+            return {value.name}
+        if value is None or isinstance(value, (str, bytes, int, float, bool)):
+            return set()
+        if isinstance(value, dict):
+            output: set[str] = set()
+            for key, item in value.items():
+                output.update(names(key))
+                output.update(names(item))
+            return output
+        if isinstance(value, (tuple, list, set, frozenset)):
+            output: set[str] = set()
+            for item in value:
+                output.update(names(item))
+            return output
+        if is_dataclass(value):
+            output: set[str] = set()
+            for field in fields(value):
+                if field.name in {"source", "type"}:
+                    continue
+                output.update(names(getattr(value, field.name)))
+            return output
+        return set()
+
+    def uses(statement: object) -> set[str]:
+        if isinstance(statement, AssignStmt):
+            output = names(statement.value)
+            if isinstance(statement.target, (GetAttrExpr, GetItemExpr)):
+                output.update(names(statement.target.obj))
+                if isinstance(statement.target, GetItemExpr):
+                    output.update(names(statement.target.key))
+            return output
+        if isinstance(statement, AssignManyStmt):
+            return {name for value in statement.values for name in names(value)}
+        return names(statement)
+
+    def assigned(statement: object) -> set[str]:
+        if isinstance(statement, AssignStmt):
+            if isinstance(statement.target, VarRef):
+                return {statement.target.name}
+            if isinstance(statement.target, (GetAttrExpr, GetItemExpr)):
+                return names(statement.target.obj)
+            return set()
+        if isinstance(statement, AssignManyStmt):
+            return {target.name for target in statement.targets}
+        if isinstance(statement, (StoreAttrStmt, StoreItemStmt)):
+            return names(statement.obj)
+        if isinstance(statement, IfStmt):
+            return assigned_sequence(statement.then_body) | assigned_sequence(statement.else_body)
+        if isinstance(statement, SwitchStmt):
+            output = assigned_sequence(statement.default_body)
+            for _value, body in statement.cases:
+                output.update(assigned_sequence(body))
+            return output
+        if isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+            output = assigned_sequence(statement.body)
+            if isinstance(statement, (ForEachStmt, ForRangeStmt)):
+                output.add(statement.target.name)
+            return output
+        if isinstance(statement, TryStmt):
+            output = assigned_sequence(statement.body)
+            for handler in statement.handlers:
+                output.update(assigned_sequence(handler.body))
+                if handler.binding is not None:
+                    output.add(handler.binding.name)
+            return output
+        return set()
+
+    def children(statement: object) -> tuple[tuple[object, ...], ...]:
+        if isinstance(statement, IfStmt):
+            return (statement.then_body, statement.else_body)
+        if isinstance(statement, SwitchStmt):
+            return tuple(body for _value, body in statement.cases) + (statement.default_body,)
+        if isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+            return (statement.body,)
+        if isinstance(statement, TryStmt):
+            return (statement.body, *(handler.body for handler in statement.handlers))
+        return ()
+
+    def assigned_sequence(sequence: tuple[object, ...]) -> set[str]:
+        output: set[str] = set()
+        for statement in sequence:
+            output.update(assigned(statement))
+        return output
+
+    def visit(sequence: tuple[object, ...], inherited: frozenset[str] = frozenset()) -> None:
+        suffix: set[str] = set()
+        uses_after: list[set[str]] = [set() for _ in sequence]
+        for index in range(len(sequence) - 1, -1, -1):
+            uses_after[index] = set(suffix)
+            suffix.difference_update(assigned(sequence[index]))
+            suffix.update(uses(sequence[index]))
+        for index, statement in enumerate(sequence):
+            if children(statement):
+                protected = inherited | frozenset(uses_after[index])
+                result.update(
+                    name
+                    for name in assigned(statement) & protected
+                    if _is_temporary_name(name)
+                )
+                for child in children(statement):
+                    visit(child, protected)
+
+    visit(statements)
+    return tuple(sorted(result))
+
+
+def _is_temporary_name(name: str) -> bool:
+    """Match neutral VM temporary naming conventions used by renderers."""
+
+    return (
+        (name.startswith("r") and name[1:].isdigit())
+        or (name.startswith("t") and name[1:].isdigit())
+        or name.startswith("tmp")
     )
 
 

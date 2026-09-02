@@ -187,7 +187,7 @@ class RegionGraph:
         members: frozenset[str],
         *,
         header: str,
-        preheader: str,
+        preheader: str | None,
         exit: str,
     ) -> bool:
         """Check a conservative natural-loop boundary.
@@ -195,8 +195,10 @@ class RegionGraph:
         A loop differs from an acyclic SESE body because it contains one or
         more back edges to its header.  The check therefore permits ordinary
         internal back edges, while still rejecting exceptional and
-        irreducible edges.  It proves only the graph boundary; callers must
-        still validate loop phi values and statement ordering before folding.
+        irreducible edges.  ``preheader=None`` is the entry-loop form and
+        requires that the loop has no incoming edge from outside its members.
+        It proves only the graph boundary; callers must still validate loop
+        phi values and statement ordering before folding.
         """
 
         if (
@@ -204,7 +206,7 @@ class RegionGraph:
             or not members
             or header not in members
             or exit in members
-            or preheader in members
+            or (preheader is not None and preheader in members)
         ):
             return False
         if any(self.node(member) is None for member in members):
@@ -217,7 +219,11 @@ class RegionGraph:
         ]
         if any(edge.target != header for edge in incoming):
             return False
-        if {edge.source for edge in incoming} != {preheader}:
+        incoming_sources = {edge.source for edge in incoming}
+        if preheader is None:
+            if incoming_sources:
+                return False
+        elif incoming_sources != {preheader}:
             return False
 
         outgoing = [

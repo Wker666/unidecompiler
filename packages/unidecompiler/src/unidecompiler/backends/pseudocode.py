@@ -161,6 +161,11 @@ def _emit_function_body(
         return lines
 
     declared: set[str] = set(function.params)
+    declared.update(
+        name
+        for name in function.metadata.get("predeclared_names", ())
+        if isinstance(name, str)
+    )
     inline_values: dict[str, AstExpr] = {}
     body_lines, declared = _emit_stmt_sequence(
         function.body,
@@ -368,6 +373,17 @@ def _emit_if(
     then_declared = declared.copy()
     then_inline = inline_values.copy()
     then_lines, _ = _emit_stmt_sequence(statement.then_body, source_language, local_names, then_declared, then_inline)
+    # Inlining is a presentation optimization only. It must never erase a
+    # non-empty control arm; rerender that arm with original expressions when
+    # the optimization would otherwise produce an empty body.
+    if statement.then_body and not any(line.strip() for line in then_lines):
+        then_lines, _ = _emit_stmt_sequence(
+            statement.then_body,
+            source_language,
+            local_names | _control_assignment_names(statement.then_body),
+            declared.copy(),
+            {},
+        )
     lines.extend(_indent(then_lines, "    "))
     if not statement.else_body:
         lines.append("    }")
@@ -376,9 +392,42 @@ def _emit_if(
     else_declared = declared.copy()
     else_inline = inline_values.copy()
     else_lines, _ = _emit_stmt_sequence(statement.else_body, source_language, local_names, else_declared, else_inline)
+    if statement.else_body and not any(line.strip() for line in else_lines):
+        else_lines, _ = _emit_stmt_sequence(
+            statement.else_body,
+            source_language,
+            local_names | _control_assignment_names(statement.else_body),
+            declared.copy(),
+            {},
+        )
     lines.extend(_indent(else_lines, "    "))
     lines.append("    }")
     return lines, declared
+
+
+def _control_assignment_names(statements: tuple[object, ...]) -> set[str]:
+    """Collect assignment targets for the empty-arm presentation fallback."""
+
+    names: set[str] = set()
+    for statement in statements:
+        if isinstance(statement, AssignStmt) and isinstance(statement.target, VarRef):
+            names.add(statement.target.name)
+        elif isinstance(statement, AssignManyStmt):
+            names.update(target.name for target in statement.targets)
+        elif isinstance(statement, IfStmt):
+            names.update(_control_assignment_names(statement.then_body))
+            names.update(_control_assignment_names(statement.else_body))
+        elif isinstance(statement, SwitchStmt):
+            names.update(_control_assignment_names(statement.default_body))
+            for _value, body in statement.cases:
+                names.update(_control_assignment_names(body))
+        elif isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+            names.update(_control_assignment_names(statement.body))
+        elif isinstance(statement, TryStmt):
+            names.update(_control_assignment_names(statement.body))
+            for handler in statement.handlers:
+                names.update(_control_assignment_names(handler.body))
+    return names
 
 
 def _shared_branch_assignments(statement: IfStmt) -> tuple[str, ...]:
