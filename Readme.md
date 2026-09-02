@@ -79,6 +79,16 @@ low-level CFG/goto form is retained. The final `FunctionDecl` AST is produced
 only after this loop reaches a stable result; backends only render that result
 and never perform CFG recovery.
 
+CFG recovery is edge-aware. Core keeps concrete incoming and outgoing edges,
+including parallel edges, with deterministic identities; a reducer must never
+deduplicate an edge merely because its source, target, or kind matches another
+edge. Shared CFG analysis snapshots provide dominators, postdominators,
+frontiers, loop information, and irreducible-entry facts for VM-neutral
+structuring passes. Phi cleanup and fallthrough-jump removal are accepted only
+when the exact predecessor edges, exception state, and data-flow values prove
+the rewrite safe. Otherwise the preservation-floor CFG/goto representation is
+kept unchanged.
+
 ## Package Architecture
 
 `unidecompiler` is an embeddable core library. It has no command-line entry

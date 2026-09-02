@@ -46,6 +46,11 @@ core recovery. Its optional simulation adapter is data-only; the generic IR
 simulator remains responsible for execution. The GUI plugin template depends
 only on `unidecompiler-gui-sdk` and remains a read-only application extension.
 
+The exported frontend guide also documents edge-aware CFG recovery. Core keeps
+parallel edges distinct and performs Phi/fallthrough simplification only when
+the exact control-flow and exception-state proof succeeds; generated frontend
+code must submit facts and never recover or rewrite CFGs itself.
+
 ## Frontend persistence
 
 Custom VM frontend folders registered from `View -> Frontends` are persisted by

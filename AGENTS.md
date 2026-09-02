@@ -53,6 +53,15 @@ fixed point; backends render it and never perform CFG recovery. This is a
 structured-`FunctionIR` refinement boundary, not an implicit or lossy
 `FunctionDecl`-to-CFG conversion.
 
+Core CFG facts are edge-aware and tied to an immutable CFG snapshot. Concrete
+parallel edges retain deterministic identities and ordinals; incoming and
+outgoing edge queries must not collapse them by source/target/kind. Shared
+analysis snapshots expose dominators, postdominators, dominance frontiers,
+grouped loop facts, and irreducible-entry edges to VM-neutral structuring
+passes. A rewrite such as Phi cleanup or fallthrough-jump removal is valid only
+when exact predecessor edges, exception state, and data-flow equivalence are
+proved. When those facts are unavailable, retain the low-level CFG/goto form.
+
 Useful source metadata should flow through the pipeline when available,
 including source filenames, bytecode versions, constants, debug tables,
 instruction offsets, line info, local variable info, upvalue or member names,
@@ -254,6 +263,12 @@ These rules are mandatory.
 - A structuring pass may replace low-level CFG/goto output only when it can
   preserve exactly the same code logic and has focused tests for the recovered
   shape.
+- CFG rewrites must use concrete edge identity and preserve parallel edges,
+  exception edges, handler state, and observable ordering; never remove a Phi
+  or jump by comparing block IDs or textual values alone.
+- Reuse the shared VM-neutral CFG analysis and region-reducer seams. Do not
+  introduce frontend-specific CFG matchers or duplicate graph algorithms in a
+  backend or frontend.
 - Core must preserve semantics where it can. When it cannot, it should degrade
   to partial or unsupported generic IR with raw context instead of moving logic
   back into a frontend.

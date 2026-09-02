@@ -49,8 +49,8 @@ from unidecompiler.core.cfg import (
     compute_immediate_postdominators,
     find_natural_loops,
 )
-from unidecompiler.core.cfg_rewrite import CFGRewriteCandidate, validate_cfg_rewrite
 from unidecompiler.core.region import RegionGraph
+from unidecompiler.core.region_reducer import RegionReducer
 
 
 LowLevelCfgStructurer = Callable[[FunctionIR], FunctionIR | None]
@@ -110,64 +110,11 @@ def structure_low_level_cfg(
     one verified replacement, preserving the registry's deterministic policy.
     """
 
-    if _has_exceptional_block_context(function):
-        return None
-    current = function
-    normalized = False
-    while True:
-        for structurer in low_level_cfg_structurers():
-            structured = structurer(current)
-            if structured is None:
-                continue
-            if current.recovery_kind in {
-                "generic-vm-low-level-cfg",
-                "generic-vm-low-level-cfg-structured",
-            }:
-                proof = (
-                    "lossless-normalization"
-                    if structurer in _LOW_LEVEL_CFG_NORMALIZERS
-                    else "exact-topology"
-                )
-                decision = validate_cfg_rewrite(
-                    CFGRewriteCandidate(
-                        original=current,
-                        rewritten=structured,
-                        rule=structured.metadata.get(
-                            "low_level_cfg_structured", structurer.__name__
-                        ),
-                        proof=proof,
-                    )
-                )
-                if not decision.accepted:
-                    continue
-                structured = decision.function
-            else:
-                # Keep the historical internal extension seam for callers
-                # that pass a non-VM FunctionIR.  VM preservation views above
-                # always cross the fail-closed rewrite gate, including later
-                # iterations after the first structured result.
-                structured = replace(
-                    structured,
-                    control_provenance=tuple(
-                        dict.fromkeys(
-                            (*current.control_provenance, *structured.control_provenance)
-                        )
-                    ),
-                    bytecode_control_flow=tuple(
-                        dict.fromkeys(
-                            (*current.bytecode_control_flow, *structured.bytecode_control_flow)
-                        )
-                    ),
-                )
-            if is_safe is not None and not is_safe(structured):
-                continue
-            if structurer in _LOW_LEVEL_CFG_NORMALIZERS:
-                current = structured
-                normalized = True
-                break
-            return structured
-        else:
-            return current if normalized else None
+    reducer = RegionReducer(
+        reducers=low_level_cfg_structurers(),
+        normalizers=_LOW_LEVEL_CFG_NORMALIZERS,
+    )
+    return reducer.reduce(function, is_safe=is_safe)
 
 
 def _has_exceptional_block_context(function: FunctionIR) -> bool:

@@ -45,6 +45,12 @@ The frontend is an adapter, not a second decompiler or VM implementation.
 - Preserve explicit unsupported diagnostics when a fact cannot be proved; never
   delete a hint, fabricate an empty effect, or reinterpret an exception as an
   ordinary branch just to improve a status count.
+- Treat CFG edges as concrete facts. Parallel edges may share source, target,
+  and kind but remain distinct; never deduplicate them or infer a Phi/jump
+  rewrite from block IDs or equal-looking text.
+- CFG structuring and refinement belong to core. Submit branch, loop,
+  exception, and handler hints and rely on core's shared edge-aware analysis;
+  do not add frontend graph algorithms or source-structure recovery.
 - __SIMULATION_GUIDANCE__
 - Classify every semantic statement as `proven`, `inferred`, or `unresolved` and
   cite file-relative lines and public bytecode offsets. Treat the user-supplied

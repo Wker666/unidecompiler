@@ -20,6 +20,11 @@ This requirement does not override the architecture rules below.
   backends only render the result and never recover CFG or eliminate gotos.
 - Keep exception edges and handler state intact when core cannot safely structure
   the normal CFG; low-level CFG/goto is the preservation floor.
+- Core CFG edges are concrete and edge-aware, including deterministic identities
+  for parallel edges. Do not deduplicate edges or remove Phi values/jumps by
+  comparing block IDs or textual values alone.
+- Reuse core's shared CFG analysis and reducer. Do not add frontend-specific
+  CFG recovery, region matchers, or graph algorithms.
 
 See `docs/NEW_VM_FRONTEND.md` for the full contract.
 

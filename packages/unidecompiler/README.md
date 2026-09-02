@@ -38,6 +38,13 @@ existing low-level CFG/goto representation remains the preservation floor.
 The loop operates on structured `FunctionIR` inside core. It is not a
 frontend-specific pass, and backends do not infer or recover control flow.
 
+CFG rewrites are edge-aware. Parallel edges retain deterministic concrete
+identity, and shared CFG analysis snapshots provide graph facts for
+structuring. Same-value Phi cleanup and explicit fallthrough-jump removal are
+performed only when predecessor edges, exception state, data-flow values, and
+evaluation order are proven equivalent. If that proof is unavailable, core
+keeps the low-level CFG/goto form rather than guessing.
+
 ## Install
 
 Install the core library directly from PyPI. Cloning this repository is not

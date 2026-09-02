@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from unidecompiler.core.cfg import CFG, build_cfg, find_natural_loops
+from unidecompiler.core.cfg import CFG, build_cfg, find_irreducible_blocks
 from unidecompiler.core.ir import FunctionIR, SourceRef
 
 
@@ -33,6 +33,15 @@ class RegionEdge:
     kind: str
     provenance: SourceRef | None = None
     roles: frozenset[RegionEdgeRole] = frozenset({"ordinary"})
+    ordinal: int = 0
+
+    @property
+    def edge_id(self) -> str:
+        return f"{self.source}:{self.target}:{self.kind}:{self.ordinal}"
+
+    @property
+    def id(self) -> str:
+        return self.edge_id
 
 
 @dataclass(frozen=True)
@@ -59,20 +68,26 @@ class RegionGraph:
     nodes: tuple[RegionNode, ...]
     edges: tuple[RegionEdge, ...]
     diagnostics: tuple[str, ...] = ()
+    irreducible_edge_ids: frozenset[str] = frozenset()
 
     @classmethod
     def from_cfg(cls, cfg: CFG) -> "RegionGraph":
-        natural_loops = find_natural_loops(cfg)
+        # Share one immutable analysis snapshot for all region facts.  The
+        # snapshot is discarded whenever a rewrite creates a new CFG, so no
+        # pass can accidentally observe stale loop information.
+        analysis = cfg.analyze()
+        loop_infos = analysis.loop_infos
         back_edges = {
-            (loop.backedge_source, loop.header)
-            for loop in natural_loops
+            (source, loop.header)
+            for loop in loop_infos
+            for source in loop.backedge_sources
         }
         loop_exit_edges = {
             (edge.source, edge.target)
-            for loop in natural_loops
+            for loop in loop_infos
             for edge in loop.exits
         }
-        irreducible_blocks = _irreducible_blocks(cfg)
+        irreducible_blocks = find_irreducible_blocks(cfg)
 
         def roles(source: str, target: str, kind: str) -> frozenset[RegionEdgeRole]:
             result: set[RegionEdgeRole] = set()
@@ -99,6 +114,7 @@ class RegionGraph:
                 kind=edge.kind,
                 provenance=edge.provenance,
                 roles=roles(edge.source, edge.target, edge.kind),
+                ordinal=edge.ordinal,
             )
             for edge in cfg.edges
         )
@@ -107,6 +123,7 @@ class RegionGraph:
             nodes=nodes,
             edges=edges,
             diagnostics=cfg.diagnostics,
+            irreducible_edge_ids=frozenset(edge.edge_id for edge in analysis.irreducible_edges),
         )
 
     @classmethod
@@ -121,6 +138,11 @@ class RegionGraph:
 
     def predecessors(self, node_id: str) -> tuple[str, ...]:
         return tuple(edge.source for edge in self.edges if edge.target == node_id)
+
+    def is_irreducible_entry_edge(self, edge: RegionEdge) -> bool:
+        """Return whether ``edge`` enters a multi-entry cyclic component."""
+
+        return edge.edge_id in self.irreducible_edge_ids
 
     def is_sese_body(
         self,
@@ -333,6 +355,7 @@ class RegionGraph:
                     kind=edge.kind,
                     provenance=edge.provenance,
                     roles=edge.roles,
+                    ordinal=edge.ordinal,
                 )
             )
         return RegionGraph(
@@ -340,67 +363,9 @@ class RegionGraph:
             nodes=nodes,
             edges=tuple(rewritten_edges),
             diagnostics=self.diagnostics,
+            irreducible_edge_ids=frozenset(
+                edge.edge_id
+                for edge in rewritten_edges
+                if edge.edge_id in self.irreducible_edge_ids
+            ),
         )
-
-
-def _irreducible_blocks(cfg: CFG) -> frozenset[str]:
-    """Return blocks in strongly connected components with multiple entries."""
-
-    irreducible: set[str] = set()
-    for component in _strongly_connected_components(cfg):
-        if len(component) == 1:
-            only = next(iter(component))
-            if only not in cfg.successors(only):
-                continue
-        entry_targets = {
-            edge.target
-            for edge in cfg.edges
-            if edge.target in component and edge.source not in component
-        }
-        if cfg.entry in component:
-            entry_targets.add(cfg.entry)
-        if len(entry_targets) > 1:
-            irreducible.update(component)
-    return frozenset(irreducible)
-
-
-def _strongly_connected_components(cfg: CFG) -> tuple[frozenset[str], ...]:
-    """Compute deterministic SCCs with Tarjan's algorithm."""
-
-    next_index = 0
-    indexes: dict[str, int] = {}
-    lowlinks: dict[str, int] = {}
-    stack: list[str] = []
-    on_stack: set[str] = set()
-    components: list[frozenset[str]] = []
-
-    def visit(node: str) -> None:
-        nonlocal next_index
-        indexes[node] = next_index
-        lowlinks[node] = next_index
-        next_index += 1
-        stack.append(node)
-        on_stack.add(node)
-
-        for successor in sorted(set(cfg.successors(node))):
-            if successor not in indexes:
-                visit(successor)
-                lowlinks[node] = min(lowlinks[node], lowlinks[successor])
-            elif successor in on_stack:
-                lowlinks[node] = min(lowlinks[node], indexes[successor])
-
-        if lowlinks[node] != indexes[node]:
-            return
-        component: set[str] = set()
-        while stack:
-            member = stack.pop()
-            on_stack.remove(member)
-            component.add(member)
-            if member == node:
-                break
-        components.append(frozenset(component))
-
-    for block_id in sorted(cfg.blocks):
-        if block_id not in indexes:
-            visit(block_id)
-    return tuple(components)

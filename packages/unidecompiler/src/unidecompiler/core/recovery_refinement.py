@@ -146,6 +146,7 @@ def _next_refinement(function: FunctionIR) -> FunctionIR | None:
         rewritten = _rewrite_first_block_expression(
             block,
             predecessors=predecessors,
+            edge_ambiguous=len(cfg.incoming_edges(block.id)) != len(predecessors),
             available_out=available_out,
             defined_anywhere=defined_anywhere,
         )
@@ -282,6 +283,7 @@ def _rewrite_first_block_expression(
     block: BasicBlock,
     *,
     predecessors: frozenset[str],
+    edge_ambiguous: bool,
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
     nested_control: bool = False,
@@ -290,6 +292,7 @@ def _rewrite_first_block_expression(
         rewritten, changed = _rewrite_first_expression(
             statement,
             predecessors=predecessors,
+            edge_ambiguous=edge_ambiguous,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
             nested_control=nested_control,
@@ -308,6 +311,7 @@ def _rewrite_first_block_expression(
     terminator, changed = _rewrite_first_expression(
         block.terminator,
         predecessors=predecessors,
+        edge_ambiguous=edge_ambiguous,
         available_out=available_out,
         defined_anywhere=defined_anywhere,
         nested_control=nested_control,
@@ -321,6 +325,7 @@ def _rewrite_first_expression(
     value: object,
     *,
     predecessors: frozenset[str],
+    edge_ambiguous: bool,
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
     nested_control: bool = False,
@@ -329,6 +334,7 @@ def _rewrite_first_expression(
         replacement = _identical_phi_value(
             value,
             predecessors=predecessors,
+            edge_ambiguous=edge_ambiguous,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
             allow_partial=nested_control,
@@ -341,6 +347,7 @@ def _rewrite_first_expression(
             rewritten, changed = _rewrite_first_expression(
                 item,
                 predecessors=predecessors,
+                edge_ambiguous=edge_ambiguous,
                 available_out=available_out,
                 defined_anywhere=defined_anywhere,
                 nested_control=nested_control,
@@ -362,6 +369,7 @@ def _rewrite_first_expression(
         rewritten, changed = _rewrite_first_expression(
             field_value,
             predecessors=predecessors,
+            edge_ambiguous=edge_ambiguous,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
             nested_control=child_nested_control,
@@ -375,11 +383,17 @@ def _identical_phi_value(
     phi: Phi,
     *,
     predecessors: frozenset[str],
+    edge_ambiguous: bool,
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
     allow_partial: bool = False,
 ) -> Expr | None:
     if not phi.incoming:
+        return None
+    # A block-id keyed Phi cannot represent which value belongs to each of
+    # several parallel edges from the same predecessor.  Keep it intact until
+    # an edge-aware Phi representation is available instead of guessing.
+    if edge_ambiguous:
         return None
 
     by_predecessor: dict[str, Expr] = {}

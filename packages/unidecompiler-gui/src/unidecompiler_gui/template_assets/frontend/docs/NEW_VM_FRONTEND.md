@@ -131,6 +131,23 @@ branch/loop structurers must not erase them merely to produce nicer output.
 Backends only render the final AST or preservation-floor CFG; they never infer
 branches, loops, Phi values, or fallthroughs themselves.
 
+### 0.5.1 Edge-aware CFG recovery invariants
+
+The core CFG is an immutable analysis snapshot. Every concrete edge has a
+deterministic identity, including parallel edges that share a source, target,
+and kind. Structuring and refinement passes must use concrete incoming and
+outgoing edges rather than a set of predecessor block IDs. The shared analysis
+surface provides dominators, postdominators, dominance frontiers, grouped loop
+facts, and irreducible-entry edges; use it instead of implementing a second
+graph algorithm in a frontend or backend.
+
+This matters at joins. A Phi may have equal-looking incoming values while its
+predecessor edges or handler state differ. Remove it only when the core proof
+covers the exact edges, data-flow values, exception state, and evaluation
+ordering. The same rule applies to removing an explicit jump to an existing
+fallthrough block. If the proof does not hold, retain the low-level CFG/goto
+output exactly; it is the semantics-preserving floor.
+
 ## 0. First clarify the boundaries of frontend
 
 Frontend can do:
