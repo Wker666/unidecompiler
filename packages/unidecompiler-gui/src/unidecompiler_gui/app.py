@@ -17,6 +17,7 @@ from unidecompiler_gui.plugin_host import PluginHost
 from unidecompiler_gui.plugin_install import GuiPluginStore, load_enabled_plugins
 from unidecompiler_gui.frontend_store import FrontendRestoreFailure, FrontendStore
 from unidecompiler_gui.hex_view import HexView
+from unidecompiler_gui.pseudocode_export import export_pseudocode_documents, write_pseudocode
 from unidecompiler_simulator import (
     SimulationCancellation,
     SimulationEngine,
@@ -728,12 +729,14 @@ class Workbench(QMainWindow):
         self.decompile_all_action = QAction("Decompile all pending", self, shortcut="Ctrl+Shift+Enter", triggered=self.decompile_all_pending)
         self.decompile_all_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         export = QAction("Export pseudocode", self, triggered=self.export_pseudocode)
+        export_all = QAction("Export all pseudocode", self, triggered=self.export_all_pseudocode)
         menu = self.menuBar().addMenu("File")
         menu.addAction(open_file)
         menu.addAction(open_directory)
         menu.addAction(open_archive)
         menu.addAction(self.decompile_all_action)
         menu.addAction(export)
+        menu.addAction(export_all)
         self.recent_menu = menu.addMenu("Recent")
         self._rebuild_recent_menu()
 
@@ -1475,7 +1478,32 @@ class Workbench(QMainWindow):
             return
         filename, _ = QFileDialog.getSaveFileName(self, "Export pseudocode", "pseudocode.txt", "Text files (*.txt);;All files (*)")
         if filename:
-            Path(filename).write_text(result.pseudocode.text, encoding="utf-8")
+            try:
+                write_pseudocode(result, Path(filename))
+            except OSError as error:
+                QMessageBox.critical(self, "Pseudocode export failed", str(error))
+                return
+
+    def export_all_pseudocode(self) -> None:
+        candidates = tuple(result for result in self.results if result.pseudocode is not None)
+        if not candidates:
+            self.statusBar().showMessage("No pseudocode to export")
+            return
+        directory = QFileDialog.getExistingDirectory(self, "Choose pseudocode output directory")
+        if not directory:
+            return
+        try:
+            exported = export_pseudocode_documents(candidates, Path(directory))
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Pseudocode export failed", str(error))
+            return
+        skipped = len(self.results) - len(candidates)
+        detail = f"\nSkipped {skipped} result(s) without pseudocode." if skipped else ""
+        QMessageBox.information(
+            self,
+            "Pseudocode exported",
+            f"Exported {len(exported)} pseudocode file(s) to:\n{Path(directory).resolve()}{detail}",
+        )
 
     def _update_cursor_status(self) -> None:
         cursor = self.pseudocode.textCursor()
