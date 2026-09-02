@@ -8,6 +8,7 @@ from unidecompiler.core.ir import (
     Assign,
     AssignMany,
     BasicBlock,
+    BinaryOp,
     Const,
     Expr,
     FunctionIR,
@@ -71,18 +72,46 @@ def refine_recovered_function(
             from unidecompiler.core.low_level_cfg_structuring import structure_low_level_cfg
 
             structured = structure_low_level_cfg(current, is_safe=is_safe)
-            if structured is None or _function_fingerprint(structured) == fingerprint:
-                return current
-            if (
-                current.recovery_kind == "generic-vm-low-level-cfg-structured"
-                and structured.recovery_kind != "generic-vm-low-level-cfg-structured"
-            ):
-                return current
-            if not is_safe(structured):
-                return current
-            current = structured
+            if structured is not None and _function_fingerprint(structured) != fingerprint:
+                if (
+                    current.recovery_kind == "generic-vm-low-level-cfg-structured"
+                    and structured.recovery_kind != "generic-vm-low-level-cfg-structured"
+                ):
+                    return current
+                if not is_safe(structured):
+                    return current
+                current = structured
             needs_restructure = False
-            continue
+            # Materialize conservative SSA join facts before the first
+            # refinement pass.  ``astify`` used to synthesize these after all
+            # recovery had finished, which made trivial loop Phis impossible
+            # to remove and prevented them from exposing another CFG shape.
+            if (
+                current.recovery_kind == "generic-vm-low-level-cfg"
+                and not current.metadata.get("recovery_phi_materialized")
+            ):
+                from unidecompiler.core.ssa import insert_phi_nodes
+
+                materialized = insert_phi_nodes(current)
+                if materialized != current:
+                    materialized = replace(
+                        materialized,
+                        metadata={
+                            **materialized.metadata,
+                            "recovery_phi_materialized": True,
+                        },
+                    )
+                if (
+                    not _refinement_is_valid(current, materialized)
+                    or not is_safe(materialized)
+                ):
+                    return current
+                current = materialized
+            # A structurer may legitimately have no matching rule.  That is
+            # not a reason to abandon expression/SSA cleanup: refinement is
+            # also defined on the preservation-floor CFG itself.  The next
+            # phase therefore runs even when ``structured`` is None or is an
+            # unchanged function.
 
         refined = _next_refinement(current)
         if refined is not None:
@@ -127,6 +156,76 @@ def _next_refinement(function: FunctionIR) -> FunctionIR | None:
                 rewritten,
             )
 
+    # VM string builders are often lowered into a straight-line sequence such
+    # as ``s = ''; s = s + 'ver'; s = s + 'sio'``.  Track only constants
+    # defined earlier in the same block and fold that proven string expression
+    # to one literal.  We deliberately do not propagate across CFG edges or
+    # through unknown assignments/calls.
+    for block_index, block in enumerate(function.blocks):
+        known_strings: dict[str, str] = {}
+        string_run_target: str | None = None
+        string_run_start: int | None = None
+        for statement_index, statement in enumerate(block.statements):
+            if not isinstance(statement, Assign) or not isinstance(statement.target, Var):
+                string_run_target = None
+                string_run_start = None
+                known_strings.clear()
+                continue
+            target_name = statement.target.name
+            if string_run_target != target_name:
+                known_strings.clear()
+                string_run_target = target_name
+                string_run_start = (
+                    statement_index
+                    if isinstance(statement.value, Const)
+                    and isinstance(statement.value.value, str)
+                    else None
+                )
+            value = _constant_string_value(statement.value, known_strings)
+            if value is not None and not isinstance(statement.value, Const):
+                rewritten = replace(
+                    statement,
+                    value=Const(
+                        value=value,
+                        source=statement.value.source,
+                        type=statement.value.type,
+                    ),
+                )
+                start = string_run_start
+                if start is not None:
+                    return _replace_block(
+                        function,
+                        block_index,
+                        replace(
+                            block,
+                            statements=(
+                                *block.statements[:start],
+                                rewritten,
+                                *block.statements[statement_index + 1 :],
+                            ),
+                        ),
+                    )
+                return _replace_block(
+                    function,
+                    block_index,
+                    replace(
+                        block,
+                        statements=(
+                            *block.statements[:statement_index],
+                            rewritten,
+                            *block.statements[statement_index + 1 :],
+                        ),
+                    ),
+                )
+            if isinstance(statement.value, Const) and isinstance(
+                statement.value.value, str
+            ):
+                known_strings[statement.target.name] = statement.value.value
+            else:
+                known_strings.pop(statement.target.name, None)
+                string_run_target = None
+                string_run_start = None
+
     # Delete only a side-effect-free identity assignment whose read is
     # definitely valid at that exact program point.  The walk includes
     # already-structured nested bodies; it never crosses an expression or
@@ -144,15 +243,22 @@ def _next_refinement(function: FunctionIR) -> FunctionIR | None:
             )
 
     # An explicit jump to the physically next block is exactly the existing
-    # implicit fallthrough edge.  Exceptional contexts remain untouched until
-    # a dedicated exceptional-CFG proof owns them.
-    if (
+    # implicit fallthrough edge.  In an exceptional CFG, retain empty routing
+    # blocks as the preservation floor; a non-empty block's jump is still a
+    # proven no-op, and removing it does not touch its exceptional edge.
+    exceptional_context = _has_exceptional_context(function)
+    allow_fallthrough_cleanup = (
         function.recovery_kind == "generic-vm-low-level-cfg-structured"
-        and not _has_exceptional_context(function)
-    ):
+        and not exceptional_context
+    ) or (
+        function.recovery_kind == "generic-vm-low-level-cfg"
+        and exceptional_context
+    )
+    if allow_fallthrough_cleanup:
         for index, block in enumerate(function.blocks[:-1]):
             if (
-                isinstance(block.terminator, Jump)
+                (not exceptional_context or block.statements)
+                and isinstance(block.terminator, Jump)
                 and block.terminator.target == function.blocks[index + 1].id
             ):
                 provenance = function.control_provenance
@@ -178,6 +284,7 @@ def _rewrite_first_block_expression(
     predecessors: frozenset[str],
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
+    nested_control: bool = False,
 ) -> BasicBlock | None:
     for index, statement in enumerate(block.statements):
         rewritten, changed = _rewrite_first_expression(
@@ -185,6 +292,7 @@ def _rewrite_first_block_expression(
             predecessors=predecessors,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
+            nested_control=nested_control,
         )
         if changed:
             return replace(
@@ -202,6 +310,7 @@ def _rewrite_first_block_expression(
         predecessors=predecessors,
         available_out=available_out,
         defined_anywhere=defined_anywhere,
+        nested_control=nested_control,
     )
     if not changed:
         return None
@@ -214,6 +323,7 @@ def _rewrite_first_expression(
     predecessors: frozenset[str],
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
+    nested_control: bool = False,
 ) -> tuple[object, bool]:
     if isinstance(value, Phi):
         replacement = _identical_phi_value(
@@ -221,6 +331,7 @@ def _rewrite_first_expression(
             predecessors=predecessors,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
+            allow_partial=nested_control,
         )
         if replacement is not None:
             return replacement, True
@@ -232,6 +343,7 @@ def _rewrite_first_expression(
                 predecessors=predecessors,
                 available_out=available_out,
                 defined_anywhere=defined_anywhere,
+                nested_control=nested_control,
             )
             if changed:
                 return (*value[:index], rewritten, *value[index + 1 :]), True
@@ -244,11 +356,15 @@ def _rewrite_first_expression(
         if field.name in {"source", "type"}:
             continue
         field_value = getattr(value, field.name)
+        child_nested_control = nested_control or isinstance(
+            value, (If, While, ForEach, ForRange)
+        )
         rewritten, changed = _rewrite_first_expression(
             field_value,
             predecessors=predecessors,
             available_out=available_out,
             defined_anywhere=defined_anywhere,
+            nested_control=child_nested_control,
         )
         if changed:
             return replace(value, **{field.name: rewritten}), True
@@ -261,6 +377,7 @@ def _identical_phi_value(
     predecessors: frozenset[str],
     available_out: dict[str, frozenset[str]],
     defined_anywhere: frozenset[str],
+    allow_partial: bool = False,
 ) -> Expr | None:
     if not phi.incoming:
         return None
@@ -273,7 +390,11 @@ def _identical_phi_value(
         by_predecessor[predecessor] = incoming
     incoming_predecessors = frozenset(by_predecessor)
     if predecessors:
-        if incoming_predecessors != predecessors:
+        if incoming_predecessors != predecessors and not (
+            allow_partial
+            and len(incoming_predecessors) == 1
+            and incoming_predecessors.issubset(predecessors)
+        ):
             return None
     elif len(incoming_predecessors) != 1:
         return None
@@ -286,12 +407,15 @@ def _identical_phi_value(
         return None
     if isinstance(first, Var):
         if len(set(by_predecessor)) == 1:
-            # A duplicate predecessor is already a single incoming edge.  The
-            # generic IR has no edge-sensitive variable object, so require
-            # only that the name is proven to be defined somewhere in this
-            # function; this covers structured nested expressions whose
-            # predecessor id is not a top-level CFG block.
-            if first.name not in defined_anywhere:
+            # A duplicate predecessor is already a single incoming edge.  If
+            # it names a CFG block, require the value to be available on that
+            # edge; otherwise retain the conservative fallback for structured
+            # nested expressions whose provenance id is not a top-level block.
+            predecessor = next(iter(by_predecessor))
+            if predecessor in available_out:
+                if first.name not in available_out[predecessor]:
+                    return None
+            elif first.name not in defined_anywhere:
                 return None
         elif any(
             first.name not in available_out.get(predecessor, frozenset())
@@ -309,6 +433,19 @@ def _pure_values_equal(left: Expr, right: Expr) -> bool:
     if isinstance(left, Const) and isinstance(right, Const):
         return type(left.value) is type(right.value) and left.value == right.value
     return False
+
+
+def _constant_string_value(value: Expr, known_strings: dict[str, str]) -> str | None:
+    if isinstance(value, Const):
+        return value.value if isinstance(value.value, str) else None
+    if isinstance(value, Var):
+        return known_strings.get(value.name)
+    if isinstance(value, BinaryOp) and value.op == "+":
+        left = _constant_string_value(value.left, known_strings)
+        right = _constant_string_value(value.right, known_strings)
+        if left is not None and right is not None:
+            return left + right
+    return None
 
 
 def _definitely_available_names(

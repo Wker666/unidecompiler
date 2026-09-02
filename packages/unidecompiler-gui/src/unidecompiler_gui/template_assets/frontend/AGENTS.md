@@ -16,9 +16,14 @@ This requirement does not override the architecture rules below.
 - The generic simulator executes recovered generic IR; it must remain independent from this frontend's bytecode model and opcode table.
 - Report unsupported shapes with bytecode context. Do not hide or guess unsupported behavior.
 - Add decoder, lifting, and source-equivalent verification tests. Add simulation tests when simulation is declared.
+- Core reaches a semantics-preserving recovery fixed point before AST emission;
+  backends only render the result and never recover CFG or eliminate gotos.
+- Keep exception edges and handler state intact when core cannot safely structure
+  the normal CFG; low-level CFG/goto is the preservation floor.
 
 See `docs/NEW_VM_FRONTEND.md` for the full contract.
 
-If `docs/AI_CONTEXT.md` exists, it is AI-only project context generated from
-user-selected reference artifacts. Read it before implementing; do not treat
-its unverified entry or inferred facts as established semantics.
+In a generated project, if `docs/AI_CONTEXT.md` exists, it is AI-only project
+context generated from user-selected reference artifacts. Read it before
+implementing; do not treat its unverified entry or inferred facts as established
+semantics.

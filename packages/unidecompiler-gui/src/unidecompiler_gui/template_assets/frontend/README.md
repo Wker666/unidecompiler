@@ -12,3 +12,9 @@ Read `AGENTS.md` before implementation, then follow `docs/NEW_VM_FRONTEND.md`.
 This project must submit VM-neutral thin IR to `unidecompiler`; core owns CFG,
 structure recovery, AST, and pseudocode. Simulation support is optional and
 must remain data-only at the frontend boundary.
+
+After lifting, core runs a semantics-preserving recovery fixed point before
+the final AST is emitted. It may refine structured `FunctionIR` and retry CFG
+structuring, but it retains low-level CFG/goto when equivalence cannot be
+proved. Backends do not perform recovery. See `docs/NEW_VM_FRONTEND.md` for
+the complete frontend, version-support, provenance, and simulation contract.

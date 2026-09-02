@@ -13,6 +13,31 @@ locations in the original input artifact. This is read-only presentation data
 for hosts such as the GUI; it has no execution, control-flow, or recovery
 semantics and is omitted whenever the decoder cannot prove the range.
 
+Core recovery reaches a fixed point before the final AST is emitted:
+
+```txt
+thin IR -> generic IR / low-level CFG
+                 |
+                 v
+          CFG structuring
+                 |
+                 v
+  structured FunctionIR refinement
+          |                 |
+       changed            stable
+          |                 |
+          +--> CFG analysis/structuring ↺
+                              |
+                              v
+                   final AST -> backend rendering
+```
+
+`recovery_refinement.py` owns the VM-neutral refinement loop. It accepts only
+rewrites that preserve the verified CFG and safety invariants; otherwise the
+existing low-level CFG/goto representation remains the preservation floor.
+The loop operates on structured `FunctionIR` inside core. It is not a
+frontend-specific pass, and backends do not infer or recover control flow.
+
 ## Install
 
 Install the core library directly from PyPI. Cloning this repository is not

@@ -482,11 +482,10 @@ def finalize_recovered_vm_function(spec: VMFunctionSpec, function: FunctionIR) -
                 unsupported,
                 metadata={**unsupported.metadata, "unbound_locals": unbound},
             )
-        # Exceptional CFG edges are first-class control flow.  Ordinary
-        # branch/loop structurers do not yet own them and must not erase them
-        # while simplifying the normal graph.
-        if any(block.exception_edge is not None for block in function.blocks):
-            return function
+        # Exceptional edges remain on the preservation-floor CFG.  The core
+        # structurer declines such graphs, but its refinement pass can still
+        # remove proven same-value Phis and identity assignments without
+        # touching those edges.
         if _function_has_try_regions(function):
             return apply_low_level_cfg_structuring(
                 function,

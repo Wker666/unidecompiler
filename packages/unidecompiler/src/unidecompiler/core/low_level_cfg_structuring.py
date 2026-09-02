@@ -89,8 +89,6 @@ def apply_low_level_cfg_structuring(
 ) -> FunctionIR:
     if function.recovery_kind != "generic-vm-low-level-cfg":
         return function
-    if _has_exceptional_block_context(function):
-        return function
     if is_safe is None:
         return function
     from unidecompiler.core.recovery_refinement import refine_recovered_function

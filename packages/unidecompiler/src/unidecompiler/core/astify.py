@@ -128,7 +128,8 @@ def module_to_ast(module: ModuleIR) -> ModuleDecl:
 
 def function_to_ast(function: FunctionIR) -> FunctionDecl:
     ssa_index = index_assignments(function)
-    function = insert_phi_nodes(function)
+    if not function.metadata.get("recovery_phi_materialized"):
+        function = insert_phi_nodes(function)
     if function.metadata.get("decompile_status") == "unsupported":
         return FunctionDecl(
             name=function.name,

@@ -510,7 +510,16 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 return False
             value = effect.missing_value
         target = effect.target or Var(name=effect.name, source=effect.source)
-        state.locals[effect.name] = target if isinstance(target, Var) else value
+        # A managed/reference local must retain the writable location it
+        # carries.  Collapsing it to the ordinary variable identity makes a
+        # later ``stind`` assign to the temporary local instead of the
+        # referenced array/member slot.
+        if isinstance(value, IndirectRef):
+            state.locals[effect.name] = value
+        elif isinstance(target, Var):
+            state.locals[effect.name] = target
+        else:
+            state.locals[effect.name] = value
         if effect.materialize:
             if isinstance(target, Var):
                 state.append_statement(Assign(source=effect.source, target=target, value=value))

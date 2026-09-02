@@ -92,6 +92,45 @@ Section 40. That preserves the mandatory decoupling:
 frontend -> core generic IR <- simulator <- CLI / GUI
 ```
 
+## 0.5 Core recovery is a fixed point
+
+Lifting is not the end of recovery. The frontend submits thin facts and core
+first builds either structured generic IR or a low-level CFG. Core then runs
+its VM-neutral structuring and refinement loop:
+
+```text
+VM bytecode -> thin IR -> generic IR / low-level CFG
+                              |
+                              v
+                    CFG structuring (if/while/branch)
+                              |
+                              v
+                    structured FunctionIR refinement
+                              |
+                +-------------+-------------+
+                |                           |
+             changed                     stable
+                |                           |
+                +--> CFG analysis/structuring ↺
+                                            |
+                                            v
+                                  final AST -> pseudocode
+```
+
+The refinement pass may remove only changes that are proven semantics-
+preserving, such as same-value Phi nodes, identity assignments, constant
+string builders, or an explicit jump whose target is the existing fallthrough
+block. After an accepted rewrite, core rebuilds the relevant CFG facts and
+tries structuring again until the result is stable. This is a
+`FunctionIR`-to-`FunctionIR` boundary owned by core; it is not a conversion of
+the final `FunctionDecl` AST back into a guessed CFG.
+
+When a proof is unavailable, keep the low-level `goto`/CFG form. In particular,
+exception edges and handler state remain first-class CFG facts: ordinary
+branch/loop structurers must not erase them merely to produce nicer output.
+Backends only render the final AST or preservation-floor CFG; they never infer
+branches, loops, Phi values, or fallthroughs themselves.
+
 ## 0. First clarify the boundaries of frontend
 
 Frontend can do:
@@ -270,6 +309,49 @@ class MyVmFrontendPlugin:
 `decode()` only does format parsing. It can return the frontend private model, but cannot construct the core IR.
 
 `lift()` only converts the private model into thin VM facts and then calls the core helper.
+
+### 4.1 Frontend-owned version support
+
+Each frontend owns the declaration of the VM versions or bytecode families it
+accepts. Keep this declaration next to the plugin implementation with
+`FrontendVersionSupport`; the registry, CLI, and GUI only read and display the
+declaration when selecting a frontend.
+
+```python
+version_support = FrontendVersionSupport(
+    family="my-vm-bytecode",
+    versions=("1", "2"),
+    parser="my-vm parser 1.4",
+    status="supported",  # or "experimental" / "deprecated"
+    notes=("Version 2 adds a switch table.",),
+)
+```
+
+Do not put cross-language version checks in core or make one frontend decode
+another frontend's format. A recognized but unsupported VM version should be
+reported as an explicit unsupported/resource-input result with diagnostics;
+it must not be silently decoded with the nearest version's rules.
+
+### 4.2 GUI plugins are a separate extension point
+
+A VM frontend is not a GUI plugin. Frontends provide decoding, thin-IR lifting,
+and optional data-only simulation adapters. GUI plugins use the separate
+`unidecompiler-gui-sdk` contract and may receive immutable document, AST,
+reference, selection, and job snapshots, but never decoded artifacts,
+`ModuleIR`/`FunctionIR`, simulator frames/stacks, Qt widgets, or frontend
+registrations.
+
+Keep the dependency direction one-way:
+
+```text
+GUI plugin -> GUI SDK -> GUI host -> public GUI/core/simulator APIs
+```
+
+GUI plugins are trusted in-process extensions and are read-only. They may
+register commands or declarative panels and request navigation, but they must
+not modify IR/AST, execute bytecode, provide simulator callbacks, or become a
+second frontend registry. See `docs/GUI_PLUGIN_DEVELOPMENT.md` when building
+that separate extension.
 
 ## 5. Decoder model
 
@@ -1747,7 +1829,7 @@ It is recommended to support when the following conditions are met at the same t
    Fact expressions without the need for a frontend to execute instructions.
 6. Can write repeatable tests for completions, exceptions, unsupported operations, and external calls.
 
-If these conditions are not met, do not declare support for impersonation just to have a Run button appear in the GUI.
+If these conditions are not met, do not declare support for simulation just to have a Run button appear in the GUI.
 Preserve decompilation capabilities and have the simulator explicitly report that this frontend does not support simulation.
 
 ### 20.1.2 Responsibilities of simulation adapter
@@ -2148,7 +2230,9 @@ External state is provided; control flow and expressions are still executed by t
 
 ### 20.1.7 Minimum delivery process supported by simulation
 
-When implementing optional simulations, proceed in the following order:1. Complete the decoder, thin IR, generic IR and decompilation tests first.
+When implementing optional simulations, proceed in the following order:
+
+1. Complete the decoder, thin IR, generic IR and decompilation tests first.
 2. Confirm that function boundaries, names, parameters, and return values have stabilized.
 3. Implement `resolve_function()` in `simulation.py`.
 4. Implement `list_simulation_targets()` to filter ambiguous targets.
@@ -2163,8 +2247,8 @@ When implementing optional simulations, proceed in the following order:1. Comple
 12. For stateful runtime, verify that one run will not pollute the next run.
 13. Check that the simulator package is not core imported, and the frontend does not have an executor or interpreter.
 
-First support a minimal function, and then expand the coverage. Don’t design one for all language features first
-frontend-specific runtime framework.
+First support a minimal function, and then expand coverage. Do not design a
+frontend-specific runtime framework for all language features up front.
 
 ## 21. When to expect while and when to accept goto
 
@@ -2676,6 +2760,10 @@ A frontend is completed within the target support range, and at least satisfies:
 - Control flow target is correct.
 - Conditional jumps are not incorrectly linearized.
 - Complex control flow outputs at least low-level `if/goto`.
+- Core reaches a stable recovery fixed point before AST emission; no backend
+  pass performs CFG recovery or goto elimination.
+- Same-value joins and other local simplifications are removed only when core
+  proves they preserve CFG edges, exception state, and observable behavior.
 - No misleading success status.
 - GUI can register, identify, decompile, and display CFG.
 - When exact original-file ranges are available, the frontend emits validated
@@ -2684,7 +2772,7 @@ A frontend is completed within the target support range, and at least satisfies:
   the frontend deliberately emits `None` rather than a guessed mapping.
 - Test coverage decoder, effects, control hints, integration.
 
-Impersonation support is optional, and not supporting impersonation does not disqualify frontend from decompilation capabilities. if
+Simulation support is optional, and not supporting simulation does not disqualify a frontend from decompilation. If
 The frontend declares that it supports simulation and must also meet:
 
 - `simulation_adapter` provides data-only target lookup and runtime facts.
@@ -2862,14 +2950,17 @@ frame, stack, module, decoder model or other execution object.
 
 ### ExternalEnvironment
 
-`ExternalEnvironment` is injected by CLI, GUI or embedding host, not by frontend
-Automatically created:
+`ExternalEnvironment` is injected by the CLI, GUI, or embedding host, not by
+the frontend. It consists of these data-only protocol objects:
 
 | Type | Function |
 |---|---|
 | `ExternalCallRequest` | Data request for function name, parameters, keyword parameters, caller and source |
 | `ExternalCallResult` | A structured result that was returned, raised, or not handled |
-| `NotHandled` | The host is not responsible for the call |environment does not accept `ModuleIR`, `FunctionIR`, frame, stack, adapter or runner.
+| `NotHandled` | The host is not responsible for the call |
+
+The environment does not accept `ModuleIR`, `FunctionIR`, frames, stacks,
+adapters, or runners.
 The loading of `runtime.py` belongs to the host-support package and is a trusted code execution, not
 simulator sandbox.
 
@@ -2956,6 +3047,15 @@ Second: If subsequent core extensions support branch condition generation direct
 ## 33. Binary decoder cookbook
 
 The binary VM decoder must first clearly distinguish the container and instruction stream.
+
+For the built-in bytecode families, use the library-backed readers already
+chosen by the project. JVM class files are read with `jawa` (never by invoking
+`javap`); .NET/CLI assemblies are read with `dnfile` (never by shelling out to
+a disassembler); and WebAssembly modules are validated and decoded with the
+`wasmtime` and `wasm` libraries before their instructions are submitted as thin
+operators. The same boundary applies to a new plugin: use a parser library or
+an in-process decoder, retain the decoded facts privately, and submit every
+opcode that can be decoded to core.
 
 Suggested order:
 
@@ -3274,7 +3374,7 @@ Acceptance order:
 5. The backward jump sample CFG has back edges.
 6. The GUI can recognize the file and does not display it as a resource.
 7. GUI CFG view does not crash.
-8. If the declaration supports impersonation, target discovery can list unique functions.
+8. If the declaration supports simulation, target discovery can list unique functions.
 9. The simulator can execute at least one purely computational function and retain the return value.
 10. Unresolved external calls can be handled when environment is provided, and fail explicitly when not provided.
 11. The adapter has no frontend bytecode interpreter or executable callback.

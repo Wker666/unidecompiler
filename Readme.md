@@ -51,11 +51,33 @@ testing, or contributing to unidecompiler.
 
 For development rules and agent instructions, see `AGENTS.md`.
 
-At a high level, the pipeline is:
+At a high level, the pipeline is a semantics-preserving fixed point in core:
 
 ```txt
-VM bytecode -> thin IR -> generic IR -> SSA/analysis -> AST -> pseudocode
+VM bytecode -> thin IR -> generic IR / low-level CFG
+                              |
+                              v
+                    CFG structuring (if/while/branch)
+                              |
+                              v
+                    structured FunctionIR refinement
+                              |
+                +-------------+-------------+
+                |                           |
+             changed                     stable
+                |                           |
+                +--> CFG analysis/structuring ↺
+                                            |
+                                            v
+                                  final AST -> pseudocode
 ```
+
+The refinement loop is owned entirely by core. Each accepted rewrite is
+validated against the original control-flow and safety invariants before core
+re-enters CFG analysis and structuring. If equivalence cannot be proved, the
+low-level CFG/goto form is retained. The final `FunctionDecl` AST is produced
+only after this loop reaches a stable result; backends only render that result
+and never perform CFG recovery.
 
 ## Package Architecture
 
@@ -94,6 +116,13 @@ The current frontend pipeline is:
 3. Attach neutral operands, opcode classes, hints, and effect-table results.
 4. Submit the complete step stream through `lift_vm_step_function`.
 5. Let core produce full, partial, or unsupported generic IR.
+
+After lifting, core may run a fixed-point recovery refinement pass. It can
+conservatively simplify structured `FunctionIR` expressions and statements,
+then re-run generic CFG analysis and structuring whenever a rewrite changes the
+recoverable shape. This repeats until no safe rewrite remains. This is a core
+phase, not a frontend or backend extension, and it never replaces an unproven
+recovery with guessed source structure.
 
 ### Simulation Architecture
 

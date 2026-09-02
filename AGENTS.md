@@ -24,11 +24,34 @@ The frontend pipeline is:
 6. Treat any unsupported result in an intended coverage path as a defect to
    eliminate, not an acceptable development endpoint.
 
-The full recovery pipeline is:
+The full recovery pipeline is a semantics-preserving core fixed point:
 
 ```txt
-VM bytecode -> thin IR -> generic IR -> SSA/analysis -> AST -> pseudocode
+VM bytecode -> thin IR -> generic IR / low-level CFG
+                              |
+                              v
+                    CFG structuring (if/while/branch)
+                              |
+                              v
+                    structured FunctionIR refinement
+                              |
+                +-------------+-------------+
+                |                           |
+             changed                     stable
+                |                           |
+                +--> CFG analysis/structuring ↺
+                                            |
+                                            v
+                                  final AST -> pseudocode
 ```
+
+The refinement loop is owned by core. It may simplify structured `FunctionIR`
+expressions and statements, then re-run generic CFG analysis and structuring
+when a verified rewrite changes the recoverable shape. It repeats until no
+safe rewrite remains. The final `FunctionDecl` AST is emitted only after this
+fixed point; backends render it and never perform CFG recovery. This is a
+structured-`FunctionIR` refinement boundary, not an implicit or lossy
+`FunctionDecl`-to-CFG conversion.
 
 Useful source metadata should flow through the pipeline when available,
 including source filenames, bytecode versions, constants, debug tables,

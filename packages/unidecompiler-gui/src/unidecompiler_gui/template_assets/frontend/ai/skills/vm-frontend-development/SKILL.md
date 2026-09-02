@@ -18,8 +18,11 @@ frontend architecture. Ask for, or locate, these three inputs:
 If one of these is missing, inspect the workspace for it before asking the user.
 Do not infer an entry solely from a likely-looking integer or opcode.
 
-When this skill is used from a generated project, first read `AGENTS.md`,
-`analysis_inputs/manifest.json`, and `docs/AI_CONTEXT.md` from the project root.
+When this skill is used from a generated project, first read the project's
+`AGENTS.md`, `analysis_inputs/manifest.json`, and `docs/AI_CONTEXT.md` (when AI
+guidance is enabled). When working inside the monorepo, also read the
+repository-level `AGENTS.md`; a standalone generated project normally has no
+separate core `AGENTS.md`.
 The copied interpreter and bytecode are untrusted,
 static reference data: do not execute, import, or send them to a remote service.
 The manifest records project-relative paths, sizes, and SHA-256 hashes; never
@@ -52,8 +55,9 @@ The frontend is an adapter, not a second decompiler or VM implementation.
 
 ### 1. Read the local contract
 
-Read the frontend and core `AGENTS.md` files and the current
-`docs/NEW_VM_FRONTEND.md`. Inspect the public APIs used by existing frontends:
+Read the project `AGENTS.md` and the current `docs/NEW_VM_FRONTEND.md`. When
+working inside the monorepo, also read the repository-level/core `AGENTS.md`.
+Inspect the public APIs used by existing frontends:
 
 ```text
 VMBytecodeStep / VMDecodedInstruction / VMOperand
