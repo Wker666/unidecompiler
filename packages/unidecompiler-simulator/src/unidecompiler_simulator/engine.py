@@ -22,6 +22,7 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    Delete,
     ResumeInput,
     UndefinedLiteral,
     Continue,
@@ -89,6 +90,39 @@ from unidecompiler_simulator.values import (
     snapshot_value,
     validate_runtime_value,
 )
+
+
+_BINARY_OPERATOR_ALIASES = {
+    # Logical/arithmetic shift spellings used by common VMs and IR producers.
+    "shl": "<<",
+    "sll": "<<",
+    "lsl": "<<",
+    "sal": "<<",
+    "lshift": "<<",
+    "shr": ">>",
+    "srl": ">>",
+    "lsr": ">>",
+    "lshr": ">>",
+    "rshift": ">>",
+    "sar": ">>",
+    "sra": ">>",
+    "asr": ">>",
+    "ashr": ">>",
+    "ushr": ">>>",
+    "urshift": ">>>",
+    "band": "&",
+    "bitand": "&",
+    "bor": "|",
+    "bitor": "|",
+    "bxor": "^",
+    "bitxor": "^",
+    "xor": "^",
+    # Both rotate naming conventions are common in bytecode descriptions.
+    "rotl": "rol",
+    "rotr": "ror",
+    "rotate_left": "rol",
+    "rotate_right": "ror",
+}
 
 
 class SimulationStatus(StrEnum):
@@ -403,6 +437,8 @@ class _Runner:
         self.frames: list[_Frame] = []
         self.last_locals: dict[str, Any] = {}
         self._iterator_positions: dict[int, int] = {}
+        self._global_values: dict[str, Any] = {}
+        self._deleted_globals: set[str] = set()
         self.trace_truncated = False
         self._function_indexes = {
             id(function): index
@@ -500,7 +536,7 @@ class _Runner:
                 self._event("enter-block", current)
                 try:
                     try:
-                        self._execute_statements(block.statements, current)
+                        self._execute_block_statements(block.statements, current)
                         terminator = block.terminator
                         if terminator is None:
                             index = block_index[current] + 1
@@ -634,6 +670,31 @@ class _Runner:
             self._event("statement", block_id, type(statement).__name__, statement.source)
             self._execute_statement(statement, block_id)
 
+    def _execute_block_statements(self, statements: tuple[Stmt, ...], block_id: str) -> None:
+        """Execute block-entry Phi assignments with SSA parallel-copy semantics."""
+
+        phi_count = 0
+        for statement in statements:
+            if isinstance(statement, Assign) and isinstance(statement.value, Phi):
+                phi_count += 1
+                continue
+            break
+        if any(
+            isinstance(statement, Assign) and isinstance(statement.value, Phi)
+            for statement in statements[phi_count:]
+        ):
+            self._unsupported("phi assignment must appear at the start of a basic block")
+        phi_statements = statements[:phi_count]
+        if phi_statements:
+            values = []
+            for statement in phi_statements:
+                self._tick(statement.source)
+                self._event("statement", block_id, type(statement).__name__, statement.source)
+                values.append(self._eval_expr(statement.value))
+            for statement, value in zip(phi_statements, values, strict=True):
+                self._assign(statement.target, value)
+        self._execute_statements(statements[phi_count:], block_id)
+
     def _execute_statement(self, statement: Stmt, block_id: str) -> None:
         frame = self.frames[-1]
         if isinstance(statement, Assign):
@@ -658,6 +719,8 @@ class _Runner:
             self._store_item(obj, key, value)
         elif isinstance(statement, ExprStmt):
             self._eval_expr(statement.value)
+        elif isinstance(statement, Delete):
+            self._delete_target(statement.target)
         elif isinstance(statement, If):
             body = statement.then_body if self._truthy(self._eval_expr(statement.condition)) else statement.else_body
             self._execute_statements(body, block_id)
@@ -776,6 +839,10 @@ class _Runner:
         if isinstance(expr, ResumeInput):
             self._unsupported("generator resume input requires an explicit resumption request")
         if isinstance(expr, Global):
+            if expr.name in self._global_values:
+                return self._global_values[expr.name]
+            if expr.name in self._deleted_globals:
+                self._unsupported(f"global {expr.name!r} was deleted")
             result = self._adapter_value("resolve_global", expr.name, frame.context)
             if result is NotHandled:
                 if self.environment is None:
@@ -854,6 +921,7 @@ class _Runner:
                 expr.semantics,
                 expr.numeric_domain,
                 expr.bit_width,
+                expr.overflow_policy,
             )
         if isinstance(expr, Call):
             callee = self._eval_expr(expr.callee)
@@ -869,17 +937,27 @@ class _Runner:
             selector = self._eval_expr(expr.selector)
             return _IndirectTarget(selector, expr.signature, frame.context)
         if isinstance(expr, ArrayLiteral):
-            return [self._eval_expr(item) for item in expr.items]
+            if expr.kind not in {"list", "tuple"}:
+                self._unsupported(f"unsupported array literal kind {expr.kind!r}")
+            values = tuple(self._eval_expr(item) for item in expr.items)
+            return values if expr.kind == "tuple" else list(values)
         if isinstance(expr, SetLiteral):
-            return {self._eval_expr(item) for item in expr.items}
+            values = [self._eval_expr(item) for item in expr.items]
+            try:
+                return set(values)
+            except TypeError as error:
+                self._unsupported(f"invalid set literal: {error}")
         if isinstance(expr, TableLiteral):
-            return TableValue(
-                [self._eval_expr(item) for item in expr.array_items],
-                {
-                    self._eval_expr(field.key): self._eval_expr(field.value)
-                    for field in expr.fields
-                },
-            )
+            array_items = [self._eval_expr(item) for item in expr.array_items]
+            field_items = [
+                (self._eval_expr(field.key), self._eval_expr(field.value))
+                for field in expr.fields
+            ]
+            try:
+                fields = dict(field_items)
+            except TypeError as error:
+                self._unsupported(f"invalid table literal: {error}")
+            return TableValue(array_items, fields)
         if isinstance(expr, ObjectLiteral):
             return ObjectValue(
                 "object",
@@ -889,13 +967,29 @@ class _Runner:
                 },
             )
         if isinstance(expr, MapLiteral):
-            return {self._eval_expr(field.key): self._eval_expr(field.value) for field in expr.fields}
+            field_items = [
+                (self._eval_expr(field.key), self._eval_expr(field.value))
+                for field in expr.fields
+            ]
+            try:
+                return dict(field_items)
+            except TypeError as error:
+                self._unsupported(f"invalid map literal: {error}")
         if isinstance(expr, CollectionProjection):
+            if expr.kind not in {"list", "set"}:
+                self._unsupported(
+                    f"unsupported collection projection kind {expr.kind!r}"
+                )
             values = []
             for item in self._iter(self._eval_expr(expr.iterable)):
                 frame.locals[expr.target.name] = item
                 values.append(self._eval_expr(expr.value))
-            return set(values) if expr.kind == "set" else values
+            if expr.kind == "set":
+                try:
+                    return set(values)
+                except TypeError as error:
+                    self._unsupported(f"invalid set projection: {error}")
+            return values
         if isinstance(expr, NewObject):
             constructor = (
                 expr.type_name
@@ -923,6 +1017,9 @@ class _Runner:
             if not expr.incoming:
                 self._unsupported("empty phi expression")
             predecessor = frame.predecessor
+            labels = tuple(label for label, _value in expr.incoming)
+            if len(labels) != len(set(labels)):
+                self._unsupported("phi expression has duplicate predecessor labels")
             incoming = dict(expr.incoming)
             if predecessor in incoming:
                 return self._eval_expr(incoming[predecessor])
@@ -1070,6 +1167,15 @@ class _Runner:
                 return int(args[0])
             if name == "float":
                 return float(args[0])
+            if name.startswith("conv."):
+                # CLI numeric conversions are value-preserving generic
+                # intrinsics; width/sign details remain in the operation name
+                # and are applied conservatively here.
+                if name.endswith((".r4", ".r8", ".r.un")):
+                    return float(args[0])
+                if ".u" in name and not name.endswith(".un"):
+                    return int(args[0]) & ((1 << 64) - 1)
+                return int(args[0])
             if name == "str":
                 return str(args[0])
             if name == "abs":
@@ -1088,9 +1194,9 @@ class _Runner:
                 values = list(args) + [None, None, None]
                 return SliceValue(values[0], values[1], values[2])
             if name == "new_array":
-                if len(args) != 1:
-                    self._unsupported("new_array expects one argument")
-                return [None] * int(args[0])
+                if len(args) not in {1, 2}:
+                    self._unsupported("new_array expects a size and optional kind")
+                return [None] * int(args[-1])
             if name in {"rotl", "rotr", "clz", "ctz", "popcnt"}:
                 if bit_width is None:
                     self._unsupported(f"intrinsic {name!r} requires a bit width")
@@ -1101,10 +1207,10 @@ class _Runner:
                 mask = (1 << bit_width) - 1
                 value = int(args[0]) & mask
                 if name == "rotl" or name == "rotr":
-                    amount = int(args[1]) & (bit_width - 1)
+                    amount = int(args[1]) % bit_width
                     if name == "rotl":
-                        return ((value << amount) | (value >> ((bit_width - amount) & (bit_width - 1)))) & mask
-                    return ((value >> amount) | (value << ((bit_width - amount) & (bit_width - 1)))) & mask
+                        return ((value << amount) | (value >> ((bit_width - amount) % bit_width))) & mask
+                    return ((value >> amount) | (value << ((bit_width - amount) % bit_width))) & mask
                 if name == "popcnt":
                     return value.bit_count()
                 if name == "clz":
@@ -1123,7 +1229,14 @@ class _Runner:
         semantics: str,
         numeric_domain: str = "default",
         bit_width: int | None = None,
+        overflow_policy: str = "wrap",
     ) -> Any:
+        if overflow_policy not in {"wrap", "trap"}:
+            self._unsupported(f"unknown integer overflow policy {overflow_policy!r}")
+        if overflow_policy == "trap" and numeric_domain not in {"signed", "unsigned"}:
+            self._unsupported(
+                "trapping integer overflow requires a fixed-width integer domain"
+            )
         if left is UNDEFINED or right is UNDEFINED:
             result = self._adapter_value(
                 "binary_op", op, left, right, context
@@ -1137,6 +1250,38 @@ class _Runner:
             result = self._adapter_value("binary_op", op, left, right, context)
             if result is not NotHandled:
                 return result
+        # Keep common VM spellings in the generic simulator.  Frontends may
+        # submit these neutral operators directly; they should not need an
+        # adapter merely to translate a standard shift/rotate operation.
+        op = _BINARY_OPERATOR_ALIASES.get(op, op)
+        if op in {"rol", "ror"}:
+            if bit_width is None or bit_width <= 0:
+                self._unsupported(
+                    f"rotate operation {op!r} requires a positive bit width"
+                )
+            if numeric_domain == "float":
+                self._unsupported(
+                    "rotate operation does not support floating-point operands"
+                )
+            if numeric_domain not in {"default", "signed", "unsigned"}:
+                self._unsupported(f"unknown numeric domain {numeric_domain!r}")
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (left, right)
+            ):
+                self._unsupported("rotate operation requires integer operands")
+            mask = (1 << bit_width) - 1
+            value = left & mask
+            amount = right % bit_width
+            inverse_amount = (bit_width - amount) % bit_width
+            if op == "rol":
+                result = (value << amount) | (value >> inverse_amount)
+            else:
+                result = (value >> amount) | (value << inverse_amount)
+            result &= mask
+            if numeric_domain == "signed" and result & (1 << (bit_width - 1)):
+                result -= 1 << bit_width
+            return result
         if numeric_domain not in {"default", "signed", "unsigned", "float"}:
             self._unsupported(f"unknown numeric domain {numeric_domain!r}")
         if numeric_domain in {"signed", "unsigned"}:
@@ -1152,6 +1297,13 @@ class _Runner:
                     f"{numeric_domain} numeric operation requires integer operands"
                 )
             mask = (1 << bit_width) - 1
+            minimum = -(1 << (bit_width - 1)) if numeric_domain == "signed" else 0
+            maximum = (1 << (bit_width - 1)) - 1 if numeric_domain == "signed" else mask
+
+            def finish_integer(value: int) -> int:
+                if overflow_policy == "trap" and not minimum <= value <= maximum:
+                    self._unsupported("integer arithmetic overflow")
+                return normalize(value)
 
             def normalize(value: int) -> int:
                 value &= mask
@@ -1159,6 +1311,7 @@ class _Runner:
                     value -= 1 << bit_width
                 return value
 
+            raw_right = right
             left = normalize(left)
             right = normalize(right)
             if numeric_domain == "unsigned":
@@ -1174,13 +1327,16 @@ class _Runner:
                         -1 if (left < 0) != (right < 0) else 1
                     )
                 if op == "/":
-                    return quotient & mask if numeric_domain == "unsigned" else normalize(quotient)
+                    return finish_integer(quotient)
                 remainder = left - quotient * right
-                return remainder & mask if numeric_domain == "unsigned" else normalize(remainder)
-            if op == ">>" and numeric_domain == "unsigned":
-                return (left & mask) >> (right & (bit_width - 1))
-            if op == ">>>" and numeric_domain == "unsigned":
-                return (left & mask) >> (right & (bit_width - 1))
+                return finish_integer(remainder)
+            if op in {"<<", ">>", ">>>"}:
+                amount = raw_right % bit_width
+                if op == "<<":
+                    return normalize(left << amount)
+                if op == ">>>" or numeric_domain == "unsigned":
+                    return (left & mask) >> amount
+                return normalize(left >> amount)
             numeric_operations = {
                 "+": operator.add,
                 "-": operator.sub,
@@ -1188,7 +1344,6 @@ class _Runner:
                 "&": operator.and_,
                 "|": operator.or_,
                 "^": operator.xor,
-                "<<": operator.lshift,
                 "==": operator.eq,
                 "!=": operator.ne,
                 "<": operator.lt,
@@ -1200,7 +1355,9 @@ class _Runner:
             if implementation is not None:
                 try:
                     result = implementation(left, right)
-                    if op in {"+", "-", "*", "&", "|", "^", "<<"}:
+                    if op in {"+", "-", "*", "&", "|", "^"}:
+                        if op in {"+", "-", "*"}:
+                            return finish_integer(result)
                         return normalize(result)
                     return result
                 except (TypeError, ValueError):
@@ -1209,19 +1366,39 @@ class _Runner:
             if bit_width not in {32, 64, None}:
                 self._unsupported(f"unsupported floating-point width {bit_width}")
             if bit_width == 32:
-                left = _float32(left)
-                right = _float32(right)
+                try:
+                    left = _float32(left)
+                    right = _float32(right)
+                except (TypeError, ValueError, OverflowError):
+                    self._unsupported("invalid floating-point operands")
             if op == "%":
                 try:
-                    result = math.fmod(left, right)
+                    if right == 0 or math.isinf(left):
+                        result = math.nan
+                    elif math.isinf(right):
+                        result = left
+                    else:
+                        result = math.fmod(left, right)
                     return _float32(result) if bit_width == 32 else result
-                except (TypeError, ValueError, ZeroDivisionError):
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
                     self._unsupported("invalid floating-point remainder")
+            if op == "/":
+                try:
+                    if right == 0:
+                        if left == 0 or math.isnan(left):
+                            result = math.nan
+                        else:
+                            sign = math.copysign(1.0, left) * math.copysign(1.0, right)
+                            result = math.copysign(math.inf, sign)
+                    else:
+                        result = left / right
+                    return _float32(result) if bit_width == 32 else result
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                    self._unsupported("invalid floating-point division")
             float_operations = {
                 "+": operator.add,
                 "-": operator.sub,
                 "*": operator.mul,
-                "/": operator.truediv,
                 "==": operator.eq,
                 "!=": operator.ne,
                 "<": operator.lt,
@@ -1234,7 +1411,7 @@ class _Runner:
                 try:
                     result = implementation(left, right)
                     return _float32(result) if bit_width == 32 else result
-                except (TypeError, ValueError, ZeroDivisionError):
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
                     self._unsupported(f"invalid floating-point operation {op!r}")
         if (
             semantics == "static"
@@ -1353,6 +1530,72 @@ class _Runner:
         except (KeyError, IndexError, TypeError):
             self._unsupported(f"unhandled item write {key!r}")
 
+    def _delete_target(self, target: Expr) -> None:
+        if isinstance(target, Var):
+            if target.name not in self.frames[-1].locals:
+                self._unsupported(f"unknown local delete {target.name!r}")
+            del self.frames[-1].locals[target.name]
+            return
+        if isinstance(target, CapturedVar):
+            result = call_adapter(
+                self.adapter,
+                "delete_captured",
+                target.name,
+                self.frames[-1].context,
+            )
+            if result is NotHandled:
+                self._unsupported(
+                    f"captured variable deletion for {target.name!r} requires a frontend simulation adapter"
+                )
+            return
+        if isinstance(target, Global):
+            self._global_values.pop(target.name, None)
+            self._deleted_globals.add(target.name)
+            return
+        if isinstance(target, IndirectRef):
+            self._delete_target(target.target)
+            return
+        if isinstance(target, GetAttr):
+            obj = self._eval_expr(target.obj)
+            if isinstance(obj, ObjectValue):
+                if target.attr not in obj.fields:
+                    self._unsupported(f"unknown attribute delete {target.attr!r}")
+                del obj.fields[target.attr]
+                return
+            if isinstance(obj, dict):
+                if target.attr not in obj:
+                    self._unsupported(f"unknown attribute delete {target.attr!r}")
+                del obj[target.attr]
+                return
+            result = call_adapter(
+                self.adapter,
+                "delete_attr",
+                obj,
+                target.attr,
+                self.frames[-1].context,
+            )
+            if result is NotHandled:
+                self._unsupported(f"unhandled attribute delete {target.attr!r}")
+            return
+        if isinstance(target, GetItem):
+            obj = self._eval_expr(target.obj)
+            key = self._eval_expr(target.key)
+            result = call_adapter(
+                self.adapter,
+                "delete_item",
+                obj,
+                key,
+                self.frames[-1].context,
+            )
+            if result is not NotHandled:
+                return
+            try:
+                del obj[key]
+                return
+            except (KeyError, IndexError, TypeError):
+                self._unsupported(f"unhandled item delete {key!r}")
+        self._unsupported(f"unsupported delete target {type(target).__name__}")
+
     def _iter(self, value: Any):
         result = self._adapter_value("iterate", value, self.frames[-1].context)
         if result is not NotHandled:
@@ -1373,6 +1616,10 @@ class _Runner:
     def _assign(self, target: Expr, value: Any) -> None:
         if isinstance(target, Var):
             self.frames[-1].locals[target.name] = value
+            return
+        if isinstance(target, Global):
+            self._global_values[target.name] = value
+            self._deleted_globals.discard(target.name)
             return
         if isinstance(target, CapturedVar):
             result = call_adapter(
@@ -1468,6 +1715,11 @@ class _Runner:
         if value is UNDEFINED or expected is UNDEFINED:
             self._unsupported(
                 "undefined exception matching requires a simulator adapter"
+            )
+        if isinstance(expected, (list, tuple, set)):
+            return any(
+                self._matches_exception(value, candidate, context)
+                for candidate in expected
             )
         if value == expected:
             return True

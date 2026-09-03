@@ -45,6 +45,13 @@ performed only when predecessor edges, exception state, data-flow values, and
 evaluation order are proven equivalent. If that proof is unavailable, core
 keeps the low-level CFG/goto form rather than guessing.
 
+The generic effect and IR layers preserve single evaluation, stack aliases,
+and values observed before later mutations. Writes and deletes have explicit
+targets for locals, globals, captured values, attributes, and items. Numeric
+operations retain domain, bit width, and wrapping or trapping overflow policy,
+while container literals retain tuple/list identity. These facts survive SSA,
+CFG rewriting, AST conversion, and backend rendering.
+
 ## Install
 
 Install the core library directly from PyPI. Cloning this repository is not

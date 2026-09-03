@@ -51,6 +51,10 @@ The frontend is an adapter, not a second decompiler or VM implementation.
 - CFG structuring and refinement belong to core. Submit branch, loop,
   exception, and handler hints and rely on core's shared edge-aware analysis;
   do not add frontend graph algorithms or source-structure recovery.
+- Preserve observable value semantics, not just stack depth. Use neutral core
+  effects for stack aliases, stores, deletes, container kinds, and fixed-width
+  arithmetic. Do not execute shift/rotate aliases or other generic IR inside
+  the frontend or its simulation adapter.
 - __SIMULATION_GUIDANCE__
 - Classify every semantic statement as `proven`, `inferred`, or `unresolved` and
   cite file-relative lines and public bytecode offsets. Treat the user-supplied
@@ -153,6 +157,11 @@ Create small synthetic programs from the runtime semantics before relying on a
 large sample. At minimum cover:
 
 - sequential effects and returns;
+- operand order, single evaluation, copied values observed before mutation, and
+  every store/delete target the VM exposes;
+- signedness, bit width, shift/rotate aliases, and wrap/trap overflow behavior
+  for fixed-width numeric opcodes;
+- tuple/list or other container-kind distinctions when the VM has them;
 - each branch-target formula;
 - closure target and captured arguments;
 - a shared potentially-throwing instruction on protected and unprotected paths;

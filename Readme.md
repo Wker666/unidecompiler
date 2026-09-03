@@ -89,6 +89,22 @@ when the exact predecessor edges, exception state, and data-flow values prove
 the rewrite safe. Otherwise the preservation-floor CFG/goto representation is
 kept unchanged.
 
+Generic value recovery also preserves observable evaluation order. Stack
+copies, duplicates, unpacking, calls, and stores retain the value that existed
+at that bytecode point even when a later local, global, captured value, member,
+or item is mutated. Store and delete operations are represented explicitly in
+generic IR instead of being approximated as stack pops. Phi assignments execute
+as parallel copies, and an ambiguous duplicate predecessor is rejected rather
+than silently overwritten.
+
+Numeric semantics travel with each generic operation. Frontends may submit
+canonical operators or common VM-neutral aliases such as `shl`, `shr`, `rol`,
+and `ror`, together with signed/unsigned/float domain, bit width, and wrapping
+or trapping overflow policy. Core rewrites preserve that metadata, and the
+optional simulator applies it without branching on a frontend or source
+language. Container kind is likewise retained, so tuple and list literals do
+not collapse into one representation.
+
 ## Package Architecture
 
 `unidecompiler` is an embeddable core library. It has no command-line entry

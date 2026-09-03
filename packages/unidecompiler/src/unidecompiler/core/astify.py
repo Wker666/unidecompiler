@@ -13,6 +13,7 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    DeleteStmt,
     ResumeInputExpr,
     UndefinedLiteralExpr,
     ExprStmt,
@@ -49,6 +50,7 @@ from unidecompiler.core.ast import (
     ExceptHandlerStmt,
     TryStmt,
     UnaryExpr,
+    UnsupportedExpr,
     UnsupportedStmt,
     VarRef,
     YieldStmt,
@@ -67,6 +69,7 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    Delete,
     ResumeInput,
     UndefinedLiteral,
     Continue,
@@ -88,6 +91,7 @@ from unidecompiler.core.ir import (
     ModuleIR,
     NewObject,
     ObjectLiteral,
+    Placeholder,
     Phi,
     Raise,
     Reraise,
@@ -469,6 +473,8 @@ def _statement_to_ast(statement) -> object:
         )
     if isinstance(statement, IrExprStmt):
         return ExprStmt(source=statement.source, value=_expr_to_ast(statement.value))
+    if isinstance(statement, Delete):
+        return DeleteStmt(source=statement.source, target=_expr_to_ast(statement.target))
     if isinstance(statement, Unsupported):
         message = statement.message
         if statement.detail:
@@ -546,6 +552,13 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return CurrentExceptionRef(source=expr.source, type=expr.type)
     if isinstance(expr, ResumeInput):
         return ResumeInputExpr(source=expr.source, type=expr.type)
+    if isinstance(expr, Placeholder):
+        return UnsupportedExpr(
+            source=expr.source,
+            type=expr.type,
+            message="unresolved placeholder",
+            detail=f"{expr.label}:{expr.token}",
+        )
     if isinstance(expr, UnaryOp):
         return UnaryExpr(
             source=expr.source,
@@ -561,16 +574,28 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
             left=_expr_to_ast(expr.left),
             right=_expr_to_ast(expr.right),
             semantics=expr.semantics,
+            numeric_domain=expr.numeric_domain,
+            bit_width=expr.bit_width,
+            overflow_policy=expr.overflow_policy,
         )
     if isinstance(expr, Call):
+        keyword_names = tuple(_keyword_name(field.key) for field in expr.keywords)
+        if any(name is None for name in keyword_names):
+            return UnsupportedExpr(
+                source=expr.source,
+                type=expr.type,
+                message="unsupported keyword call",
+                detail="keyword name is not a static string",
+            )
         return CallExpr(
             source=expr.source,
             type=expr.type,
             callee=_expr_to_ast(expr.callee),
             args=tuple(_expr_to_ast(arg) for arg in expr.args),
             keywords=tuple(
-                (_keyword_name(field.key), _expr_to_ast(field.value))
-                for field in expr.keywords
+                (name, _expr_to_ast(field.value))
+                for name, field in zip(keyword_names, expr.keywords, strict=True)
+                if name is not None
             ),
             returns=expr.returns,
         )
@@ -626,6 +651,7 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return ArrayLiteralExpr(
             source=expr.source,
             type=expr.type,
+            kind=expr.kind,
             items=tuple(_expr_to_ast(item) for item in expr.items),
         )
     if isinstance(expr, SetLiteral):
@@ -675,15 +701,18 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
             constructor=None if expr.constructor is None else _expr_to_ast(expr.constructor),
             args=tuple(_expr_to_ast(arg) for arg in expr.args),
         )
-    return UnsupportedStmt(message=f"unsupported expr: {type(expr).__name__}")
+    return UnsupportedExpr(
+        source=expr.source,
+        type=expr.type,
+        message="unsupported expression node",
+        detail=type(expr).__name__,
+    )
 
 
-def _keyword_name(expr: Expr) -> str:
+def _keyword_name(expr: Expr) -> str | None:
     if isinstance(expr, Const) and isinstance(expr.value, str):
         return expr.value
-    if isinstance(expr, Var):
-        return expr.name
-    return "<keyword>"
+    return None
 
 
 def _logical_name(name: str) -> str:

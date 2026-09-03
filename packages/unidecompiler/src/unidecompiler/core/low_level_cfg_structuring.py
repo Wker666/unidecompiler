@@ -3662,7 +3662,9 @@ def _add_shared_block_phi_incomings(
         if not (isinstance(statement, Assign) and isinstance(statement.value, Phi)):
             statements.append(statement)
             continue
-        incoming = dict(statement.value.incoming)
+        incoming = _unique_phi_incoming(statement.value)
+        if incoming is None:
+            return None
         if shared_id not in incoming:
             return None
         if any(clone_id in incoming for clone_id in clone_ids):
@@ -4310,7 +4312,9 @@ def _final_join_phi_copies(
         if isinstance(statement, Assign) and isinstance(statement.target, Var) and isinstance(statement.value, Phi):
             if saw_non_phi:
                 return None
-            incoming = dict(statement.value.incoming)
+            incoming = _unique_phi_incoming(statement.value)
+            if incoming is None:
+                return None
             if not predecessors <= set(incoming) or set(incoming) - predecessors - {"existing"}:
                 return None
             values = {predecessor: incoming[predecessor] for predecessor in predecessors}
@@ -6150,7 +6154,9 @@ def _two_edge_header_phi_copies(
         if isinstance(statement, Assign) and isinstance(statement.target, Var) and isinstance(statement.value, Phi):
             if saw_non_phi:
                 return None
-            incoming = dict(statement.value.incoming)
+            incoming = _unique_phi_incoming(statement.value)
+            if incoming is None:
+                return None
             if set(incoming) != {preheader_id, backedge_id}:
                 return None
             initial = incoming[preheader_id]
@@ -8900,7 +8906,9 @@ def _prepare_collapsed_exit_statements(
             continue
         if saw_non_phi:
             return None
-        incoming = dict(statement.value.incoming)
+        incoming = _unique_phi_incoming(statement.value)
+        if incoming is None:
+            return None
         if not original_predecessors <= set(incoming):
             return None
         if set(incoming) - original_predecessors - {"existing"}:
@@ -9795,6 +9803,9 @@ def _condition_with_temp_value(condition: Expr, temp_name: str, value: Expr) -> 
                 left=replaced_left,
                 right=replaced_right,
                 semantics=condition.semantics,
+                numeric_domain=condition.numeric_domain,
+                bit_width=condition.bit_width,
+                overflow_policy=condition.overflow_policy,
             )
     return None
 
@@ -10083,7 +10094,9 @@ def _is_short_circuit_bool_phi(
         return False
     if not isinstance(statement.target, Var) or not isinstance(statement.value, Phi):
         return False
-    incoming = dict(statement.value.incoming)
+    incoming = _unique_phi_incoming(statement.value)
+    if incoming is None:
+        return False
     true_value = incoming.get(true_block)
     false_value = incoming.get(false_block)
     if not isinstance(true_value, Var) or true_value.name != true_name:
@@ -10092,6 +10105,15 @@ def _is_short_circuit_bool_phi(
         return False
     existing_value = incoming.get("existing")
     return existing_value is None or (isinstance(existing_value, Var) and existing_value.name == true_name)
+
+
+def _unique_phi_incoming(phi: Phi) -> dict[str, Expr] | None:
+    """Return edge values only when every predecessor identity is unique."""
+
+    incoming = dict(phi.incoming)
+    if len(incoming) != len(phi.incoming):
+        return None
+    return incoming
 
 
 def _terminator_targets_any_original_block(terminator: Terminator | None, function: FunctionIR) -> bool:

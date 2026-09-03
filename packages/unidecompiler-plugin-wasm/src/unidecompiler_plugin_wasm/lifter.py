@@ -11,8 +11,10 @@ from unidecompiler.core.effects import (
     LoadLocal,
     Pop,
     Push,
+    RaiseTop,
     ReturnTop,
     SelectValue,
+    StoreGlobal,
     StoreLocal,
     Unary,
     UnknownOpcode,
@@ -179,7 +181,7 @@ CONVERSIONS = {
 }
 
 CONTROL_OPS = {"block", "loop", "if", "else", "end", "br", "br_if", "br_table"}
-IGNORED_OPS = {"nop", "unreachable", "block", "loop"}
+IGNORED_OPS = {"nop", "block", "loop"}
 WASM_REGION_OPCODE_CLASSES = VMRegionOpcodeClasses(
     noise=frozenset({"nop", "block", "loop", "end"}),
     control=frozenset({"if", "else", "br", "br_if"}),
@@ -256,6 +258,7 @@ def _wasm_binary(opcode: str, op: str):
                 semantics="static",
                 numeric_domain=numeric_domain,
                 bit_width=bit_width,
+                overflow_policy=("trap" if opcode in {"i32.div_s", "i64.div_s"} else "wrap"),
             ),
         )
 
@@ -293,6 +296,16 @@ def _wasm_memory_load(
     return (CallTopAs(source=source, callee_name=instruction.opcode),)
 
 
+def _wasm_global_store(
+    _function: WasmFunctionListing,
+    instruction: WasmInstruction,
+    source: SourceRef,
+) -> tuple:
+    index = _first_int_operand(instruction)
+    name = f"global{index}" if index is not None else "global"
+    return (StoreGlobal(source=source, name=name),)
+
+
 def _wasm_simd_extract_lane(_function: WasmFunctionListing, instruction: WasmInstruction, source: SourceRef) -> tuple:
     lane = instruction.operands[0] if instruction.operands else "unknown"
     try:
@@ -319,6 +332,31 @@ def _wasm_stack_call(name: str, arg_count: int, *, returns: int = 1):
             BuildCall(
                 source=source,
                 callee=Global(name=name, source=source),
+                arg_count=arg_count,
+                returns=returns,
+            ),
+        )
+
+    return factory
+
+
+def _wasm_operation_name(instruction: WasmInstruction) -> str:
+    if not instruction.operands:
+        return instruction.opcode
+    operands = ",".join(str(operand) for operand in instruction.operands)
+    return f"{instruction.opcode}[{operands}]"
+
+
+def _wasm_operation_call(arg_count: int, *, returns: int = 0):
+    def factory(
+        _function: WasmFunctionListing,
+        instruction: WasmInstruction,
+        source: SourceRef,
+    ) -> tuple:
+        return (
+            BuildCall(
+                source=source,
+                callee=Global(name=_wasm_operation_name(instruction), source=source),
                 arg_count=arg_count,
                 returns=returns,
             ),
@@ -413,6 +451,10 @@ WASM_EFFECT_TABLE = VMEffectTable(
         "i32.eqz": lambda _function, _instruction, source: (CallTopAs(source=source, callee_name="is_zero"),),
         "i64.eqz": lambda _function, _instruction, source: (CallTopAs(source=source, callee_name="is_zero"),),
         "drop": lambda _function, _instruction, source: (Pop(source=source, count=1, emit_calls=True),),
+        "unreachable": lambda _function, _instruction, source: (
+            Push(source=source, value=Const(value="wasm trap: unreachable", source=source)),
+            RaiseTop(source=source),
+        ),
         "select": lambda _function, _instruction, source: (SelectValue(source=source),),
         "return": lambda _function, _instruction, source: (ReturnTop(source=source, empty_is_void=True),),
         "if": lambda _function, _instruction, _source: (),
@@ -422,19 +464,19 @@ WASM_EFFECT_TABLE = VMEffectTable(
         "end": _wasm_end,
         "call": _wasm_call,
         "call_indirect": _wasm_call_indirect,
-        "memory.size": lambda _function, _instruction, source: (Push(source=source, value=Global(name="memory.size", source=source)),),
+        "memory.size": _wasm_stack_call("memory.size", 0),
         "memory.grow": lambda _function, _instruction, source: (BuildCall(source=source, callee=Global(name="memory.grow", source=source), arg_count=1),),
         "ref.null": lambda _function, _instruction, source: (Push(source=source, value=Const(value=None, source=source)),),
         "ref.is_null": lambda _function, _instruction, source: (CallTopAs(source=source, callee_name="is_null"),),
         "ref.func": lambda _function, instruction, source: (Push(source=source, value=Global(name=f"$func{instruction.operands[0] if instruction.operands else 'unknown'}", source=source)),),
         "table.get": lambda _function, instruction, source: (BuildCall(source=source, callee=Global(name=f"table{instruction.operands[0] if instruction.operands else ''}.get", source=source), arg_count=1),),
-        "table.set": lambda _function, _instruction, source: (Pop(source=source, count=2, allow_missing=True),),
-        "table.init": lambda _function, _instruction, source: (Pop(source=source, count=3, allow_missing=True),),
-        "elem.drop": lambda _function, _instruction, source: (),
-        "table.copy": lambda _function, _instruction, source: (Pop(source=source, count=3, allow_missing=True),),
+        "table.set": _wasm_operation_call(2),
+        "table.init": _wasm_operation_call(3),
+        "elem.drop": _wasm_operation_call(0),
+        "table.copy": _wasm_operation_call(3),
         "table.grow": lambda _function, instruction, source: (BuildCall(source=source, callee=Global(name=f"table{instruction.operands[0] if instruction.operands else ''}.grow", source=source), arg_count=2),),
-        "table.size": lambda _function, instruction, source: (Push(source=source, value=Global(name=f"table{instruction.operands[0] if instruction.operands else ''}.size", source=source)),),
-        "table.fill": lambda _function, _instruction, source: (Pop(source=source, count=3, allow_missing=True),),
+        "table.size": _wasm_operation_call(0, returns=1),
+        "table.fill": _wasm_operation_call(3),
         "v128.const": _wasm_simd_const,
         "v128.load": lambda _function, _instruction, source: (CallTopAs(source=source, callee_name="v128.load"),),
         "v128.store": _wasm_stack_call("v128.store", 2, returns=0),
@@ -445,7 +487,7 @@ WASM_EFFECT_TABLE = VMEffectTable(
         "memory.init": _wasm_stack_call("memory.init", 3, returns=0),
         "memory.copy": _wasm_stack_call("memory.copy", 3, returns=0),
         "memory.fill": _wasm_stack_call("memory.fill", 3, returns=0),
-        "data.drop": lambda _function, _instruction, source: (),
+        "data.drop": _wasm_operation_call(0),
     },
     rules=(
         VMEffectRule(
@@ -456,9 +498,12 @@ WASM_EFFECT_TABLE = VMEffectTable(
         VMEffectRule(matches=lambda opcode, _instruction: opcode == "local.get", factory=_wasm_local_load),
         VMEffectRule(matches=lambda opcode, _instruction: opcode in {"local.set", "local.tee"}, factory=_wasm_local_store),
         VMEffectRule(matches=lambda opcode, _instruction: opcode == "global.get", factory=_wasm_global_load),
-        VMEffectRule(matches=lambda opcode, _instruction: opcode == "global.set", factory=lambda _function, _instruction, source: (Pop(source=source, count=1, allow_missing=True),)),
+        VMEffectRule(matches=lambda opcode, _instruction: opcode == "global.set", factory=_wasm_global_store),
         VMEffectRule(matches=lambda opcode, _instruction: opcode in SATURATING_CONVERSIONS, factory=lambda _function, instruction, source: (CallTopAs(source=source, callee_name=instruction.opcode),)),
-        VMEffectRule(matches=lambda opcode, _instruction: opcode in MEMORY_OPS, factory=lambda _function, _instruction, _source: ()),
+        VMEffectRule(
+            matches=lambda opcode, _instruction: opcode in MEMORY_OPS and ".store" in opcode,
+            factory=_wasm_operation_call(2),
+        ),
     ),
     fallback=_wasm_unknown_opcode_effect,
 )

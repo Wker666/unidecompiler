@@ -208,6 +208,35 @@ If the current thin IR cannot express a VM behavior cleanly, prefer adding a
 new neutral thin IR fact, effect, hint, or operand concept over introducing
 complex adaptation logic elsewhere.
 
+## Generic Value Semantics Contract
+
+Thin effects and generic IR must preserve observable value semantics, not only
+stack depth. This contract applies to every frontend and to the simulator:
+
+- A value with side effects is evaluated once. Stack copies, duplicates,
+  unpacking, argument collection, and store-at-depth operations must preserve
+  aliases without repeating the original expression.
+- A value read before a local, global, captured variable, indirect reference,
+  member, or item is mutated must retain its old value. Core owns any temporary
+  materialization needed to enforce that ordering.
+- Writes and deletes use neutral store/delete effects and generic IR targets for
+  locals, globals, captured values, attributes, and items. A frontend must not
+  approximate a decoded mutation by dropping operands.
+- Container identity is semantic. `BuildArray(kind="tuple")` must remain a
+  tuple through generic IR, AST, rendering, and simulation rather than becoming
+  a list.
+- Numeric operations carry their operator, static/dynamic semantics, numeric
+  domain, bit width, and overflow policy. Core transformations must preserve all
+  of those fields. Shared shift, rotate, and bitwise spellings belong in a
+  VM-neutral operator normalization layer; a frontend must not implement `ror`,
+  `rol`, `shl`, `shr`, or equivalent execution itself.
+- A Phi has one incoming value per concrete predecessor label. Duplicate labels
+  are invalid and must be rejected rather than collapsed through a dictionary.
+  Multiple Phi assignments at block entry use parallel-copy semantics.
+- When a call shape, exception value, numeric domain, container kind, or write
+  target cannot be represented safely, emit analyzable unsupported context or
+  fail explicitly. Do not manufacture a default value or guessed operation.
+
 ## Hard Rules
 
 These rules are mandatory.
@@ -347,6 +376,14 @@ The test suite includes frontend-decoupling checks that enforce this design:
   outcomes visibly.
 - GUI plugin tests cover SDK isolation, manifest validation, safe archive
   extraction, and enabled/disabled lifecycle behavior.
+- Every public thin effect and every generic IR expression, statement, and
+  terminator family must have executable coverage. Coverage should be measured
+  by runtime instrumentation or an equivalent behavior check, not by scanning
+  class names in source.
+- Stack/value effects require differential or model-based tests for ordering,
+  aliasing, underflow, and mutation barriers. Numeric tests must cover canonical
+  operators and aliases, widths, signedness, overflow policies, and zero/limit
+  cases.
 
 Run:
 

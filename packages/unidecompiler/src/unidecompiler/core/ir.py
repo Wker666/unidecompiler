@@ -74,6 +74,7 @@ class BinaryOp(Expr):
     semantics: Literal["static", "dynamic"] = "dynamic"
     numeric_domain: NumericDomain = "default"
     bit_width: int | None = None
+    overflow_policy: Literal["wrap", "trap"] = "wrap"
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ class TableLiteral(Expr):
 
 @dataclass(frozen=True)
 class ArrayLiteral(Expr):
+    kind: Literal["list", "tuple"] = "list"
     items: tuple[Expr, ...] = ()
 
 
@@ -233,6 +235,13 @@ class StoreItem(Stmt):
 @dataclass(frozen=True)
 class ExprStmt(Stmt):
     value: Expr = field(default_factory=Expr)
+
+
+@dataclass(frozen=True)
+class Delete(Stmt):
+    """Delete a generic writable location."""
+
+    target: Expr = field(default_factory=Expr)
 
 
 @dataclass(frozen=True)

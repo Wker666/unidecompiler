@@ -580,9 +580,10 @@ Common categories:
 | Category | Effect Example | Usage |
 |---|---|---|
 | Value/Stack | `Push`, `Pop`, `Copy`, `DuplicateTop`, `Swap`, `Unpack` | Stack shape and constant values |
-| Local variables | `LoadLocal`, `StoreLocal`, `AssignValue`, `UpdateLocal`, `StoreMany` | locals |
+| Local variables | `LoadLocal`, `StoreLocal`, `StoreGlobal`, `AssignValue`, `UpdateLocal`, `StoreMany` | locals and globals |
 | Operations | `Unary`, `Binary`, `Compare`, `Truthy`, `SelectValue` | Expressions and conditions |
 | Properties/index | `LoadAttr`, `StoreAttr`, `LoadItem`, `StoreItemEffect`, `LoadIndirect` | member/index |
+| Delete | `DeleteLocal`, `DeleteGlobal`, `DeleteAttr`, `DeleteItem` | explicit target deletion |
 | Container | `BuildArray`, `BuildSet`, `BuildMap`, `BuildString` | aggregate |
 | Call | `Invoke`, `BuildCall`, `CallStackArgs` | Call |
 | Termination | `ReturnTop`, `ReturnVoid`, `RaiseTop`, `YieldTop` | terminator |
@@ -620,6 +621,48 @@ MY_EFFECT_TABLE = VMEffectTable(
 )
 ```
 Unknown opcode Do not return empty tuple. Empty tuples are only suitable for clear and unsemantic noise opcodes, such as `nop`, padding, and line markers.
+
+### 8.1 Preserve values, targets, and numeric semantics
+
+Effects describe observable semantics, not only the final stack height. Core
+provides the shared machinery for the following rules, so a frontend should
+submit the closest neutral effect instead of emulating it with local stack
+rewrites:
+
+- `Copy`, duplicate, unpack, invocation, and store-at-depth effects preserve
+  single evaluation and aliases. A later write must not retroactively change a
+  value that was read earlier.
+- Use `StoreGlobal`, `DeleteLocal`, `DeleteGlobal`, `DeleteAttr`, and
+  `DeleteItem` for real mutations. Do not replace a decoded write or delete with
+  `Pop(..., allow_missing=True)` merely to make stack depth match.
+- Use `BuildArray(kind="tuple")` when the VM distinguishes tuples from lists.
+  Core carries that kind through generic IR, AST, pseudocode, and simulation.
+- For a fixed-width operation, set `numeric_domain` (`"signed"`,
+  `"unsigned"`, or `"float"`) and `bit_width`. Set
+  `overflow_policy="trap"` only when the VM traps rather than wraps on integer
+  overflow. Core transformations preserve these fields.
+- Common neutral operator spellings such as `shl`, `shr`, `rol`, `ror`,
+  `rotl`, `rotr`, `band`, `bor`, and `bxor` are handled by generic execution.
+  The frontend still records the decoded opcode in `decoded`/`raw`, but it must
+  not execute the operation or add a frontend-specific simulator branch.
+
+For example, a signed 32-bit trapping division can be submitted as:
+
+```python
+Binary(
+    source=source,
+    op="/",
+    semantics="static",
+    numeric_domain="signed",
+    bit_width=32,
+    overflow_policy="trap",
+)
+```
+
+If the frontend cannot determine the signedness, width, overflow behavior, call
+keyword shape, or mutation target, retain raw/decoded context and report the
+shape as unsupported. Supplying an attractive but incorrect default violates
+the thin-IR contract.
 
 ### Opcode mapping table template
 
@@ -2549,9 +2592,16 @@ Effect:
 
 - constant push.
 - local load/store.
+- global/local/captured/member/item store and delete, when the VM exposes them.
 - Binary order of operations.
+- fixed-width signed/unsigned/float arithmetic, shift/rotate aliases, zero
+  divisors, and wrapping versus trapping overflow, when applicable.
+- copy/duplicate/unpack behavior around later writes and side-effecting values.
+- list versus tuple/container-kind preservation, when applicable.
 - Call parameter order.
+- invalid or unrecoverable keyword-call shapes produce explicit unsupported.
 - return/halt.
+- raise and reraise stack-underflow behavior.
 - unknown opcode.
 
 Control：
@@ -2781,6 +2831,12 @@ A frontend is completed within the target support range, and at least satisfies:
   pass performs CFG recovery or goto elimination.
 - Same-value joins and other local simplifications are removed only when core
   proves they preserve CFG edges, exception state, and observable behavior.
+- Stack aliases preserve single evaluation and pre-mutation values across
+  copies, duplicates, unpacking, calls, and stores.
+- Numeric domain, bit width, overflow policy, and container kind survive every
+  core rewrite and appear unchanged in final generic IR.
+- Every intended opcode effect is exercised behaviorally; unsupported results
+  in the declared support range are treated as defects.
 - No misleading success status.
 - GUI can register, identify, decompile, and display CFG.
 - When exact original-file ranges are available, the frontend emits validated
@@ -2992,9 +3048,12 @@ The following are selection guidelines for common effects.
 | Copy stack value | `Copy`/`DuplicateTop` | Visual effect | Visual effect | Used for dup class opcode |
 | Swap order | `Swap(depth=n)` | n | n | Common in non-default operand order |
 | Binary operation | `Binary(op=...)` | 2 | 1 | Confirm the left/right order first |
+| Fixed-width operation | `Binary(op=..., numeric_domain=..., bit_width=..., overflow_policy=...)` | 2 | 1 | Preserve signedness, width, and trap/wrap behavior |
 | Compare | `Binary(op=\"==\")` or `Compare` | 2 | 1 | Output conditional expression |
 | Read local | `LoadLocal(name=...)` | 0 | 1 | Register mappable as local |
 | write local | `StoreLocal(name=...)` | 1 | 0 | use stable local name |
+| Write global | `StoreGlobal(name=...)` | 1 | 0 | Do not model as a local write |
+| Delete target | `DeleteLocal`/`DeleteGlobal`/`DeleteAttr`/`DeleteItem` | target-dependent | 0 | Preserve the actual mutation target |
 | call | `CallStackArgs`/`Invoke` | argc | returns | runtime API readable callee |
 | Return to the top of the stack | `ReturnTop` | 1 | Terminate | Function return value |
 | Return without value | `ReturnVoid` | 0 | Terminate | halt/void return |

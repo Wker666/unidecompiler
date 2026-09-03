@@ -10,6 +10,7 @@ from unidecompiler.core.ir import (
     CapturedVar,
     Const,
     Expr,
+    ExprStmt,
     Global,
     GetItem,
     MapLiteral,
@@ -96,9 +97,6 @@ IGNORED_OPS = {
     "MMBINK",
     "VARARGPREP",
     "EXTRAARG",
-    "LFALSESKIP",
-    "CLOSE",
-    "TBC",
     *(CONTROL_OPS - frozenset({"FORPREP", "FORLOOP", "TESTSET", "TFORPREP", "TFORLOOP"})),
 }
 @dataclass(frozen=True)
@@ -501,7 +499,20 @@ def _lua_set_list(context: LuaEffectContext, instruction, source: SourceRef) -> 
     base = int(operands[0])
     count = int(operands[1])
     if count <= 0:
-        return ()
+        return (
+            Emit(
+                source=source,
+                statement=ExprStmt(
+                    source=source,
+                    value=Call(
+                        source=source,
+                        callee=Global(name="lua_setlist", source=source),
+                        args=(Var(name=_read_register_name(context.listing, base, instruction.pc), source=source),),
+                        returns=0,
+                    ),
+                ),
+            ),
+        )
     table = Var(name=_read_register_name(context.listing, base, instruction.pc), source=source)
     return tuple(
         Emit(
@@ -601,7 +612,24 @@ def _lua_tforcall_effect(context: LuaEffectContext, instruction, source: SourceR
     base = int(operands[0])
     count = int(operands[2])
     if count <= 0:
-        return ()
+        base = int(operands[0])
+        return (
+            Emit(
+                source=source,
+                statement=ExprStmt(
+                    source=source,
+                    value=Call(
+                        source=source,
+                        callee=Global(name="lua_generic_for_next", source=source),
+                        args=tuple(
+                            Var(name=_read_register_name(context.listing, base + index, instruction.pc), source=source)
+                            for index in range(3)
+                        ),
+                        returns=0,
+                    ),
+                ),
+            ),
+        )
     names = tuple(
         _write_register_name(context.listing, register, instruction.pc)
         for register in range(base + 4, base + 4 + count)
@@ -627,6 +655,28 @@ def _lua_tforcall_effect(context: LuaEffectContext, instruction, source: SourceR
             ),
         ),
     )
+
+
+def _lua_runtime_marker(name: str):
+    """Represent a runtime-only Lua lifecycle operation without dropping stack values."""
+
+    def factory(_context: LuaEffectContext, _instruction, source: SourceRef) -> tuple:
+        return (
+            Emit(
+                source=source,
+                statement=ExprStmt(
+                    source=source,
+                    value=Call(
+                        source=source,
+                        callee=Global(name=name, source=source),
+                        args=(),
+                        returns=0,
+                    ),
+                ),
+            ),
+        )
+
+    return factory
 
 
 def _lua_tforloop_effect(context: LuaEffectContext, instruction, source: SourceRef) -> tuple | None:
@@ -851,6 +901,11 @@ LUA_EFFECT_TABLE = VMEffectTable(
         "FORLOOP": _lua_forloop_effect,
         "TFORPREP": _lua_no_effect,
         "TFORCALL": _lua_tforcall_effect,
+        "LFALSESKIP": lambda context, instruction, source: (
+            _lua_assign(context.listing, int(instruction.operands[0]), instruction.pc, Const(value=False, source=source), source),
+        ) if instruction.operands else (UnknownOpcode(source=source, opcode="LFALSESKIP", raw="missing register"),),
+        "CLOSE": _lua_runtime_marker("lua_close"),
+        "TBC": _lua_runtime_marker("lua_tbc"),
         "TFORLOOP": _lua_tforloop_effect,
         "TESTSET": _lua_testset_effect,
         "RETURN1": _lua_return1,
@@ -1119,6 +1174,20 @@ def _lua_operand_role(operand: str):
 
 
 def _lua_instruction_hints(listing: LuaFunctionListing, instruction, source: SourceRef) -> tuple[VMHint, ...]:
+    if instruction.opcode == "LFALSESKIP":
+        # Lua's skip instruction advances over the following instruction when
+        # the assigned false value is consumed. Preserve that edge as a
+        # neutral hint; core owns the actual CFG recovery.
+        return (
+            VMHint(
+                kind="branch-target",
+                source=source,
+                target=instruction.pc + 2,
+                label=instruction.opcode,
+                detail="target-if-false",
+                flow="unconditional",
+            ),
+        )
     if instruction.opcode in CONDITIONAL_OPS:
         return (
             VMHint(

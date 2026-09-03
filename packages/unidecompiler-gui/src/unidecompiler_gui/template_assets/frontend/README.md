@@ -24,3 +24,11 @@ Phi or fallthrough-jump cleanup is safe only when core proves predecessor-edge,
 exception-state, data-flow, and evaluation-order equivalence. Frontend code
 must not inspect or simplify CFGs; submit all decoded control-flow facts and
 let the shared core reducer decide whether a structured replacement is safe.
+
+Effects must preserve more than stack depth. Use the neutral core effects for
+local/global/member/item writes and deletes, stack copies, container kinds, and
+fixed-width numeric operations. Record signedness, bit width, and wrap/trap
+overflow policy when the VM defines them. Shared shift/rotate aliases such as
+`shl`, `shr`, `rol`, and `ror` are core semantics; do not implement them in the
+frontend or a simulation adapter. Add behavioral tests for aliasing,
+pre-mutation values, numeric edge cases, and every submitted effect.

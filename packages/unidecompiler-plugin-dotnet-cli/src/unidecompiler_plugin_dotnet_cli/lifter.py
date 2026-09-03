@@ -6,6 +6,7 @@ from unidecompiler.core.effects import (
     BuildCall,
     CallTopAs,
     DuplicateTop,
+    Emit,
     InvokeMember,
     LoadIndirect,
     LoadAttr,
@@ -15,6 +16,7 @@ from unidecompiler.core.effects import (
     Pop,
     Push,
     RaiseTop,
+    ReraiseTop,
     ReturnTop,
     StoreAttr,
     StoreIndirect,
@@ -23,7 +25,7 @@ from unidecompiler.core.effects import (
     StoreStaticMember,
     UnknownOpcode,
 )
-from unidecompiler.core.ir import BinaryOp, Const, Expr, Global, IndirectRef, SourceRef, Var
+from unidecompiler.core.ir import BinaryOp, Const, Expr, Global, IndirectRef, SourceRef, Unsupported, Var
 from unidecompiler.core.vm_bytecode import VMBytecodeStep
 from unidecompiler.core.vm_effect_table import VMEffectRule, VMEffectTable
 from unidecompiler.core.vm_function import VMFunctionSpec, lift_steps, lift_vm_step_function, recover_vm_function
@@ -152,38 +154,7 @@ IGNORED_OPS = {
     "volatile.",
     "unaligned.",
     "prefix",
-    "castclass",
-    "box",
-    "unbox",
-    "unbox.any",
-    "conv.i",
-    "conv.i1",
-    "conv.i2",
-    "conv.i4",
-    "conv.i8",
-    "conv.u",
-    "conv.u1",
-    "conv.u2",
-    "conv.u4",
-    "conv.u8",
-    "conv.r4",
-    "conv.r8",
-    "conv.r.un",
-    "conv.ovf.i",
-    "conv.ovf.i.un",
-    "conv.ovf.i1.un",
-    "conv.ovf.i2.un",
-    "conv.ovf.i4.un",
-    "conv.ovf.i8.un",
-    "conv.ovf.u",
-    "conv.ovf.u.un",
-    "conv.ovf.u1.un",
-    "conv.ovf.u2.un",
-    "conv.ovf.u4.un",
-    "conv.ovf.u8.un",
     "endfinally",
-    "endfilter",
-    "rethrow",
     *CONTROL_OPS,
 }
 
@@ -250,6 +221,13 @@ def _dotnet_load_local_effect(method: DotNetMethodListing, instruction: DotNetIn
     if index is None:
         return None
     name = _local_name(method, index)
+    if instruction.opcode.startswith("ldloca"):
+        return (
+            Push(
+                source=source,
+                value=IndirectRef(source=source, target=Var(name=name, source=source)),
+            ),
+        )
     return (LoadLocal(source=source, name=name, fallback=Var(name=name, source=source)),)
 
 
@@ -325,6 +303,36 @@ def _dotnet_call(_method: DotNetMethodListing, instruction: DotNetInstruction, s
     )
 
 
+def _dotnet_operation_call(arg_count: int, *, returns: int = 0):
+    def factory(
+        _method: DotNetMethodListing,
+        instruction: DotNetInstruction,
+        source: SourceRef,
+    ) -> tuple:
+        suffix = f"<{instruction.operands}>" if instruction.operands else ""
+        return (
+            BuildCall(
+                source=source,
+                callee=Global(name=f"{instruction.opcode}{suffix}", source=source),
+                arg_count=arg_count,
+                returns=returns,
+            ),
+        )
+
+    return factory
+
+
+def _dotnet_unary_operation(_method, instruction, source: SourceRef) -> tuple:
+    # Keep the CLI operation name neutral and readable.  Operand metadata is
+    # already retained on the decoded instruction; embedding the Python tuple
+    # representation in the callee name prevents generic intrinsic handling.
+    return (CallTopAs(source=source, callee_name=instruction.opcode),)
+
+
+def _dotnet_unsupported_operation(_method, instruction, source: SourceRef) -> tuple:
+    return (Emit(source=source, statement=Unsupported(source=source, message="unsupported CLI control operation", detail=instruction.opcode, raw=(_dotnet_raw_instruction_line(instruction),))),)
+
+
 DOTNET_EFFECT_TABLE = VMEffectTable(
     opcode_attr="opcode",
     ignored=frozenset(IGNORED_OPS),
@@ -332,6 +340,12 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
         **{opcode: _dotnet_binary(opcode, op) for opcode, op in BINARY_OPS.items()},
         **{opcode: _dotnet_compare(opcode, op) for opcode, op in COMPARE_OPS.items()},
         "ldnull": lambda _method, _instruction, source: (Push(source=source, value=Const(value=None, source=source)),),
+        **{opcode: _dotnet_unary_operation for opcode in {
+            "castclass", "box", "unbox", "unbox.any", "conv.i", "conv.i1", "conv.i2", "conv.i4", "conv.i8",
+            "conv.u", "conv.u1", "conv.u2", "conv.u4", "conv.u8", "conv.r4", "conv.r8", "conv.r.un",
+            "conv.ovf.i", "conv.ovf.i.un", "conv.ovf.i1.un", "conv.ovf.i2.un", "conv.ovf.i4.un", "conv.ovf.i8.un",
+            "conv.ovf.u", "conv.ovf.u.un", "conv.ovf.u1.un", "conv.ovf.u2.un", "conv.ovf.u4.un", "conv.ovf.u8.un",
+        }},
         "dup": lambda _method, instruction, source: (DuplicateTop(source=source, materialized_name=f"local_stack_{instruction.offset}"),),
         "pop": lambda _method, _instruction, source: (Pop(source=source, count=1, emit_calls=True),),
         "neg": lambda _method, _instruction, source: (CallTopAs(source=source, callee_name="neg"),),
@@ -342,12 +356,12 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
         "jmp": _dotnet_call,
         "ldftn": lambda _method, instruction, source: (Push(source=source, value=Global(name=_member_token_name(instruction.operands), source=source)),),
         "ldvirtftn": lambda _method, instruction, source: (Push(source=source, value=Global(name=_member_token_name(instruction.operands), source=source)),),
-        "initobj": lambda _method, _instruction, source: (Pop(source=source, count=1, allow_missing=True),),
+        "initobj": _dotnet_operation_call(1),
         "arglist": lambda _method, _instruction, source: (Push(source=source, value=Global(name="arglist", source=source)),),
         "ckfinite": lambda _method, _instruction, source: (CallTopAs(source=source, callee_name="check_finite"),),
-        "cpblk": lambda _method, _instruction, source: (Pop(source=source, count=3, allow_missing=True),),
-        "cpobj": lambda _method, _instruction, source: (Pop(source=source, count=2, allow_missing=True),),
-        "initblk": lambda _method, _instruction, source: (Pop(source=source, count=3, allow_missing=True),),
+        "cpblk": _dotnet_operation_call(3),
+        "cpobj": _dotnet_operation_call(2),
+        "initblk": _dotnet_operation_call(3),
         "localloc": lambda _method, _instruction, source: (BuildCall(source=source, callee=Global(name="localloc", source=source), arg_count=1),),
         "mkrefany": lambda _method, instruction, source: (BuildCall(source=source, callee=Global(name=f"mkrefany<{instruction.operands or 'type'}>", source=source), arg_count=1),),
         "refanytype": lambda _method, _instruction, source: (CallTopAs(source=source, callee_name="refanytype"),),
@@ -356,7 +370,7 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
         "ldstr": lambda _method, instruction, source: (Push(source=source, value=Const(value=instruction.operands, source=source)),),
         "ldtoken": lambda _method, instruction, source: (Push(source=source, value=Global(name=instruction.operands, source=source)),),
         "isinst": lambda _method, instruction, source: (BuildCall(source=source, callee=Global(name="instanceof", source=source), arg_count=1, returns=1),),
-        "ldobj": lambda _method, instruction, source: (Pop(source=source, count=1, allow_missing=True), Push(source=source, value=Global(name=_member_token_name(instruction.operands), source=source))),
+        "ldobj": _dotnet_operation_call(1, returns=1),
         "ldfld": lambda _method, instruction, source: (LoadAttr(source=source, attr=_member_name(instruction)),),
         "ldflda": lambda _method, instruction, source: (LoadAttr(source=source, attr=_member_name(instruction)),),
         "stfld": lambda _method, instruction, source: (StoreAttr(source=source, attr=_member_name(instruction)),),
@@ -372,6 +386,8 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
         "ldlen": lambda _method, _instruction, source: (LoadAttr(source=source, attr="length"),),
         "newarr": lambda _method, instruction, source: (BuildArrayCall(source=source, kind=instruction.operands or "array"),),
         "throw": lambda _method, _instruction, source: (RaiseTop(source=source),),
+        "rethrow": lambda _method, _instruction, source: (ReraiseTop(source=source),),
+        "endfilter": _dotnet_unsupported_operation,
         "ret": lambda _method, _instruction, source: (ReturnTop(source=source, empty_is_void=True),),
     },
     rules=(

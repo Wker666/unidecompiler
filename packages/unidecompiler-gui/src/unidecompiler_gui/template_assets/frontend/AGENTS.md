@@ -25,6 +25,17 @@ This requirement does not override the architecture rules below.
   comparing block IDs or textual values alone.
 - Reuse core's shared CFG analysis and reducer. Do not add frontend-specific
   CFG recovery, region matchers, or graph algorithms.
+- Preserve observable values, not only stack height. Copies, duplicates,
+  unpacking, calls, and stores must evaluate side-effecting inputs once and
+  retain values read before a later mutation.
+- Use neutral core effects for local/global/captured/member/item stores and
+  deletes. Never replace a decoded mutation with an operand drop.
+- Preserve tuple/list kind and all numeric semantics (`numeric_domain`,
+  `bit_width`, and wrap/trap overflow policy). Core owns generic shift, rotate,
+  and bitwise execution, including aliases such as `shl`, `shr`, `rol`, and
+  `ror`; this frontend and its simulation adapter must not execute them.
+- Test every submitted effect behaviorally, including aliasing, mutation
+  barriers, numeric limits, and explicit unsupported outcomes.
 
 See `docs/NEW_VM_FRONTEND.md` for the full contract.
 

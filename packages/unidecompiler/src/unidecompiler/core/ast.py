@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from unidecompiler.core.ir import SourceRef, TypeRef
+from unidecompiler.core.ir import NumericDomain, SourceRef, TypeRef
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,14 @@ class ResumeInputExpr(AstExpr):
 
 
 @dataclass(frozen=True)
+class UnsupportedExpr(AstExpr):
+    """An explicit, analyzable fallback for an unrecovered expression."""
+
+    message: str = "unsupported expression"
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class UnaryExpr(AstExpr):
     op: str = ""
     value: AstExpr = field(default_factory=AstExpr)
@@ -49,6 +57,9 @@ class BinaryExpr(AstExpr):
     left: AstExpr = field(default_factory=AstExpr)
     right: AstExpr = field(default_factory=AstExpr)
     semantics: Literal["static", "dynamic"] = "dynamic"
+    numeric_domain: NumericDomain = "default"
+    bit_width: int | None = None
+    overflow_policy: Literal["wrap", "trap"] = "wrap"
 
 
 @dataclass(frozen=True)
@@ -98,6 +109,7 @@ class TableLiteralExpr(AstExpr):
 
 @dataclass(frozen=True)
 class ArrayLiteralExpr(AstExpr):
+    kind: Literal["list", "tuple"] = "list"
     items: tuple[AstExpr, ...] = ()
 
 
@@ -183,6 +195,11 @@ class StoreItemStmt(AstStmt):
 @dataclass(frozen=True)
 class ExprStmt(AstStmt):
     value: AstExpr = field(default_factory=AstExpr)
+
+
+@dataclass(frozen=True)
+class DeleteStmt(AstStmt):
+    target: AstExpr = field(default_factory=AstExpr)
 
 
 @dataclass(frozen=True)

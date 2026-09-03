@@ -13,6 +13,10 @@ from unidecompiler.core.effects import (
     BuildArrayCall,
     CallTopAs,
     Copy,
+    DeleteAttr,
+    DeleteGlobal,
+    DeleteItem,
+    DeleteLocal,
     DropBelowTop,
     Effect,
     Compare,
@@ -42,6 +46,7 @@ from unidecompiler.core.effects import (
     ReturnTop,
     ReturnVoid,
     StoreAttr,
+    StoreGlobal,
     StoreLocal,
     StoreMany,
     StoreManyFromPopOrder,
@@ -101,6 +106,10 @@ BINARY_SYMBOLS = {
     "-=": "-",
     "*": "*",
     "*=": "*",
+    "**": "**",
+    "**=": "**",
+    "@": "@",
+    "@=": "@",
     "/": "/",
     "/=": "/",
     "//": "//",
@@ -188,8 +197,7 @@ def _load_build_class(_context, _instruction, source: SourceRef) -> tuple[Effect
 
 def _import_name(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     return (
-        Pop(source=source, count=2, allow_missing=True),
-        Push(source=source, value=Global(name=str(instruction.argval), source=source)),
+        BuildCall(source=source, callee=Global(name=f"__import__:{instruction.argval}", source=source), arg_count=2, returns=1),
     )
 
 
@@ -217,6 +225,14 @@ def _load_local(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     return (LoadLocal(source=source, name=name, fallback=Var(name=name, source=source)),)
 
 
+def _load_and_clear_local(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    name = str(instruction.argval)
+    return (
+        LoadLocal(source=source, name=name, fallback=Var(name=name, source=source)),
+        DeleteLocal(source=source, name=name),
+    )
+
+
 def _load_closure(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     name = str(instruction.argval)
     return (Push(source=source, value=CapturedVar(name=name, source=source)),)
@@ -241,10 +257,23 @@ def _load_global(_context, instruction, source: SourceRef) -> tuple[Effect, ...]
 
 def _load_from_dict_or_globals(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     name = str(instruction.argval)
+    return (BuildCall(source=source, callee=Global(name=f"load_from_dict_or_globals:{name}", source=source), arg_count=1, returns=1),)
+
+
+def _call_intrinsic_1(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    return (CallTopAs(source=source, callee_name=str(instruction.argval or instruction.argrepr or "intrinsic")),)
+
+
+def _before_with(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    name = "before_async_with" if "ASYNC" in instruction.opname else "before_with"
     return (
-        Pop(source=source, count=1, allow_missing=True),
-        Push(source=source, value=Global(name=name, source=source)),
+        BuildCall(source=source, callee=Global(name=name, source=source), arg_count=1, returns=1),
+        Unpack(source=source, count=2),
     )
+
+
+def _set_function_attribute(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    return (BuildCall(source=source, callee=Global(name=f"set_function_attribute:{instruction.argval or instruction.argrepr}", source=source), arg_count=2, returns=1),)
 
 
 def _make_function(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -322,7 +351,7 @@ def _unary(op: str):
 
 def _store_global(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     name = str(instruction.argval)
-    return (StoreLocal(source=source, name=name, target=Var(name=name, source=source), materialize=False),)
+    return (StoreGlobal(source=source, name=name),)
 
 
 def _store_deref(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -337,16 +366,32 @@ def _store_deref(_context, instruction, source: SourceRef) -> tuple[Effect, ...]
     )
 
 
-def _delete_global(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (Pop(source=source, count=1, allow_missing=True),)
+def _delete_local(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    name = str(instruction.argval)
+    return (DeleteLocal(source=source, name=name),)
 
 
-def _delete_attr(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (Pop(source=source, count=1, allow_missing=True),)
+def _delete_deref(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    name = str(instruction.argval)
+    return (
+        DeleteLocal(
+            source=source,
+            name=name,
+            target=CapturedVar(name=name, source=source),
+        ),
+    )
+
+
+def _delete_global(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    return (DeleteGlobal(source=source, name=str(instruction.argval)),)
+
+
+def _delete_attr(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    return (DeleteAttr(source=source, attr=str(instruction.argval)),)
 
 
 def _delete_subscr(_context, _instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (Pop(source=source, count=2, allow_missing=True),)
+    return (DeleteItem(source=source),)
 
 
 def _build_slice(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -532,24 +577,17 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
         "JUMP_NO_INTERRUPT",
         "INSTRUMENTED_JUMP_BACKWARD",
         "INSTRUMENTED_JUMP_FORWARD",
-        "CALL_INTRINSIC_1",
-        "BEFORE_WITH",
         "CLEANUP_THROW",
         "CHECK_EG_MATCH",
         "END_ASYNC_FOR",
         "LOOKUP_METHOD",
         "PUSH_EXC_INFO",
         "WITH_EXCEPT_START",
-        "DELETE_FAST",
-        "DELETE_NAME",
-        "DELETE_DEREF",
-        "DELETE_GLOBAL",
         "ENTER_EXECUTOR",
         "EXIT_INIT_CHECK",
         "INSTRUMENTED_INSTRUCTION",
         "INSTRUMENTED_LINE",
         "INSTRUMENTED_RESUME",
-        "INTERPRETER_EXIT",
         "POP_BLOCK",
         "RESERVED",
         "SETUP_CLEANUP",
@@ -570,12 +608,15 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
         "LOAD_CLOSURE": _load_closure,
         "LOAD_FAST": _load_local,
         "LOAD_FAST_CHECK": _load_local,
-        "LOAD_FAST_AND_CLEAR": _load_local,
+        "LOAD_FAST_AND_CLEAR": _load_and_clear_local,
         "LOAD_FAST_LOAD_FAST": _load_fast_pair,
         "LOAD_FROM_DICT_OR_GLOBALS": _load_from_dict_or_globals,
         "LOAD_GLOBAL": _load_global,
         "MAKE_FUNCTION": _make_function,
         "STORE_GLOBAL": _store_global,
+        "DELETE_FAST": _delete_local,
+        "DELETE_NAME": _delete_local,
+        "DELETE_DEREF": _delete_deref,
         "DELETE_GLOBAL": _delete_global,
         "DELETE_ATTR": _delete_attr,
         "DELETE_SUBSCR": _delete_subscr,
@@ -588,7 +629,12 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
         "CALL_FUNCTION_EX": _call_function_ex,
         "INSTRUMENTED_CALL_FUNCTION_EX": _call_function_ex,
         "LOAD_LOCALS": _load_locals,
-        "SET_FUNCTION_ATTRIBUTE": lambda _context, _instruction, source: (DropBelowTop(source=source, count=1),),
+        "SET_FUNCTION_ATTRIBUTE": _set_function_attribute,
+        "CALL_INTRINSIC_1": _call_intrinsic_1,
+        "BEFORE_WITH": _before_with,
+        "BEFORE_ASYNC_WITH": _before_with,
+        "EXIT_INIT_CHECK": lambda _context, _instruction, source: (BuildCall(source=source, callee=Global(name="exit_init_check", source=source), arg_count=1, returns=0),),
+        "INTERPRETER_EXIT": lambda _context, _instruction, source: (ReturnTop(source=source),),
         "COPY": _copy,
         "SWAP": _swap,
         "LOAD_ATTR": _load_attr,

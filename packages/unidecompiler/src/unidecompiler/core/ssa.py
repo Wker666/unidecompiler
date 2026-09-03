@@ -12,8 +12,10 @@ from unidecompiler.core.ir import (
     Branch,
     Break,
     Call,
+    CollectionProjection,
     Const,
     Continue,
+    Delete,
     Expr,
     ExprStmt,
     ForEach,
@@ -22,6 +24,8 @@ from unidecompiler.core.ir import (
     GetAttr,
     GetItem,
     If,
+    IndirectCall,
+    IndirectRef,
     MapLiteral,
     MultiBranch,
     MultiReturn,
@@ -30,6 +34,8 @@ from unidecompiler.core.ir import (
     Phi,
     Raise,
     Reraise,
+    SetLiteral,
+    Switch,
     UnaryOp,
     Return,
     StoreAttr,
@@ -214,7 +220,7 @@ def _rewrite_statement(
 ):
     if isinstance(statement, Assign):
         value = _rewrite_expr(statement.value, current)
-        target = statement.target
+        target = _rewrite_expr(statement.target, current)
         if versions is not None and isinstance(statement.target, Var):
             original_name = statement.target.name
             next_version = versions.get(original_name, -1) + 1
@@ -255,6 +261,11 @@ def _rewrite_statement(
             attr=statement.attr,
             value=_rewrite_expr(statement.value, current),
         )
+    if isinstance(statement, Delete):
+        return Delete(
+            source=statement.source,
+            target=_rewrite_expr(statement.target, current),
+        )
     if isinstance(statement, ExprStmt):
         return ExprStmt(source=statement.source, value=_rewrite_expr(statement.value, current))
     if isinstance(statement, If):
@@ -268,6 +279,27 @@ def _rewrite_statement(
             then_body=_rewrite_statement_sequence(statement.then_body, then_current, then_versions),
             else_body=_rewrite_statement_sequence(statement.else_body, else_current, else_versions),
         )
+    if isinstance(statement, Switch):
+        return Switch(
+            source=statement.source,
+            selector=_rewrite_expr(statement.selector, current),
+            cases=tuple(
+                (
+                    _rewrite_expr(value, current),
+                    _rewrite_statement_sequence(
+                        body,
+                        current.copy(),
+                        versions.copy() if versions is not None else None,
+                    ),
+                )
+                for value, body in statement.cases
+            ),
+            default_body=_rewrite_statement_sequence(
+                statement.default_body,
+                current.copy(),
+                versions.copy() if versions is not None else None,
+            ),
+        )
     if isinstance(statement, While):
         body_current = current.copy()
         body_versions = versions.copy() if versions is not None else None
@@ -279,18 +311,20 @@ def _rewrite_statement(
     if isinstance(statement, ForEach):
         body_current = current.copy()
         body_versions = versions.copy() if versions is not None else None
+        target = _bind_local(statement.target, body_current, body_versions)
         return ForEach(
             source=statement.source,
-            target=statement.target,
+            target=target,
             iterable=_rewrite_expr(statement.iterable, current),
             body=_rewrite_statement_sequence(statement.body, body_current, body_versions),
         )
     if isinstance(statement, ForRange):
         body_current = current.copy()
         body_versions = versions.copy() if versions is not None else None
+        target = _bind_local(statement.target, body_current, body_versions)
         return ForRange(
             source=statement.source,
-            target=statement.target,
+            target=target,
             start=_rewrite_expr(statement.start, current),
             stop=_rewrite_expr(statement.stop, current),
             step=_rewrite_expr(statement.step, current),
@@ -303,15 +337,7 @@ def _rewrite_statement(
             source=statement.source,
             body=_rewrite_statement_sequence(statement.body, body_current, body_versions),
             handlers=tuple(
-                ExceptHandler(
-                    exception_type=_rewrite_expr(handler.exception_type, current),
-                    binding=handler.binding,
-                    body=_rewrite_statement_sequence(
-                        handler.body,
-                        current.copy(),
-                        versions.copy() if versions is not None else None,
-                    ),
-                )
+                _rewrite_handler(handler, current, versions)
                 for handler in statement.handlers
             ),
         )
@@ -334,7 +360,62 @@ def _rewrite_statement(
             source=statement.source,
             values=tuple(_rewrite_expr(value, current) for value in statement.values),
         )
+    if isinstance(statement, Branch):
+        return Branch(
+            source=statement.source,
+            condition=_rewrite_expr(statement.condition, current),
+            true_target=statement.true_target,
+            false_target=statement.false_target,
+        )
+    if isinstance(statement, MultiBranch):
+        return MultiBranch(
+            source=statement.source,
+            selector=_rewrite_expr(statement.selector, current),
+            cases=tuple(
+                (_rewrite_expr(value, current), target)
+                for value, target in statement.cases
+            ),
+            default_target=statement.default_target,
+        )
     return statement
+
+
+def _bind_local(
+    target: Var,
+    current: dict[str, str],
+    versions: dict[str, int] | None,
+) -> Var:
+    if versions is None:
+        current.pop(target.name, None)
+        return target
+    next_version = versions.get(target.name, -1) + 1
+    versions[target.name] = next_version
+    ssa_name = f"{target.name}_{next_version}"
+    current[target.name] = ssa_name
+    return Var(source=target.source, type=target.type, name=ssa_name)
+
+
+def _rewrite_handler(
+    handler: ExceptHandler,
+    current: dict[str, str],
+    versions: dict[str, int] | None,
+) -> ExceptHandler:
+    handler_current = current.copy()
+    handler_versions = versions.copy() if versions is not None else None
+    binding = (
+        None
+        if handler.binding is None
+        else _bind_local(handler.binding, handler_current, handler_versions)
+    )
+    return ExceptHandler(
+        exception_type=_rewrite_expr(handler.exception_type, current),
+        binding=binding,
+        body=_rewrite_statement_sequence(
+            handler.body,
+            handler_current,
+            handler_versions,
+        ),
+    )
 
 
 def _rewrite_statement_sequence(
@@ -362,6 +443,9 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
             left=_rewrite_expr(expr.left, current),
             right=_rewrite_expr(expr.right, current),
             semantics=expr.semantics,
+            numeric_domain=expr.numeric_domain,
+            bit_width=expr.bit_width,
+            overflow_policy=expr.overflow_policy,
         )
     if isinstance(expr, UnaryOp):
         return UnaryOp(
@@ -390,6 +474,13 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
             type=expr.type,
             callee=_rewrite_expr(expr.callee, current),
             args=tuple(_rewrite_expr(arg, current) for arg in expr.args),
+            keywords=tuple(
+                TableField(
+                    key=_rewrite_expr(field.key, current),
+                    value=_rewrite_expr(field.value, current),
+                )
+                for field in expr.keywords
+            ),
             returns=expr.returns,
         )
     if isinstance(expr, MultiReturn):
@@ -415,7 +506,25 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
         return ArrayLiteral(
             source=expr.source,
             type=expr.type,
+            kind=expr.kind,
             items=tuple(_rewrite_expr(item, current) for item in expr.items),
+        )
+    if isinstance(expr, SetLiteral):
+        return SetLiteral(
+            source=expr.source,
+            type=expr.type,
+            items=tuple(_rewrite_expr(item, current) for item in expr.items),
+        )
+    if isinstance(expr, CollectionProjection):
+        projection_current = current.copy()
+        projection_current.pop(expr.target.name, None)
+        return CollectionProjection(
+            source=expr.source,
+            type=expr.type,
+            kind=expr.kind,
+            target=expr.target,
+            iterable=_rewrite_expr(expr.iterable, current),
+            value=_rewrite_expr(expr.value, projection_current),
         )
     if isinstance(expr, ObjectLiteral):
         return ObjectLiteral(
@@ -462,6 +571,19 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
                 for pred, value in expr.incoming
             ),
         )
+    if isinstance(expr, IndirectCall):
+        return IndirectCall(
+            source=expr.source,
+            type=expr.type,
+            selector=_rewrite_expr(expr.selector, current),
+            signature=expr.signature,
+        )
+    if isinstance(expr, IndirectRef):
+        return IndirectRef(
+            source=expr.source,
+            type=expr.type,
+            target=_rewrite_expr(expr.target, current),
+        )
     return expr
 
 
@@ -476,10 +598,23 @@ def _assigned_names(statement) -> tuple[str, ...]:
             for inner in (*statement.then_body, *statement.else_body)
             for name in _assigned_names(inner)
         )
+    if isinstance(statement, Switch):
+        return tuple(
+            name
+            for _value, body in statement.cases
+            for inner in body
+            for name in _assigned_names(inner)
+        ) + tuple(
+            name
+            for inner in statement.default_body
+            for name in _assigned_names(inner)
+        )
     if isinstance(statement, While):
         return tuple(name for inner in statement.body for name in _assigned_names(inner))
     if isinstance(statement, (ForEach, ForRange)):
-        return tuple(name for inner in statement.body for name in _assigned_names(inner))
+        return (statement.target.name,) + tuple(
+            name for inner in statement.body for name in _assigned_names(inner)
+        )
     if isinstance(statement, Try):
         return tuple(
             name
@@ -490,6 +625,10 @@ def _assigned_names(statement) -> tuple[str, ...]:
             for handler in statement.handlers
             for inner in handler.body
             for name in _assigned_names(inner)
+        ) + tuple(
+            handler.binding.name
+            for handler in statement.handlers
+            if handler.binding is not None
         )
     return ()
 
@@ -507,12 +646,27 @@ def _used_names(statement) -> tuple[str, ...]:
         )
     if isinstance(statement, StoreAttr):
         return (*_expr_used_names(statement.obj), *_expr_used_names(statement.value))
+    if isinstance(statement, Delete):
+        return _expr_used_names(statement.target)
     if isinstance(statement, ExprStmt):
         return _expr_used_names(statement.value)
     if isinstance(statement, If):
         return (
             *_expr_used_names(statement.condition),
             *(name for inner in (*statement.then_body, *statement.else_body) for name in _used_names(inner)),
+        )
+    if isinstance(statement, Switch):
+        return (
+            *_expr_used_names(statement.selector),
+            *(
+                name
+                for value, body in statement.cases
+                for name in (
+                    *_expr_used_names(value),
+                    *(name for inner in body for name in _used_names(inner)),
+                )
+            ),
+            *(name for inner in statement.default_body for name in _used_names(inner)),
         )
     if isinstance(statement, While):
         return (
@@ -545,6 +699,8 @@ def _used_names(statement) -> tuple[str, ...]:
         )
     if isinstance(statement, Reraise):
         return ()
+    if isinstance(statement, Yield):
+        return _expr_used_names(statement.value)
     if isinstance(statement, Return):
         return tuple(name for value in statement.values for name in _expr_used_names(value))
     if isinstance(statement, Branch):
@@ -569,7 +725,15 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
     if isinstance(expr, GetAttr):
         return _expr_used_names(expr.obj)
     if isinstance(expr, Call):
-        return (*_expr_used_names(expr.callee), *(name for arg in expr.args for name in _expr_used_names(arg)))
+        return (
+            *_expr_used_names(expr.callee),
+            *(name for arg in expr.args for name in _expr_used_names(arg)),
+            *(
+                name
+                for field in expr.keywords
+                for name in (*_expr_used_names(field.key), *_expr_used_names(field.value))
+            ),
+        )
     if isinstance(expr, MultiReturn):
         return _expr_used_names(expr.value)
     if isinstance(expr, (TableLiteral, ObjectLiteral, MapLiteral)):
@@ -579,6 +743,13 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
         )
     if isinstance(expr, ArrayLiteral):
         return tuple(name for item in expr.items for name in _expr_used_names(item))
+    if isinstance(expr, SetLiteral):
+        return tuple(name for item in expr.items for name in _expr_used_names(item))
+    if isinstance(expr, CollectionProjection):
+        return (
+            *_expr_used_names(expr.iterable),
+            *(name for name in _expr_used_names(expr.value) if name != expr.target.name),
+        )
     if isinstance(expr, NewObject):
         return (
             *(() if expr.constructor is None else _expr_used_names(expr.constructor)),
@@ -586,6 +757,10 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
         )
     if isinstance(expr, Phi):
         return tuple(name for _, value in expr.incoming for name in _expr_used_names(value))
+    if isinstance(expr, IndirectCall):
+        return _expr_used_names(expr.selector)
+    if isinstance(expr, IndirectRef):
+        return _expr_used_names(expr.target)
     return ()
 
 

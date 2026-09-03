@@ -63,6 +63,13 @@ does not choose among overloads or perform frontend-specific name recovery.
 Execution is bounded and in-memory. Unknown operations, unsupported IR, and
 unsafe runtime behavior stop with a structured result instead of guessing.
 
+Generic numeric execution supports canonical operators and common neutral
+shift, rotate, and bitwise aliases, including `shl`, `shr`, `rol`, and `ror`.
+Signedness, bit width, float width, and integer wrap/trap overflow policy come
+from generic IR and are never inferred from a frontend ID. Phi assignments at
+block entry use parallel-copy semantics; explicit generic stores, deletes,
+tuple/list kinds, and exception matching are also preserved.
+
 Applications may inject an `ExternalEnvironment` for unresolved named calls.
 The environment receives only `ExternalCallRequest` data and returns an
 `ExternalCallResult`; it never receives IR, frames, adapters, or execution

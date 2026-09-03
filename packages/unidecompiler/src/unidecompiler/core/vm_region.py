@@ -372,7 +372,7 @@ def lift_stateful_low_level_cfg(
                 start,
             )
             lifted = VMLinearState(locals=in_state.locals.copy(), stack=in_state.stack)
-        if in_state.edge_statements and not lifted.statements:
+        if in_state.edge_statements:
             lifted = VMLinearState(
                 locals=lifted.locals,
                 stack=lifted.stack,
@@ -1522,13 +1522,17 @@ def _materialize_cross_block_stack(
     source = SourceRef(frontend=profile.frontend, offset=profile.offset(instruction))
     statements = list(state.statements)
     stack: list[Expr] = []
+    identity_snapshots: dict[int, Var] = {}
     changed = False
     for index, value in enumerate(state.stack):
         if isinstance(value, (Const, IndirectRef, Var)):
             stack.append(value)
             continue
-        target = Var(name=f"order_tmp_{profile.offset(instruction)}_{index}_v", source=source)
-        statements.append(Assign(source=source, target=target, value=value))
+        target = identity_snapshots.get(id(value))
+        if target is None:
+            target = Var(name=f"order_tmp_{profile.offset(instruction)}_{index}_v", source=source)
+            statements.append(Assign(source=source, target=target, value=value))
+            identity_snapshots[id(value)] = target
         stack.append(target)
         changed = True
     if not changed:
@@ -1658,6 +1662,11 @@ def _same_logical_expr_seen(left: Expr, right: Expr, seen: set[tuple[int, int]])
             return False
         left_incoming = dict(left.incoming)
         right_incoming = dict(right.incoming)
+        if (
+            len(left_incoming) != len(left.incoming)
+            or len(right_incoming) != len(right.incoming)
+        ):
+            return False
         if left_incoming.keys() != right_incoming.keys():
             return False
         return all(
@@ -1668,6 +1677,9 @@ def _same_logical_expr_seen(left: Expr, right: Expr, seen: set[tuple[int, int]])
         return (
             left.op == right.op
             and left.semantics == right.semantics
+            and left.numeric_domain == right.numeric_domain
+            and left.bit_width == right.bit_width
+            and left.overflow_policy == right.overflow_policy
             and _same_logical_expr_seen(left.left, right.left, seen)
             and _same_logical_expr_seen(left.right, right.right, seen)
         )
@@ -3291,6 +3303,9 @@ def _negate_condition(condition: Expr, *, source: SourceRef) -> Expr:
                 left=condition.left,
                 right=condition.right,
                 semantics=condition.semantics,
+                numeric_domain=condition.numeric_domain,
+                bit_width=condition.bit_width,
+                overflow_policy=condition.overflow_policy,
             )
     from unidecompiler.core.ir import UnaryOp
 

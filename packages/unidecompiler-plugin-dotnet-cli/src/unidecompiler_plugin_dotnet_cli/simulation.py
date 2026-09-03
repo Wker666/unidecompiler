@@ -19,7 +19,12 @@ class DotNetSimulationAdapter:
         return ResolvedFunction(matches[0], context=context, identifier=query)
 
     def resolve_global(self, name, context):
-        from unidecompiler_simulator import NotHandled, ResolvedFunction
+        from unidecompiler_simulator import IntrinsicCall, NotHandled, ResolvedFunction
+
+        # Conversion and unary operation names emitted by the generic lifter
+        # are pure value intrinsics, not methods in the lifted module.
+        if name.startswith(("conv.", "castclass", "box", "unbox", "neg", "bitnot", "check_finite", "refanytype")):
+            return IntrinsicCall(name)
 
         if not isinstance(context, dict):
             return NotHandled

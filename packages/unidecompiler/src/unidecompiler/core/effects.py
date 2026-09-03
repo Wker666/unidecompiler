@@ -12,6 +12,7 @@ from unidecompiler.core.ir import (
     Call,
     Const,
     CurrentException,
+    Delete as IRDelete,
     GetAttr,
     GetItem,
     IndirectCall,
@@ -72,6 +73,32 @@ class StoreLocal(Effect):
     materialize: bool = True
     target: Expr | None = None
     missing_value: Expr | None = None
+
+
+@dataclass(frozen=True)
+class StoreGlobal(Effect):
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class DeleteLocal(Effect):
+    name: str = ""
+    target: Expr | None = None
+
+
+@dataclass(frozen=True)
+class DeleteGlobal(Effect):
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class DeleteAttr(Effect):
+    attr: str = ""
+
+
+@dataclass(frozen=True)
+class DeleteItem(Effect):
+    pass
 
 
 @dataclass(frozen=True)
@@ -137,6 +164,7 @@ class Binary(Effect):
     semantics: Literal["static", "dynamic"] = "dynamic"
     numeric_domain: NumericDomain = "default"
     bit_width: int | None = None
+    overflow_policy: Literal["wrap", "trap"] = "wrap"
 
 
 @dataclass(frozen=True)
@@ -518,6 +546,8 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
             state.locals[effect.name] = value
         elif isinstance(target, Var):
             state.locals[effect.name] = target
+        elif isinstance(target, IndirectRef) and isinstance(target.target, (Var, CapturedVar)):
+            state.locals[effect.name] = target.target
         else:
             state.locals[effect.name] = value
         if effect.materialize:
@@ -545,6 +575,54 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
             else:
                 state.diagnostics.append("invalid-local-store-target")
                 return False
+        return True
+    if isinstance(effect, StoreGlobal):
+        value = state.pop()
+        if value is None:
+            return False
+        state.append_statement(
+            Assign(
+                source=effect.source,
+                target=Global(name=effect.name, source=effect.source),
+                value=value,
+            )
+        )
+        return True
+    if isinstance(effect, DeleteLocal):
+        target = effect.target or Var(name=effect.name, source=effect.source)
+        state.locals.pop(effect.name, None)
+        state.append_statement(IRDelete(source=effect.source, target=target))
+        return True
+    if isinstance(effect, DeleteGlobal):
+        state.append_statement(
+            IRDelete(
+                source=effect.source,
+                target=Global(name=effect.name, source=effect.source),
+            )
+        )
+        return True
+    if isinstance(effect, DeleteAttr):
+        obj = state.pop()
+        if obj is None:
+            return False
+        state.append_statement(
+            IRDelete(
+                source=effect.source,
+                target=GetAttr(source=effect.source, obj=obj, attr=effect.attr),
+            )
+        )
+        return True
+    if isinstance(effect, DeleteItem):
+        values = state.pop_many(2)
+        if values is None:
+            return False
+        obj, key = values
+        state.append_statement(
+            IRDelete(
+                source=effect.source,
+                target=GetItem(source=effect.source, obj=obj, key=key),
+            )
+        )
         return True
     if isinstance(effect, AssignValue):
         target = effect.target or Var(name=effect.name, source=effect.source)
@@ -645,6 +723,7 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 semantics=effect.semantics,
                 numeric_domain=effect.numeric_domain,
                 bit_width=effect.bit_width,
+                overflow_policy=effect.overflow_policy,
             )
         )
         return True
@@ -720,7 +799,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         )
         return True
     if isinstance(effect, LoadAttrFromTop):
-        obj = state.stack[-1] if state.stack else effect.fallback_obj
+        obj = (
+            state.materialize_stack_slot(-1, effect.source, label="attr_receiver")
+            if state.stack
+            else effect.fallback_obj
+        )
         state.push(GetAttr(source=effect.source, obj=obj, attr=effect.attr))
         return True
     if isinstance(effect, StoreAttr):
@@ -758,6 +841,20 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if values is None:
             return False
         obj, key = values
+        if _address_component_requires_single_execution(obj):
+            obj = state.materialize_value(
+                obj,
+                effect.source,
+                label="address_obj",
+                force_variable=isinstance(obj, (Global, CapturedVar)),
+            )
+        if _address_component_requires_single_execution(key):
+            key = state.materialize_value(
+                key,
+                effect.source,
+                label="address_key",
+                force_variable=isinstance(key, (Global, CapturedVar)),
+            )
         state.push(IndirectRef(source=effect.source, target=GetItem(source=effect.source, obj=obj, key=key)))
         return True
     if isinstance(effect, StoreItemEffect):
@@ -778,7 +875,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
             state.diagnostics.append(f"invalid-store-depth:{effect.depth}")
             return False
         key, value = values
-        obj = state.stack[-effect.depth]
+        obj = state.materialize_stack_slot(
+            -effect.depth,
+            effect.source,
+            label="store_item_obj",
+        )
         state.append_statement(StoreItem(source=effect.source, obj=obj, key=key, value=value))
         return True
     if isinstance(effect, LoadIndirect):
@@ -816,7 +917,7 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         items = state.pop_many(effect.count)
         if items is None:
             return False
-        state.push(ArrayLiteral(source=effect.source, items=items))
+        state.push(ArrayLiteral(source=effect.source, kind=effect.kind, items=items))
         return True
     if isinstance(effect, ExtendArray):
         iterable = state.pop()
@@ -828,7 +929,13 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if isinstance(target, ArrayLiteral):
             items = _static_iterable_items(iterable, effect.source)
             if items is not None:
-                state.push(ArrayLiteral(source=target.source or effect.source, items=(*target.items, *items)))
+                state.push(
+                    ArrayLiteral(
+                        source=target.source or effect.source,
+                        kind=target.kind,
+                        items=(*target.items, *items),
+                    )
+                )
                 return True
         state.push(
             Call(
@@ -859,6 +966,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 items=(*target.items, value),
             )
         else:
+            target = state.materialize_stack_slot(
+                target_index,
+                effect.source,
+                label="set_target",
+            )
             state.append_statement(
                 ExprStmt(
                     source=effect.source,
@@ -954,13 +1066,23 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         # A destructuring operation projects several fields from one VM stack
         # value. Materialize effectful calls once so every projection observes
         # the same return value instead of running the call again.
-        if isinstance(value, Call) and effect.count != 1:
+        projection_count = (
+            effect.count
+            if effect.count
+            else effect.before + effect.after + 1
+        )
+        if projection_count != 1 and not isinstance(value, Placeholder):
             item = Var(
                 name=f"unpack_value_{effect.source.offset if effect.source and effect.source.offset is not None else len(state.statements)}",
                 source=effect.source,
             )
-            state.append_statement(Assign(source=effect.source, target=item, value=value))
-            value = item
+            value = state.materialize_value(
+                value,
+                effect.source,
+                label="unpack",
+                preferred_name=item.name,
+                force_variable=isinstance(value, (Global, CapturedVar)),
+            )
         if effect.count:
             for index in range(effect.count):
                 state.push(GetItem(source=effect.source, obj=value, key=Const(value=index, source=effect.source)))
@@ -992,16 +1114,25 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 return True
             state.diagnostics.append(f"invalid-copy-depth:{effect.depth}")
             return False
-        state.push(state.stack[-effect.depth])
+        value = state.stack[-effect.depth]
+        if not _is_repeatable_core_intrinsic(value):
+            value = state.materialize_stack_slot(
+                -effect.depth,
+                effect.source,
+                label="copy",
+            )
+        state.push(value)
         return True
     if isinstance(effect, DuplicateTop):
-        value = state.pop()
-        if value is None:
+        if not state.stack:
             return False
-        if effect.materialized_name and _should_materialize_stack_value(value):
-            local = Var(name=effect.materialized_name, source=effect.source)
-            state.append_statement(Assign(source=effect.source, target=local, value=value))
-            value = local
+        value = state.materialize_stack_slot(
+            -1,
+            effect.source,
+            label="duplicate",
+            preferred_name=effect.materialized_name,
+        )
+        state.pop()
         state.push(value)
         state.push(value)
         return True
@@ -1009,10 +1140,12 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if not state.stack:
             return False
         if len(state.stack) == 1:
-            value = state.stack[-1]
+            value = state.materialize_stack_slot(-1, effect.source, label="duplicate_wide")
             state.push(value)
             return True
-        values = state.stack[-2:]
+        first = state.materialize_stack_slot(-2, effect.source, label="duplicate_wide_0")
+        second = state.materialize_stack_slot(-1, effect.source, label="duplicate_wide_1")
+        values = (first, second)
         state.push(values[0])
         state.push(values[1])
         return True
@@ -1020,9 +1153,8 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if effect.below_count < 1 or len(state.stack) < effect.below_count + 1:
             state.diagnostics.append(f"invalid-duplicate-below-depth:{effect.below_count}")
             return False
-        value = state.pop()
-        if value is None:
-            return False
+        value = state.materialize_stack_slot(-1, effect.source, label="duplicate_below")
+        state.pop()
         insert_at = len(state.stack) - effect.below_count
         state.stack.insert(insert_at, value)
         state.push(value)
@@ -1031,6 +1163,8 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if effect.count < 0:
             state.diagnostics.append(f"invalid-drop-below-top:{effect.count}")
             return False
+        if effect.count == 0:
+            return True
         if not state.stack:
             state.diagnostics.append("stack-underflow")
             return False
@@ -1077,21 +1211,28 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         key_tuple = state.pop()
         if key_tuple is None:
             return False
+        if not isinstance(key_tuple, Const) or not isinstance(key_tuple.value, tuple):
+            state.diagnostics.append("invalid-keyword-names")
+            return False
+        if not all(isinstance(key, str) for key in key_tuple.value):
+            state.diagnostics.append("invalid-keyword-name")
+            return False
         args = state.pop_many(effect.arg_count + effect.implicit_arg_count)
         if args is None:
+            return False
+        keyword_count = len(key_tuple.value)
+        if keyword_count > len(args):
+            state.diagnostics.append("invalid-keyword-count")
             return False
         callee = effect.receiver or state.pop()
         if callee is None:
             return False
-        if isinstance(key_tuple, Const) and isinstance(key_tuple.value, tuple):
-            keyword_count = len(key_tuple.value)
-            keyword_fields = tuple(
-                TableField(key=Const(value=key, source=effect.source), value=value)
-                for key, value in zip(key_tuple.value, args[-keyword_count:], strict=False)
-            )
-            args = args[: len(args) - keyword_count]
-        else:
-            keyword_fields = ()
+        keyword_values = args[-keyword_count:] if keyword_count else ()
+        keyword_fields = tuple(
+            TableField(key=Const(value=key, source=effect.source), value=value)
+            for key, value in zip(key_tuple.value, keyword_values, strict=True)
+        )
+        args = args[: len(args) - keyword_count] if keyword_count else args
         call = Call(source=effect.source, callee=callee, args=args, keywords=keyword_fields, returns=effect.returns)
         if effect.returns == 0:
             state.append_statement(ExprStmt(source=effect.source, value=call))
@@ -1127,7 +1268,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         if effect.depth <= 0 or effect.depth > len(state.stack):
             state.diagnostics.append(f"invalid-invoke-depth:{effect.depth}")
             return False
-        receiver = state.stack[-effect.depth]
+        receiver = state.materialize_stack_slot(
+            -effect.depth,
+            effect.source,
+            label="method_receiver",
+        )
         call = Call(
             source=effect.source,
             callee=GetAttr(source=effect.source, obj=receiver, attr=effect.attr),
@@ -1279,7 +1424,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         return True
     if isinstance(effect, BuildShapeTest):
         descriptors = state.pop_many(effect.descriptor_count)
-        subject = state.stack[-1] if state.stack else None
+        subject = (
+            state.materialize_stack_slot(-1, effect.source, label="shape_subject")
+            if state.stack
+            else None
+        )
         if descriptors is None or subject is None:
             return False
         state.push(
@@ -1306,7 +1455,9 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         state.return_values(effect.values, source=effect.source)
         return True
     if isinstance(effect, RaiseTop):
-        value = state.pop() if state.stack else Const(value=None, source=effect.source)
+        value = state.pop()
+        if value is None:
+            return False
         from unidecompiler.core.ir import Raise
 
         state.append_statement(Raise(source=effect.source, value=value))
@@ -1327,7 +1478,11 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         return True
     if isinstance(effect, ExceptionMatch):
         expected = state.pop()
-        active = state.stack[-1] if state.stack else CurrentException(source=effect.source)
+        active = (
+            state.materialize_stack_slot(-1, effect.source, label="active_exception")
+            if state.stack
+            else CurrentException(source=effect.source)
+        )
         if expected is None:
             return False
         state.push(
@@ -1363,6 +1518,37 @@ def _static_iterable_items(value: Expr, source: SourceRef | None) -> tuple[Expr,
     return None
 
 
+def _address_component_requires_single_execution(value: Expr) -> bool:
+    """Whether delaying an address component could repeat observable work.
+
+    Pure arithmetic over constants and locals may remain symbolic until the
+    normal local-write barrier freezes it.  Member/item access, calls, globals,
+    and allocation-like expressions must be computed exactly once when the
+    VM forms the address.
+    """
+
+    if isinstance(value, (Const, Var)):
+        return False
+    if isinstance(value, UnaryOp):
+        return _address_component_requires_single_execution(value.value)
+    if isinstance(value, BinaryOp):
+        return any(
+            _address_component_requires_single_execution(item)
+            for item in (value.left, value.right)
+        )
+    return True
+
+
+def _is_repeatable_core_intrinsic(value: Expr) -> bool:
+    """Core-owned pure probes which structuring may safely inspect twice."""
+
+    return (
+        isinstance(value, Call)
+        and isinstance(value.callee, Global)
+        and value.callee.name == "shape_test"
+    )
+
+
 def apply_effects(state: StackMachineState, effects: tuple[Effect, ...]) -> bool:
     for effect in effects:
         if not apply_effect(state, effect):
@@ -1370,12 +1556,6 @@ def apply_effects(state: StackMachineState, effects: tuple[Effect, ...]) -> bool
         if state.diagnostics:
             return False
     return True
-
-
-def _should_materialize_stack_value(value: Expr) -> bool:
-    if isinstance(value, Placeholder):
-        return False
-    return isinstance(value, (Call, NewObject, ArrayLiteral, SetLiteral, GetAttr, GetItem, BinaryOp))
 
 
 def _looks_like_function_value(value: Expr) -> bool:

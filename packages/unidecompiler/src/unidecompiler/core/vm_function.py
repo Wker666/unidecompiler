@@ -1927,7 +1927,11 @@ def _handler_exception_type(steps: tuple[VMBytecodeStep, ...]) -> Expr | None:
                 if pending_tuple_size is not None:
                     tuple_items.append(effect.value)
                     if len(tuple_items) == pending_tuple_size:
-                        return ArrayLiteral(source=effect.source, items=tuple(reversed(tuple_items)))
+                        return ArrayLiteral(
+                            source=effect.source,
+                            kind="tuple",
+                            items=tuple(reversed(tuple_items)),
+                        )
                     continue
                 return effect.value
     return None

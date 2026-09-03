@@ -15,6 +15,7 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    DeleteStmt,
     ResumeInputExpr,
     UndefinedLiteralExpr,
     ExprStmt,
@@ -49,6 +50,7 @@ from unidecompiler.core.ast import (
     TableLiteralExpr,
     TryStmt,
     UnaryExpr,
+    UnsupportedExpr,
     UnsupportedStmt,
     VarRef,
     YieldStmt,
@@ -223,7 +225,8 @@ def _emit_stmt(
     if isinstance(statement, AssignStmt):
         resolved = _resolve_expr(statement.value, inline_values)
         if not isinstance(statement.target, VarRef):
-            return [f"    {_emit_expr(statement.target)} = {_emit_expr(resolved)}"], declared
+            target = _resolve_expr(statement.target, inline_values)
+            return [f"    {_emit_expr(target)} = {_emit_expr(resolved)}"], declared
         if _should_inline_assignment(statement.target.name, local_names, resolved, source_language):
             inline_values[statement.target.name] = resolved
             return [], declared
@@ -261,6 +264,8 @@ def _emit_stmt(
         ], declared
     if isinstance(statement, ExprStmt):
         return [f"    {_emit_expr(_resolve_expr(statement.value, inline_values))}"], declared
+    if isinstance(statement, DeleteStmt):
+        return [f"    delete {_emit_expr(_resolve_expr(statement.target, inline_values))}"], declared
     if isinstance(statement, ReturnStmt):
         if statement.values:
             return [
@@ -338,12 +343,15 @@ def _emit_try(
         type_text = _emit_expr(_resolve_expr(handler.exception_type, inline_values))
         binding = f" {handler.binding.name}" if handler.binding is not None else ""
         lines[-1] += f" catch ({type_text}{binding}) {{"
+        handler_inline = inline_values.copy()
+        if handler.binding is not None:
+            handler_inline.pop(handler.binding.name, None)
         handler_lines, _ = _emit_stmt_sequence(
             handler.body,
             source_language,
             local_names,
             declared.copy(),
-            inline_values.copy(),
+            handler_inline,
         )
         lines.extend(_indent(handler_lines, "    "))
         lines.append("    }")
@@ -369,7 +377,8 @@ def _emit_if(
             inline_values.pop(name, None)
             prelude.append(f"    let {name} = null")
 
-    lines = [*prelude, f"    if ({_emit_expr(statement.condition)}) {{"]
+    condition = _resolve_expr(statement.condition, inline_values)
+    lines = [*prelude, f"    if ({_emit_expr(condition)}) {{"]
     then_declared = declared.copy()
     then_inline = inline_values.copy()
     then_lines, _ = _emit_stmt_sequence(statement.then_body, source_language, local_names, then_declared, then_inline)
@@ -500,7 +509,8 @@ def _emit_while(
     declared: set[str],
     inline_values: dict[str, AstExpr],
 ) -> tuple[list[str], set[str]]:
-    lines = [f"    while ({_emit_expr(statement.condition)}) {{"]
+    condition = _resolve_expr(statement.condition, inline_values)
+    lines = [f"    while ({_emit_expr(condition)}) {{"]
     body_declared = declared.copy()
     body_inline = inline_values.copy()
     body_lines, _ = _emit_stmt_sequence(statement.body, source_language, local_names, body_declared, body_inline)
@@ -518,11 +528,14 @@ def _emit_for_range(
 ) -> tuple[list[str], set[str]]:
     lines = [
         f"    for {statement.target.name} in range("
-        f"{_emit_expr(statement.start)}, {_emit_expr(statement.stop)}, {_emit_expr(statement.step)}"
+        f"{_emit_expr(_resolve_expr(statement.start, inline_values))}, "
+        f"{_emit_expr(_resolve_expr(statement.stop, inline_values))}, "
+        f"{_emit_expr(_resolve_expr(statement.step, inline_values))}"
         ") {"
     ]
     body_declared = declared.copy()
     body_inline = inline_values.copy()
+    body_inline.pop(statement.target.name, None)
     body_lines, _ = _emit_stmt_sequence(statement.body, source_language, local_names, body_declared, body_inline)
     lines.extend(_indent(body_lines, "    "))
     lines.append("    }")
@@ -542,6 +555,7 @@ def _emit_for_each(
     ]
     body_declared = declared.copy()
     body_inline = inline_values.copy()
+    body_inline.pop(statement.target.name, None)
     body_lines, _ = _emit_stmt_sequence(statement.body, source_language, local_names, body_declared, body_inline)
     lines.extend(_indent(body_lines, "    "))
     lines.append("    }")
@@ -582,6 +596,9 @@ def _source_spans(lines: list[str]) -> tuple[dict, ...]:
 
 
 def _emit_expr(expr: AstExpr) -> str:
+    if isinstance(expr, UnsupportedExpr):
+        detail = f": {expr.detail}" if expr.detail else ""
+        return f"unsupported_expr({expr.message + detail!r})"
     if isinstance(expr, CurrentExceptionRef):
         return "current_exception"
     if isinstance(expr, ResumeInputExpr):
@@ -614,7 +631,7 @@ def _emit_expr(expr: AstExpr) -> str:
     if isinstance(expr, IndirectCallExpr):
         return f"indirect<{expr.signature}>[{_emit_expr(expr.selector)}]"
     if isinstance(expr, IndirectRefExpr):
-        return _emit_expr(expr.target)
+        return f"ref({_emit_expr(expr.target)})"
     if isinstance(expr, GetAttrExpr):
         return f"{_emit_access_base(expr.obj)}.{expr.attr}"
     if isinstance(expr, CallExpr):
@@ -632,8 +649,13 @@ def _emit_expr(expr: AstExpr) -> str:
                 parts.append(f"[{_emit_expr(field.key)}] = {_emit_expr(field.value)}")
         return "{" + ", ".join(parts) + "}"
     if isinstance(expr, ArrayLiteralExpr):
-        return "[" + ", ".join(_emit_expr(item) for item in expr.items) + "]"
+        items = ", ".join(_emit_expr(item) for item in expr.items)
+        if expr.kind == "tuple":
+            return "(" + items + ("," if len(expr.items) == 1 else "") + ")"
+        return "[" + items + "]"
     if isinstance(expr, SetLiteralExpr):
+        if not expr.items:
+            return "set()"
         return "{" + ", ".join(_emit_expr(item) for item in expr.items) + "}"
     if isinstance(expr, CollectionProjectionExpr):
         opener, closer = ("[", "]") if expr.kind == "list" else ("{", "}")
@@ -767,6 +789,9 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
             left=_resolve_expr(expr.left, inline_values),
             right=_resolve_expr(expr.right, inline_values),
             semantics=expr.semantics,
+            numeric_domain=expr.numeric_domain,
+            bit_width=expr.bit_width,
+            overflow_policy=expr.overflow_policy,
         )
     if isinstance(expr, UnaryExpr):
         return UnaryExpr(
@@ -843,6 +868,7 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
         return ArrayLiteralExpr(
             source=expr.source,
             type=expr.type,
+            kind=expr.kind,
             items=tuple(_resolve_expr(item, inline_values) for item in expr.items),
         )
     if isinstance(expr, SetLiteralExpr):
@@ -852,13 +878,15 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
             items=tuple(_resolve_expr(item, inline_values) for item in expr.items),
         )
     if isinstance(expr, CollectionProjectionExpr):
+        projection_inline = inline_values.copy()
+        projection_inline.pop(expr.target.name, None)
         return CollectionProjectionExpr(
             source=expr.source,
             type=expr.type,
             kind=expr.kind,
             target=expr.target,
             iterable=_resolve_expr(expr.iterable, inline_values),
-            value=_resolve_expr(expr.value, inline_values),
+            value=_resolve_expr(expr.value, projection_inline),
         )
     if isinstance(expr, ObjectLiteralExpr):
         return ObjectLiteralExpr(
