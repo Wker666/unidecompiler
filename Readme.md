@@ -396,29 +396,3 @@ Build the core package independently:
 ```sh
 .venv/bin/python -m build packages/unidecompiler
 ```
-
-Before a release, build every distributable package (including
-`unidecompiler-all`) and validate each wheel and source archive:
-
-```sh
-for package in packages/*; do
-  [ -f "$package/pyproject.toml" ] || continue
-  .venv/bin/python -m build --wheel --sdist "$package" || exit 1
-done
-for artifact in packages/*/dist/*; do
-  .venv/bin/python -m twine check "$artifact" || exit 1
-done
-```
-
-Run the full verification suite before publishing:
-
-```sh
-.venv/bin/python -m pytest -q
-git diff --check
-```
-
-Build directories and `dist/` archives are local release artifacts and must
-remain ignored by Git. Review archive contents for credentials, machine paths,
-private source files, and test corpora before uploading. Uploading to PyPI and
-pushing to GitHub are explicit maintainer actions; this repository does not do
-either automatically.
