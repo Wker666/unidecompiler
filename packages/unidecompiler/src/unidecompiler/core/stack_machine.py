@@ -17,6 +17,7 @@ from unidecompiler.core.ir import (
     Stmt,
     Terminator,
     Var,
+    Call,
 )
 
 
@@ -37,9 +38,13 @@ class StackMachineState:
     statements: list[Stmt] = field(default_factory=list)
     terminator: Terminator | None = None
     diagnostics: list[str] = field(default_factory=list)
+    # Optional VM-neutral call summaries supplied by a host/core pass.  The
+    # state never executes a provider; it only uses descriptive write facts to
+    # preserve deferred stack values across mutation barriers.
+    call_effects: object | None = None
 
     def push(self, value: Expr) -> None:
-        self.stack.append(value)
+        self.stack.append(self._annotate_call_summaries(value))
 
     def pop(self, diagnostic: str = "stack-underflow") -> Expr | None:
         if not self.stack:
@@ -79,16 +84,72 @@ class StackMachineState:
         return True
 
     def append_statement(self, statement: Stmt) -> None:
+        statement = self._annotate_call_summaries(statement)
         written_locals, written_globals, written_captures = _directly_written_storage(
             statement
         )
+        call_locals, call_globals, call_captures, _unknown_call = _call_write_sets(
+            statement, self.call_effects
+        )
+        written_locals |= frozenset(call_locals)
+        written_globals |= frozenset(call_globals)
+        written_captures |= frozenset(call_captures)
         self.materialize_pending_stack(
             statement.source,
             written_names=written_locals,
             written_globals=written_globals,
             written_captures=written_captures,
+            unknown_call=_unknown_call,
         )
         self.statements.append(statement)
+
+    def _annotate_call_summaries(self, value: object):
+        """Attach descriptive summaries to calls created by generic effects.
+
+        This is deliberately a value-only core operation.  A provider may
+        resolve a static callee to a summary, but it is never invoked as
+        executable code and unresolved calls remain unknown.  Existing
+        explicit summaries always win over inferred metadata.
+        """
+
+        from unidecompiler.core.call_effects import summarize_call
+
+        if isinstance(value, Call):
+            callee = self._annotate_call_summaries(value.callee)
+            args = tuple(self._annotate_call_summaries(arg) for arg in value.args)
+            keywords = tuple(
+                replace(
+                    keyword,
+                    key=self._annotate_call_summaries(keyword.key),
+                    value=self._annotate_call_summaries(keyword.value),
+                )
+                for keyword in value.keywords
+            )
+            summary = value.effect_summary
+            if summary is None and self.call_effects is not None:
+                summary = summarize_call(
+                    replace(value, callee=callee, args=args, keywords=keywords),
+                    self.call_effects,
+                )
+            return replace(
+                value,
+                callee=callee,
+                args=args,
+                keywords=keywords,
+                effect_summary=summary,
+            )
+        if isinstance(value, tuple):
+            return tuple(self._annotate_call_summaries(item) for item in value)
+        if isinstance(value, list):
+            return [self._annotate_call_summaries(item) for item in value]
+        if is_dataclass(value):
+            updates = {
+                item.name: self._annotate_call_summaries(getattr(value, item.name))
+                for item in fields(value)
+                if item.name not in {"source", "type"}
+            }
+            return replace(value, **updates) if updates else value
+        return value
 
     def materialize_value(
         self,
@@ -117,7 +178,13 @@ class StackMachineState:
             name=preferred_name or f"order_tmp_{len(self.statements)}_{label}_v",
             source=source,
         )
-        self.statements.append(Assign(source=source, target=target, value=value))
+        self.statements.append(
+            Assign(
+                source=source,
+                target=target,
+                value=self._annotate_call_summaries(value),
+            )
+        )
         return target
 
     def materialize_stack_slot(
@@ -164,6 +231,7 @@ class StackMachineState:
         written_names: frozenset[str] = frozenset(),
         written_globals: frozenset[str] = frozenset(),
         written_captures: frozenset[str] = frozenset(),
+        unknown_call: bool = False,
     ) -> None:
         if not self.stack:
             return
@@ -182,6 +250,7 @@ class StackMachineState:
                         written_globals,
                         written_captures,
                         source,
+                        unknown_call=unknown_call,
                     )
                 )
                 continue
@@ -190,7 +259,10 @@ class StackMachineState:
                 or isinstance(value, Global) and value.name in written_globals
                 or isinstance(value, CapturedVar) and value.name in written_captures
             )
-            if isinstance(value, (Var, Global, CapturedVar)) and not is_overwritten_storage:
+            if (
+                isinstance(value, (Var, Global, CapturedVar))
+                and not is_overwritten_storage
+            ):
                 materialized.append(value)
                 continue
             storage_key = (
@@ -222,6 +294,8 @@ class StackMachineState:
         written_globals: frozenset[str],
         written_captures: frozenset[str],
         source=None,
+        *,
+        unknown_call: bool = False,
     ) -> IndirectRef:
         target = reference.target
         if isinstance(target, Var):
@@ -235,6 +309,7 @@ class StackMachineState:
             written_globals,
             written_captures,
             source,
+            unknown_call=unknown_call,
         )
         if frozen is target:
             return reference
@@ -334,6 +409,8 @@ def _freeze_address_expr(
     written_globals: frozenset[str],
     written_captures: frozenset[str],
     source=None,
+    *,
+    unknown_call: bool = False,
 ) -> Expr:
     """Freeze only address components invalidated by an upcoming local write."""
 
@@ -342,13 +419,13 @@ def _freeze_address_expr(
     if isinstance(target, GetItem):
         obj = target.obj
         key = target.key
-        if _expr_reads_storage(
+        if unknown_call or _expr_reads_storage(
             obj, written_names, written_globals, written_captures
         ):
             obj = state.materialize_value(
                 obj, source, label="address_obj", force_variable=True
             )
-        if _expr_reads_storage(
+        if unknown_call or _expr_reads_storage(
             key, written_names, written_globals, written_captures
         ):
             key = state.materialize_value(
@@ -357,7 +434,7 @@ def _freeze_address_expr(
         return replace(target, obj=obj, key=key)
     if isinstance(target, GetAttr):
         obj = target.obj
-        if _expr_reads_storage(
+        if unknown_call or _expr_reads_storage(
             obj, written_names, written_globals, written_captures
         ):
             obj = state.materialize_value(
@@ -381,18 +458,69 @@ InstructionHandler = Callable[[InstructionT, StackMachineState], bool]
 EffectEmitter = Callable[[InstructionT], tuple[object, ...] | None]
 
 
+def _call_write_sets(
+    statement: Stmt,
+    summaries: object | None,
+) -> tuple[set[str], set[str], set[str], bool]:
+    """Collect descriptive call writes without interpreting call targets."""
+
+    from unidecompiler.core.call_effects import summarize_call
+    from unidecompiler.core.ir import Call
+
+    local_names: set[str] = set()
+    global_names: set[str] = set()
+    capture_names: set[str] = set()
+    unknown = False
+
+    def visit(value: object) -> None:
+        nonlocal unknown
+        if isinstance(value, Call):
+            summary = summarize_call(value, summaries)
+            if summary.unknown:
+                unknown = True
+            for name in summary.writes:
+                # Storage names are intentionally unqualified in the neutral
+                # summary contract.  They are conservatively treated as local
+                # identities; explicit callers can use ``global:`` and
+                # ``capture:`` prefixes when they need a stronger partition.
+                if name.startswith("global:"):
+                    global_names.add(name.removeprefix("global:"))
+                elif name.startswith("capture:"):
+                    capture_names.add(name.removeprefix("capture:"))
+                else:
+                    local_names.add(name)
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+            return
+        if is_dataclass(value):
+            for field_info in fields(value):
+                visit(getattr(value, field_info.name))
+
+    visit(statement)
+    return local_names, global_names, capture_names, unknown
+
+
 class StackMachineLifter(Generic[InstructionT]):
     """Runs frontend-provided instruction effects over a generic stack state."""
 
-    def __init__(self, initial_locals: dict[str, Expr] | None = None) -> None:
+    def __init__(
+        self,
+        initial_locals: dict[str, Expr] | None = None,
+        *,
+        call_effects: object | None = None,
+    ) -> None:
         self.initial_locals = dict(initial_locals or {})
+        self.call_effects = call_effects
 
     def lift(
         self,
         instructions: tuple[InstructionT, ...],
         handler: InstructionHandler[InstructionT],
     ) -> StackLiftResult[InstructionT]:
-        state = StackMachineState(locals=self.initial_locals.copy())
+        state = StackMachineState(
+            locals=self.initial_locals.copy(), call_effects=self.call_effects
+        )
         for instruction in instructions:
             handled = handler(instruction, state)
             if not handled:
@@ -408,7 +536,9 @@ class StackMachineLifter(Generic[InstructionT]):
     ) -> StackLiftResult[InstructionT]:
         from unidecompiler.core.effects import apply_effects
 
-        state = StackMachineState(locals=self.initial_locals.copy())
+        state = StackMachineState(
+            locals=self.initial_locals.copy(), call_effects=self.call_effects
+        )
         for instruction in instructions:
             effects = emitter(instruction)
             if effects is None:

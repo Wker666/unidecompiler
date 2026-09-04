@@ -114,7 +114,8 @@ def index_assignments(function: FunctionIR) -> SSAIndex:
 def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
     cfg = build_cfg(function)
     placements = _phi_placements(function)
-    if not placements:
+    ambiguous_blocks = _ambiguous_phi_blocks(function, cfg)
+    if not placements and not ambiguous_blocks:
         return function
 
     updated_blocks: list[BasicBlock] = []
@@ -148,8 +149,34 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
         recovery_kind=function.recovery_kind,
         control_provenance=function.control_provenance,
         bytecode_control_flow=function.bytecode_control_flow,
-        metadata={**function.metadata, "ssa_phi_blocks": _phi_metadata(placements)},
+        metadata={
+            **function.metadata,
+            "ssa_phi_blocks": _phi_metadata(placements),
+            **(
+                {
+                    "ssa_phi_diagnostics": tuple(
+                        f"block {block_id}: parallel incoming edges require edge-keyed Phi"
+                        for block_id in sorted(ambiguous_blocks)
+                    )
+                }
+                if ambiguous_blocks
+                else {}
+            ),
+        },
     )
+
+
+def validate_phi_nodes(function: FunctionIR) -> tuple[str, ...]:
+    """Validate existing block-entry Phis without rewriting structured IR.
+
+    This is an analysis API for callers that need an explicit safety decision;
+    AST rendering deliberately does not invoke it because structured regions
+    may use logical labels that are not outer CFG predecessor IDs.
+    """
+
+    from unidecompiler.core.value_validation import validate_value_invariants
+
+    return validate_value_invariants(function)
 
 
 def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
@@ -482,6 +509,7 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
                 for field in expr.keywords
             ),
             returns=expr.returns,
+            effect_summary=expr.effect_summary,
         )
     if isinstance(expr, MultiReturn):
         return MultiReturn(
@@ -767,11 +795,19 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
 def _phi_placements(function: FunctionIR) -> tuple[PhiPlacement, ...]:
     cfg = build_cfg(function)
     preds = _predecessors(cfg)
+    # ``Phi`` currently labels inputs by predecessor block, not by concrete
+    # edge.  A switch (or other VM-neutral terminator) may contain parallel
+    # edges from one block to the same join; collapsing those edges would make
+    # the value selected at the join unknowable.  Keep the preservation CFG in
+    # that case until an edge-keyed Phi representation is available.
+    ambiguous_blocks = _ambiguous_phi_blocks(function, cfg)
     successors = {block_id: set(cfg.successors(block_id)) for block_id in cfg.blocks}
     live_in = _live_in_by_block(function, successors)
     reaching_out = _reaching_definitions(function, preds)
     placements: list[PhiPlacement] = []
     for block in function.blocks:
+        if block.id in ambiguous_blocks:
+            continue
         predecessors = preds.get(block.id, set())
         if len(predecessors) < 2:
             continue
@@ -796,6 +832,15 @@ def _phi_placements(function: FunctionIR) -> tuple[PhiPlacement, ...]:
                 )
             )
     return tuple(placements)
+
+
+def _ambiguous_phi_blocks(function: FunctionIR, cfg) -> frozenset[str]:
+    predecessors = _predecessors(cfg)
+    return frozenset(
+        block.id
+        for block in function.blocks
+        if len(cfg.incoming_edges(block.id)) != len(predecessors.get(block.id, set()))
+    )
 
 
 def _live_in_by_block(

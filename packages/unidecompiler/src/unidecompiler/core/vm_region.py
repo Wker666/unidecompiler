@@ -1572,6 +1572,8 @@ def _merge_low_level_incoming(
             suffix=name,
             current_predecessors=current_predecessors,
         )
+        if isinstance(merged, Phi):
+            merged = _collapse_redundant_phi(merged)
         if name not in locals_ or merged != locals_[name]:
             locals_[name] = merged
             changed = True
@@ -1587,6 +1589,8 @@ def _merge_low_level_incoming(
             suffix=f"stack{index}",
             current_predecessors=current_predecessors,
         )
+        if isinstance(merged, Phi):
+            merged = _collapse_redundant_phi(merged)
         stack_values.append(merged)
         changed = changed or merged is not left
     if not changed:
@@ -1609,7 +1613,24 @@ def _merge_phi_expr(
     current_predecessors: tuple[str, ...] = (),
 ) -> Expr:
     if isinstance(current, Phi):
+        normalized_current = _collapse_redundant_phi(current)
+        if normalized_current is not current:
+            current = normalized_current
+        if not isinstance(current, Phi):
+            return _merge_phi_expr(
+                current,
+                incoming,
+                predecessor,
+                source,
+                suffix=suffix,
+                current_predecessors=current_predecessors,
+            )
         pairs = list(current.incoming)
+        # A merge may revisit the same concrete predecessor while a loop
+        # header is being evaluated.  Phi labels are edge identities and must
+        # remain unique; update an existing label rather than appending a
+        # second copy.  Keeping the first position preserves deterministic
+        # ordering while replacing the value with the newly proved incoming.
         for index, (pred, value) in enumerate(pairs):
             if pred != predecessor:
                 continue
@@ -1617,25 +1638,73 @@ def _merge_phi_expr(
                 current_offset = _expr_source_offset(value)
                 incoming_offset = _expr_source_offset(incoming)
                 if current_offset is not None and incoming_offset is not None and incoming_offset < current_offset:
-                    return current
+                    return _collapse_redundant_phi(current)
                 pairs[index] = (pred, incoming)
-                return Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+                return _collapse_redundant_phi(
+                    Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+                )
             return current
         pairs.append((predecessor, incoming))
-        return Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+        return _collapse_redundant_phi(
+            Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+        )
     if _same_logical_expr(current, incoming):
         return current
-    labelled_current = tuple(
-        (current_predecessor, current)
-        for current_predecessor in dict.fromkeys(current_predecessors)
-    )
-    return Phi(
+    # ``current_predecessors`` can contain the edge currently being merged
+    # when a loop backedge reaches a header more than once.  Build a keyed
+    # sequence and replace that label instead of emitting duplicate Phi
+    # predecessors (which are invalid and cannot be rendered safely).
+    unique_predecessors = tuple(dict.fromkeys(current_predecessors))
+    if unique_predecessors:
+        predecessor_values = {
+            current_predecessor: current for current_predecessor in unique_predecessors
+        }
+        predecessor_values[predecessor] = incoming
+        labelled_current = tuple(predecessor_values.items())
+    elif predecessor == "existing":
+        labelled_current = (("existing", incoming),)
+    else:
+        labelled_current = (("existing", current), (predecessor, incoming))
+    return _collapse_redundant_phi(Phi(
         source=source,
-        incoming=(
-            *(labelled_current or (("existing", current),)),
-            (predecessor, incoming),
-        ),
-    )
+        incoming=labelled_current or (("existing", current),),
+    ))
+
+
+def _collapse_redundant_phi(value: Phi) -> Expr:
+    """Remove wrappers that repeat the same concrete predecessor label.
+
+    Iterative stack-state merging can encounter a loop header through a
+    backedge more than once, producing ``phi(P: phi(P: ...))``.  The outer
+    value contributes no information when its sole label is also present in
+    the nested Phi, so collapse it until the representation is canonical.
+    Other multi-incoming Phis are left untouched; their labels carry distinct
+    edge information and must not be guessed away.
+    """
+
+    current: Expr = value
+    while isinstance(current, Phi):
+        # Normalize nested values, but deliberately do not deduplicate labels
+        # within a multi-edge Phi.  Duplicate labels are malformed evidence
+        # and must remain visible to the invariant validator rather than being
+        # silently collapsed through a dictionary.
+        normalized = tuple(
+            (label, _collapse_redundant_phi(incoming) if isinstance(incoming, Phi) else incoming)
+            for label, incoming in current.incoming
+        )
+        if len(normalized) == 1:
+            label, nested = normalized[0]
+            if isinstance(nested, Phi):
+                # A one-edge Phi wrapping another Phi is only a merge-state
+                # artifact.  The nested node already carries all known edge
+                # values; retaining the wrapper creates repeated labels such
+                # as ``P: phi(P: ...)`` and violates the Phi contract.
+                current = nested
+                continue
+        if normalized != current.incoming:
+            current = Phi(source=current.source, type=current.type, incoming=normalized)
+        break
+    return current
 
 
 def _same_logical_expr(left: Expr, right: Expr) -> bool:

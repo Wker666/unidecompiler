@@ -12,7 +12,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TypeVar
 
-from unidecompiler.core.cfg_rewrite import CFGRewriteCandidate, validate_cfg_rewrite
+from unidecompiler.core.cfg import build_cfg
+from unidecompiler.core.cfg_rewrite import (
+    CFGRewriteCandidate,
+    RewriteEvidence,
+    validate_cfg_rewrite,
+)
 
 
 FunctionT = TypeVar("FunctionT")
@@ -54,6 +59,7 @@ class RegionReducer:
                     continue
 
                 if _is_low_level_function(current):
+                    snapshot = build_cfg(current)
                     proof = (
                         "lossless-normalization"
                         if reducer in normalizer_set
@@ -65,6 +71,22 @@ class RegionReducer:
                             rewritten=candidate,
                             rule=_rule_name(candidate, reducer),
                             proof=proof,
+                            evidence=RewriteEvidence(
+                                edge_ids=tuple(edge.edge_id for edge in snapshot.edges),
+                                raw_context=tuple(
+                                    current.metadata.get("unsupported_context", ())
+                                )
+                                or tuple(
+                                    str(row)
+                                    for row in current.metadata.get(
+                                        "bytecode_instructions", ()
+                                    )
+                                ),
+                                snapshot_key=tuple(
+                                    (edge.source, edge.target, edge.kind, edge.ordinal)
+                                    for edge in snapshot.edges
+                                ),
+                            ),
                         )
                     )
                     if not decision.accepted:

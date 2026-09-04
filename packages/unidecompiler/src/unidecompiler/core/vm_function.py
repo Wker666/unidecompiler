@@ -128,8 +128,14 @@ def lift_linear_vm_function(
     initial_locals: dict[str, Expr] | None = None,
     initial_stack: tuple[Expr, ...] = (),
     structured_lift: str | None = None,
+    call_effects: object | None = None,
 ) -> FunctionIR:
-    result = run_vm_steps(steps, initial_locals=initial_locals, initial_stack=initial_stack)
+    result = run_vm_steps(
+        steps,
+        initial_locals=initial_locals,
+        initial_stack=initial_stack,
+        call_effects=call_effects,
+    )
     if result.state.diagnostics:
         return unsupported_vm_function(spec, tuple(result.state.diagnostics), structured_lift=structured_lift)
     if result.stopped_at is not None and result.state.terminator is None:
@@ -276,6 +282,7 @@ def _lift_vm_step_function(
     initial_locals: dict[str, Expr] | None = None,
     initial_stack: tuple[Expr, ...] = (),
     raw_window: Callable[[int], tuple[str, ...]] | None = None,
+    call_effects: object | None = None,
 ) -> FunctionIR:
     """Lift a frontend-submitted VM function through the generic core pipeline."""
 
@@ -398,7 +405,12 @@ def _lift_vm_step_function(
             )
             if low_level is not None:
                 return finalize_recovered_vm_function(spec, low_level)
-    result = run_vm_steps(steps, initial_locals=initial_locals, initial_stack=initial_stack)
+    result = run_vm_steps(
+        steps,
+        initial_locals=initial_locals,
+        initial_stack=initial_stack,
+        call_effects=call_effects,
+    )
     if result.state.diagnostics:
         return unsupported_vm_function(spec, tuple(result.state.diagnostics), structured_lift="generic-vm-pipeline")
     if result.stopped_at is not None and result.state.terminator is None:
@@ -1120,8 +1132,14 @@ def lift_steps(
     *,
     initial_locals: dict[str, Expr] | None = None,
     initial_stack: tuple[Expr, ...] = (),
+    call_effects: object | None = None,
 ) -> StackLiftResult[VMBytecodeStep]:
-    return run_vm_steps(steps, initial_locals=initial_locals, initial_stack=initial_stack)
+    return run_vm_steps(
+        steps,
+        initial_locals=initial_locals,
+        initial_stack=initial_stack,
+        call_effects=call_effects,
+    )
 
 
 def _lift_stateful_candidate(

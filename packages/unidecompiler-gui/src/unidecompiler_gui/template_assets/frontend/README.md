@@ -32,3 +32,9 @@ overflow policy when the VM defines them. Shared shift/rotate aliases such as
 `shl`, `shr`, `rol`, and `ror` are core semantics; do not implement them in the
 frontend or a simulation adapter. Add behavioral tests for aliasing,
 pre-mutation values, numeric edge cases, and every submitted effect.
+
+Calls may carry a descriptive core `CallEffectSummary` for reads, writes,
+return arity, and raise/suspend/mutation facts. It is metadata, never an
+executor. Unknown calls conservatively form mutation barriers for deferred
+stack values. Core's pass manager owns fixed-point budgets and repeated-state
+diagnostics; a frontend must not implement its own CFG recovery loop.

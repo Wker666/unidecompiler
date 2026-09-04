@@ -78,11 +78,32 @@ class BinaryOp(Expr):
 
 
 @dataclass(frozen=True)
+class CallEffectSummary:
+    """VM-neutral, descriptive effects of a call.
+
+    This is analysis metadata, not executable behavior.  ``unknown`` keeps
+    core passes fail-closed when a callee cannot be resolved safely.
+    """
+
+    reads: frozenset[str] = frozenset()
+    writes: frozenset[str] = frozenset()
+    may_raise: bool = True
+    may_suspend: bool = False
+    returns: int | Literal["unknown"] = "unknown"
+    unknown: bool = True
+
+    @property
+    def may_mutate(self) -> bool:
+        return self.unknown or bool(self.writes)
+
+
+@dataclass(frozen=True)
 class Call(Expr):
     callee: Expr = field(default_factory=Expr)
     args: tuple[Expr, ...] = ()
     keywords: tuple[TableField, ...] = ()
     returns: int | Literal["unknown"] = 1
+    effect_summary: CallEffectSummary | None = None
 
 
 @dataclass(frozen=True)

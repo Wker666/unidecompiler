@@ -30,6 +30,24 @@ CFGRewriteProof = Literal["lossless-normalization", "exact-topology"]
 
 
 @dataclass(frozen=True)
+class RewriteEvidence:
+    """Auditable facts used to admit one VM-neutral CFG rewrite.
+
+    Matchers retain their local proof logic, but recording the exact concrete
+    edges and source context makes a rejected or later-regressed rewrite
+    diagnosable without referring to a frontend-private model.
+    """
+
+    edge_ids: tuple[str, ...] = ()
+    value_ids: tuple[str, ...] = ()
+    raw_context: tuple[str, ...] = ()
+    # Optional immutable identity of the CFG snapshot used by the matcher.
+    # When supplied, the common gate recomputes the key from ``original`` and
+    # rejects stale evidence instead of trusting a block-id comparison.
+    snapshot_key: tuple[tuple[str, str, str, int], ...] | None = None
+
+
+@dataclass(frozen=True)
 class CFGRewriteCandidate:
     """One core-owned CFG rewrite awaiting fail-closed validation.
 
@@ -42,6 +60,7 @@ class CFGRewriteCandidate:
     rewritten: FunctionIR
     rule: str
     proof: CFGRewriteProof
+    evidence: RewriteEvidence = RewriteEvidence()
 
 
 @dataclass(frozen=True)
@@ -49,6 +68,7 @@ class CFGRewriteDecision:
     accepted: bool
     function: FunctionIR
     reasons: tuple[str, ...] = ()
+    evidence: RewriteEvidence = RewriteEvidence()
 
 
 def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
@@ -74,6 +94,16 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
     if not candidate.rule:
         reasons.append("CFG rewrite rule has no stable identity")
 
+    original_cfg = build_cfg(original)
+    original_edge_ids = {edge.edge_id for edge in original_cfg.edges}
+    if any(edge_id not in original_edge_ids for edge_id in candidate.evidence.edge_ids):
+        reasons.append("rewrite evidence references an edge outside the original CFG snapshot")
+    if (
+        candidate.evidence.snapshot_key is not None
+        and candidate.evidence.snapshot_key != _cfg_snapshot_key(original_cfg)
+    ):
+        reasons.append("rewrite evidence does not match the original CFG snapshot")
+
     if (
         rewritten.name != original.name
         or rewritten.params != original.params
@@ -90,7 +120,6 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
     if _has_exceptional_context(original) or _has_exceptional_context(rewritten):
         reasons.append("ordinary CFG rewriting cannot own exceptional context")
 
-    original_cfg = build_cfg(original)
     rewritten_cfg = build_cfg(rewritten)
     if original_cfg.diagnostics:
         reasons.append("original CFG has unresolved targets")
@@ -143,8 +172,17 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         reasons.append("rewrite made no provable CFG progress")
 
     if reasons:
-        return CFGRewriteDecision(False, original, tuple(dict.fromkeys(reasons)))
-    return CFGRewriteDecision(True, rewritten)
+        return CFGRewriteDecision(
+            False, original, tuple(dict.fromkeys(reasons)), candidate.evidence
+        )
+    return CFGRewriteDecision(True, rewritten, evidence=candidate.evidence)
+
+
+def _cfg_snapshot_key(cfg) -> tuple[tuple[str, str, str, int], ...]:
+    return tuple(
+        (edge.source, edge.target, edge.kind, edge.ordinal)
+        for edge in cfg.edges
+    )
 
 
 def _merge_context(original: FunctionIR, rewritten: FunctionIR) -> FunctionIR:

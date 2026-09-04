@@ -88,7 +88,7 @@ BINARY_OPS = {
     "land": "&",
     "lor": "|",
     "lshl": "<<",
-    "lshr": ">>",
+    "lshr": ">>>",
     "lushr": ">>>",
     "lxor": "^",
     "fadd": "+",

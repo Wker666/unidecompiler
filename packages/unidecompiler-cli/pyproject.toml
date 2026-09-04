@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-cli"
-version = "0.1.1"
+version = "0.1.2"
 description = "Command-line host for unidecompiler plugins"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Wker", email = "1670133844@qq.com" }]
 requires-python = ">=3.11"
 dependencies = [
-    "unidecompiler>=0.1.1,<0.2.0",
-    "unidecompiler-simulator>=0.1.1,<0.2.0",
-    "unidecompiler-simulation-host-python>=0.1.1,<0.2.0",
+    "unidecompiler>=0.1.10,<0.2.0",
+    "unidecompiler-simulator>=0.1.5,<0.2.0",
+    "unidecompiler-simulation-host-python>=0.1.2,<0.2.0",
 ]
 
 [project.urls]

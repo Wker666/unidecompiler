@@ -52,6 +52,12 @@ operations retain domain, bit width, and wrapping or trapping overflow policy,
 while container literals retain tuple/list identity. These facts survive SSA,
 CFG rewriting, AST conversion, and backend rendering.
 
+Calls may carry descriptive `CallEffectSummary` metadata for reads, writes,
+return arity, and possible raise/suspend/mutation behavior. The core never
+executes a summary. Unknown calls conservatively barrier deferred values, and
+the shared pass manager records fixed-point budget or non-progress diagnostics
+with available bytecode context.
+
 ## Install
 
 Install the core library directly from PyPI. Cloning this repository is not

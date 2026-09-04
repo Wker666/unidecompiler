@@ -161,6 +161,34 @@ def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: di
         functions.append(FunctionResult(function_id, function.name, status, function.metadata.get("unsupported_reason"), raw, source))
         if status in {"partial", "unsupported"}:
             diagnostics.append(Diagnostic(f"recovery.{status}", function.metadata.get("unsupported_reason", "Partial recovery"), "warning", frontend_id, function_id, None if source is None else source.offset, source, raw))
+        for refinement in function.metadata.get("recovery_refinement_diagnostics", ()):
+            if not isinstance(refinement, dict):
+                continue
+            diagnostics.append(
+                Diagnostic(
+                    f"recovery.refinement.{refinement.get('code', 'stop')}",
+                    str(refinement.get("message", "recovery refinement stopped")),
+                    "warning",
+                    frontend_id,
+                    function_id,
+                    None if source is None else source.offset,
+                    source,
+                    tuple(dict.fromkeys((*raw, *tuple(refinement.get("context", ())))))
+                )
+            )
+        for value_diagnostic in function.metadata.get("recovery_value_diagnostics", ()):
+            diagnostics.append(
+                Diagnostic(
+                    "recovery.value-invariant",
+                    str(value_diagnostic),
+                    "error",
+                    frontend_id,
+                    function_id,
+                    None if source is None else source.offset,
+                    source,
+                    raw,
+                )
+            )
         function_control: list[BytecodeControlFlowInstruction] = []
         for row in rows:
             byte_range = row.get("artifact_range")

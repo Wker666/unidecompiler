@@ -31,11 +31,13 @@ def run_vm_steps(
     *,
     initial_locals: dict[str, Expr] | None = None,
     initial_stack: tuple[Expr, ...] = (),
+    call_effects: object | None = None,
 ) -> StackLiftResult[VMBytecodeStep]:
     steps = normalize_vm_steps(steps)
     state = StackMachineState(
         locals=dict(initial_locals or {}),
         stack=list(initial_stack),
+        call_effects=call_effects,
     )
     for step in steps:
         if step.effects is None:

@@ -51,7 +51,25 @@ def refine_recovered_function(
     if not function.blocks or not is_safe(function):
         return function
 
-    original = function
+    # Validate only representation-level value invariants here.  Structured
+    # regions may use logical labels, while duplicate/invalid block-entry
+    # Phis are never safe to rewrite or render as if they were valid SSA.
+    from unidecompiler.core.value_validation import validate_value_invariants
+
+    value_diagnostics = tuple(
+        diagnostic
+        for diagnostic in validate_value_invariants(function)
+        if "lacks concrete edge identity" not in diagnostic
+    )
+    if value_diagnostics:
+        return replace(
+            function,
+            metadata={
+                **function.metadata,
+                "recovery_value_diagnostics": value_diagnostics,
+            },
+        )
+
     current = function
     needs_restructure = current.recovery_kind == "generic-vm-low-level-cfg"
     seen: set[object] = set()
@@ -60,7 +78,12 @@ def refine_recovered_function(
     for _round in range(max_rounds):
         fingerprint = _function_fingerprint(current)
         if fingerprint in seen:
-            return original
+            return _refinement_diagnostic(
+                current,
+                code="non_progress",
+                message="recovery refinement reached a repeated function state",
+                rounds=_round,
+            )
         seen.add(fingerprint)
 
         # Establish the existing preservation-floor structure first.  Some
@@ -83,7 +106,6 @@ def refine_recovered_function(
                 current = structured
             needs_restructure = False
             # Materialize conservative SSA join facts before the first
-            # refinement pass.  ``astify`` used to synthesize these after all
             # recovery had finished, which made trivial loop Phis impossible
             # to remove and prevented them from exposing another CFG shape.
             if (
@@ -113,7 +135,23 @@ def refine_recovered_function(
             # phase therefore runs even when ``structured`` is None or is an
             # unchanged function.
 
-        refined = _next_refinement(current)
+        # Keep pass scheduling in the shared core manager so fixed-point
+        # budgets and non-progress diagnostics use one deterministic policy.
+        from unidecompiler.core.pass_manager import PassSpec, run_passes
+
+        pass_result = run_passes(
+            current,
+            (PassSpec("recovery-refinement", _next_refinement),),
+            fingerprint=_function_fingerprint,
+        )
+        refined = pass_result.function if pass_result.changed else None
+        if pass_result.diagnostics:
+            current = _refinement_diagnostic(
+                current,
+                code=pass_result.diagnostics[0].code,
+                message=pass_result.diagnostics[0].message,
+                rounds=_round,
+            )
         if refined is not None:
             if not _refinement_is_valid(current, refined) or not is_safe(refined):
                 # A rejected atomic candidate must not prevent a later CFG
@@ -126,7 +164,48 @@ def refine_recovered_function(
         if not needs_restructure:
             return current
 
-    return original
+    return _refinement_diagnostic(
+        current,
+        code="budget_exhausted",
+        message="recovery refinement reached its fixed-point budget",
+        rounds=max_rounds,
+    )
+
+
+def _refinement_diagnostic(
+    function: FunctionIR,
+    *,
+    code: str,
+    message: str,
+    rounds: int,
+) -> FunctionIR:
+    """Attach an analyzable fixed-point stop reason to the preservation IR."""
+
+    existing = tuple(function.metadata.get("recovery_refinement_diagnostics", ()))
+    context = tuple(function.metadata.get("unsupported_context", ()))
+    rows = tuple(function.metadata.get("bytecode_instructions", ()))
+    if rows and not context:
+        context = tuple(
+            f"offset={row.get('offset')!r}; opcode={row.get('opcode')}; "
+            f"operands={[item.get('text') for item in row.get('operands', ())]}"
+            for row in rows[-8:]
+            if isinstance(row, dict)
+        )
+    diagnostic = {
+        "code": code,
+        "message": message,
+        "rounds": rounds,
+        "context": context,
+    }
+    if diagnostic in existing:
+        return function
+    return replace(
+        function,
+        metadata={
+            **function.metadata,
+            "recovery_refinement_diagnostics": (*existing, diagnostic),
+        },
+    )
 
 
 def _next_refinement(function: FunctionIR) -> FunctionIR | None:
@@ -604,6 +683,14 @@ def _refinement_is_valid(original: FunctionIR, rewritten: FunctionIR) -> bool:
     ):
         return False
     if _contains_empty_control_body(rewritten):
+        return False
+
+    from unidecompiler.core.value_validation import validate_value_invariants
+
+    if any(
+        "lacks concrete edge identity" not in diagnostic
+        for diagnostic in validate_value_invariants(rewritten)
+    ):
         return False
 
     original_cfg = build_cfg(original)

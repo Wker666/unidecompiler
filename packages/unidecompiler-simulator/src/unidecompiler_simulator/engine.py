@@ -62,6 +62,7 @@ from unidecompiler.core.ir import (
     Yield,
     ModuleIR,
 )
+from unidecompiler.core.operators import normalize_numeric_operator
 from unidecompiler.input_sources import expand_input_path
 from unidecompiler.plugin_registry import FrontendRegistry
 
@@ -90,39 +91,6 @@ from unidecompiler_simulator.values import (
     snapshot_value,
     validate_runtime_value,
 )
-
-
-_BINARY_OPERATOR_ALIASES = {
-    # Logical/arithmetic shift spellings used by common VMs and IR producers.
-    "shl": "<<",
-    "sll": "<<",
-    "lsl": "<<",
-    "sal": "<<",
-    "lshift": "<<",
-    "shr": ">>",
-    "srl": ">>",
-    "lsr": ">>",
-    "lshr": ">>",
-    "rshift": ">>",
-    "sar": ">>",
-    "sra": ">>",
-    "asr": ">>",
-    "ashr": ">>",
-    "ushr": ">>>",
-    "urshift": ">>>",
-    "band": "&",
-    "bitand": "&",
-    "bor": "|",
-    "bitor": "|",
-    "bxor": "^",
-    "bitxor": "^",
-    "xor": "^",
-    # Both rotate naming conventions are common in bytecode descriptions.
-    "rotl": "rol",
-    "rotr": "ror",
-    "rotate_left": "rol",
-    "rotate_right": "ror",
-}
 
 
 class SimulationStatus(StrEnum):
@@ -1231,6 +1199,10 @@ class _Runner:
         bit_width: int | None = None,
         overflow_policy: str = "wrap",
     ) -> Any:
+        # Normalize before consulting a dynamic adapter.  Adapters consume
+        # the same VM-neutral canonical operator vocabulary as static
+        # execution; otherwise aliases would have two observable meanings.
+        op = normalize_numeric_operator(op)
         if overflow_policy not in {"wrap", "trap"}:
             self._unsupported(f"unknown integer overflow policy {overflow_policy!r}")
         if overflow_policy == "trap" and numeric_domain not in {"signed", "unsigned"}:
@@ -1253,7 +1225,6 @@ class _Runner:
         # Keep common VM spellings in the generic simulator.  Frontends may
         # submit these neutral operators directly; they should not need an
         # adapter merely to translate a standard shift/rotate operation.
-        op = _BINARY_OPERATOR_ALIASES.get(op, op)
         if op in {"rol", "ror"}:
             if bit_width is None or bit_width <= 0:
                 self._unsupported(
@@ -1284,6 +1255,16 @@ class _Runner:
             return result
         if numeric_domain not in {"default", "signed", "unsigned", "float"}:
             self._unsupported(f"unknown numeric domain {numeric_domain!r}")
+        if op == ">>>" and numeric_domain == "default":
+            if bit_width is None or bit_width <= 0:
+                self._unsupported("logical-right shift requires a positive bit width")
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (left, right)
+            ):
+                self._unsupported("logical-right shift requires integer operands")
+            mask = (1 << bit_width) - 1
+            return (left & mask) >> (right % bit_width)
         if numeric_domain in {"signed", "unsigned"}:
             if bit_width is None or bit_width <= 0:
                 self._unsupported(

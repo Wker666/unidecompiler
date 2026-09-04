@@ -36,6 +36,7 @@ from unidecompiler.core.ir import (
     Unsupported,
 )
 from unidecompiler.core.stack_machine import StackMachineState
+from unidecompiler.core.operators import normalize_numeric_operator
 
 
 @dataclass(frozen=True)
@@ -717,7 +718,7 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
         state.push(
             BinaryOp(
                 source=effect.source,
-                op=effect.op,
+                op=normalize_numeric_operator(effect.op),
                 left=left,
                 right=right,
                 semantics=effect.semantics,
@@ -1021,10 +1022,12 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
             return False
         target_index = len(state.stack) - effect.depth
         target = state.stack[target_index]
-        state.stack[target_index] = Call(
-            source=effect.source,
-            callee=Global(name="merge", source=effect.source),
-            args=(target, mapping),
+        state.stack[target_index] = state._annotate_call_summaries(
+            Call(
+                source=effect.source,
+                callee=Global(name="merge", source=effect.source),
+                args=(target, mapping),
+            )
         )
         return True
     if isinstance(effect, BuildConstKeyMap):

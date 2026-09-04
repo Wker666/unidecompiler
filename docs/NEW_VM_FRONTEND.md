@@ -148,6 +148,29 @@ ordering. The same rule applies to removing an explicit jump to an existing
 fallthrough block. If the proof does not hold, retain the low-level CFG/goto
 output exactly; it is the semantics-preserving floor.
 
+### 0.5.2 Shared numeric operators and call effects
+
+Numeric operator spelling is normalized by the VM-neutral core registry. Use
+the canonical forms `<<`, `>>`, `>>>`, `rol`, and `ror` in generic analysis;
+frontends may submit VM aliases such as `shl`, `lshr`, or `iushr` and must
+preserve the numeric domain, width, and overflow policy. Logical right shift
+must remain distinct from arithmetic right shift, including when a value is
+represented in the default domain.
+
+Calls may carry a descriptive `CallEffectSummary` containing reads, writes,
+return arity, and whether the call may raise, suspend, or mutate storage. The
+summary is analysis metadata only: it never executes a callee. A known summary
+may allow a narrowly proven value to remain deferred; an unknown call is a
+mutation barrier for deferred stack values and indirect-reference address
+components. If a summary cannot prove safety, core materializes the value or
+keeps the preservation-floor CFG.
+
+Fixed-point scheduling is centralized in the core pass manager. Every pass has
+a deterministic budget and repeated-state detection. Budget exhaustion or
+non-progress is reported with the last verified `FunctionIR`; it must never be
+silently converted into guessed structure. Refinement diagnostics retain the
+available instruction window, raw opcode, decoded operands, and branch hints.
+
 ## 0. First clarify the boundaries of frontend
 
 Frontend can do:

@@ -105,6 +105,13 @@ optional simulator applies it without branching on a frontend or source
 language. Container kind is likewise retained, so tuple and list literals do
 not collapse into one representation.
 
+Core also accepts descriptive call-effect summaries. They record reads,
+writes, return arity, and possible raise/suspend/mutation behavior without
+executing a callee. Known summaries enable narrowly proven stack-value
+preservation; unknown calls form conservative barriers for deferred values.
+Fixed-point pass scheduling and CFG rewrite evidence remain core-owned and
+diagnosable, including the instruction context available when recovery stops.
+
 ## Package Architecture
 
 `unidecompiler` is an embeddable core library. It has no command-line entry

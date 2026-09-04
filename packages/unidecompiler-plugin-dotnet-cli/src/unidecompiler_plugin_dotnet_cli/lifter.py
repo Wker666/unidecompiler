@@ -68,7 +68,7 @@ BINARY_OPS = {
     "xor": "^",
     "shl": "<<",
     "shr": ">>",
-    "shr.un": ">>",
+    "shr.un": ">>>",
 }
 
 COMPARE_OPS = {
