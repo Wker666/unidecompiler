@@ -1880,9 +1880,10 @@ public projection; GUI tests validate rendering and navigation.
 
 ## 20.1 Optional simulation support
 
-Simulating execution is not a required responsibility of the frontend. Even if a frontend can only decompile, it cannot
-Simulation is also legal. Only if the VM's function boundaries, calling conventions, and necessary runtime facts
-Support for mocking should only be declared when it is sufficiently explicit.
+Simulation is not required for decompilation. A frontend may opt in only when
+function boundaries, calling conventions, and required runtime facts are
+explicit enough to support repeatable generic-IR execution tests. Declaring
+simulation support must never introduce a frontend interpreter.
 
 The dependency direction of the simulator and frontend must remain strictly decoupled:
 ```text
@@ -2332,6 +2333,30 @@ When implementing optional simulations, proceed in the following order:
 
 First support a minimal function, and then expand coverage. Do not design a
 frontend-specific runtime framework for all language features up front.
+
+## 20.2 GUI pseudocode export
+
+Pseudocode export belongs to the GUI host and does not change frontend
+responsibilities. A frontend only supplies the recovered result and its
+display path; it must not implement file dialogs, output naming, or export
+selection.
+
+The GUI exposes two read-only commands:
+
+- `Export pseudocode` writes the currently selected result to one user-chosen
+  text file.
+- `Export all pseudocode` writes every open result that has pseudocode to a
+  user-chosen existing directory.
+
+The all-result exporter derives names from the final source basename, replaces
+unsafe characters, and adds a numeric suffix instead of overwriting an
+existing file. Results without pseudocode are skipped and reported. Absolute
+source paths, decoder objects, and private metadata must never be copied into
+the output filename or file content.
+
+This feature is intentionally independent of CFG recovery, simulation, and
+frontend lookup. It is safe for documents opened from files, directories, or
+archives, and it does not modify the input artifact.
 
 ## 21. When to expect while and when to accept goto
 

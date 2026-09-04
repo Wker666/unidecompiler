@@ -15,6 +15,10 @@ This requirement does not override the architecture rules below.
 - If simulation is supported, its adapter may only enumerate opaque targets, resolve a target to a current `FunctionIR`, and provide narrow data-only runtime facts.
 - The generic simulator executes recovered generic IR; it must remain independent from this frontend's bytecode model and opcode table.
 - Report unsupported shapes with bytecode context. Do not hide or guess unsupported behavior.
+- If the decoder proves an instruction's absolute position in the complete input
+  artifact, attach `ByteRange(start, size)` as read-only provenance for GUI
+  Structure/Hex navigation. Keep it separate from the VM `SourceRef.offset`,
+  and leave it unset when no exact conversion is provable.
 - Add decoder, lifting, and source-equivalent verification tests. Add simulation tests when simulation is declared.
 - Core reaches a semantics-preserving recovery fixed point before AST emission;
   backends only render the result and never recover CFG or eliminate gotos.
@@ -32,8 +36,9 @@ This requirement does not override the architecture rules below.
   deletes. Never replace a decoded mutation with an operand drop.
 - Preserve tuple/list kind and all numeric semantics (`numeric_domain`,
   `bit_width`, and wrap/trap overflow policy). Core owns generic shift, rotate,
-  and bitwise execution, including aliases such as `shl`, `shr`, `rol`, and
-  `ror`; this frontend and its simulation adapter must not execute them.
+  and bitwise execution. Its shared registry maps `shl` to `<<`, arithmetic
+  `shr`/`sar` to `>>`, logical-right aliases to `>>>`, and rotate aliases to
+  `rol`/`ror`; this frontend and its simulation adapter must not execute them.
 - Test every submitted effect behaviorally, including aliasing, mutation
   barriers, numeric limits, and explicit unsupported outcomes.
 

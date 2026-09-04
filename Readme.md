@@ -4,8 +4,8 @@ A small universal bytecode decompiler experiment.
 
 ## Quick start (PyPI)
 
-The current release is published on PyPI. For the complete read-only GUI,
-CLI, simulator, and all bundled frontend formats, install the meta-package:
+For the complete read-only GUI, CLI, simulator, and all bundled frontend
+formats, install the meta-package:
 
 ```sh
 python -m pip install --upgrade unidecompiler-all
@@ -275,6 +275,12 @@ corresponding bytes. Logical VM offsets are kept separate from artifact byte
 offsets; when a range cannot be proven, the GUI deliberately does not guess.
 This view never edits, re-encodes, or executes the original bytes.
 
+Pseudocode can be exported from the `File` menu. `Export pseudocode` writes
+the currently selected result to one text file. `Export all pseudocode` writes
+every open result that has pseudocode to a directory, using sanitized source
+basenames and numeric suffixes for collisions. Results without pseudocode are
+reported as skipped; source paths are never copied into output filenames.
+
 The GUI plugin SDK is installed automatically with `unidecompiler-gui`. Plugin
 authors can install it directly when developing against the public, Qt-neutral
 API:
@@ -390,3 +396,29 @@ Build the core package independently:
 ```sh
 .venv/bin/python -m build packages/unidecompiler
 ```
+
+Before a release, build every distributable package (including
+`unidecompiler-all`) and validate each wheel and source archive:
+
+```sh
+for package in packages/*; do
+  [ -f "$package/pyproject.toml" ] || continue
+  .venv/bin/python -m build --wheel --sdist "$package" || exit 1
+done
+for artifact in packages/*/dist/*; do
+  .venv/bin/python -m twine check "$artifact" || exit 1
+done
+```
+
+Run the full verification suite before publishing:
+
+```sh
+.venv/bin/python -m pytest -q
+git diff --check
+```
+
+Build directories and `dist/` archives are local release artifacts and must
+remain ignored by Git. Review archive contents for credentials, machine paths,
+private source files, and test corpora before uploading. Uploading to PyPI and
+pushing to GitHub are explicit maintainer actions; this repository does not do
+either automatically.

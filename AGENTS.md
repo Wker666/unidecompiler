@@ -70,6 +70,13 @@ must not become a reason for core to depend on frontend-private decoded models.
 Metadata is pass-through context only. It must not express program logic,
 control flow, recovery decisions, or source-language semantics.
 
+When the decoder can prove an instruction's exact position in the complete
+input artifact, it may attach a `ByteRange(start, size)` to the public decoded
+instruction. `SourceRef.offset` remains the VM control-flow coordinate; a
+`ByteRange` is only absolute, read-only provenance for Structure/Hex views.
+Never derive a range from a VM PC, RVA, instruction index, or a byte search.
+When the conversion is not provable, leave the range unset.
+
 Here, `unsupported` means the core could not safely recover the current stack
 shape, control-flow shape, or IR combination, so it must emit an explicit
 fallback instead of guessing.
@@ -229,7 +236,14 @@ stack depth. This contract applies to every frontend and to the simulator:
   domain, bit width, and overflow policy. Core transformations must preserve all
   of those fields. Shared shift, rotate, and bitwise spellings belong in a
   VM-neutral operator normalization layer; a frontend must not implement `ror`,
-  `rol`, `shl`, `shr`, or equivalent execution itself.
+  `rol`, `shl`, `shr`, or equivalent execution itself. The shared registry
+  canonicalizes `shl` to `<<`, arithmetic `shr`/`sar` to `>>`, logical-right
+  aliases to `>>>`, and rotate aliases to `rol`/`ror`; unknown spellings remain
+  unchanged and must not be guessed.
+- Calls may carry a descriptive `CallEffectSummary` with reads, writes, return
+  arity, and possible raise/suspend/mutation behavior. It is analysis metadata
+  only and never an executor. Unknown calls conservatively form a mutation
+  barrier for deferred stack values.
 - A Phi has one incoming value per concrete predecessor label. Duplicate labels
   are invalid and must be rejected rather than collapsed through a dictionary.
   Multiple Phi assignments at block entry use parallel-copy semantics.
@@ -322,6 +336,27 @@ These rules are mandatory.
   IR concept. If replacing a `goto`/CFG fallback with structured output is
   low-cost, do it, but only when the resulting pseudocode preserves exactly the
   same code logic.
+
+## Documentation and Release Hygiene
+
+`Readme.md`, this file, and `docs/NEW_VM_FRONTEND.md` are the repository's
+canonical architecture and onboarding documents. Changes to frontend-facing
+contracts must update all three, and the GUI frontend template's copied
+`README.md`/`docs/NEW_VM_FRONTEND.md` must stay synchronized with them.
+
+The GUI's pseudocode export is host functionality, not frontend recovery:
+single-result export writes one selected result, while all-result export writes
+each open result with pseudocode to a user-selected directory. Export names
+must use sanitized basenames, avoid overwriting existing files, and never
+encode absolute source paths or private metadata.
+
+Before a release, run the full test suite and `git diff --check`, build every
+package with both wheel and sdist (including `unidecompiler-all`), and run
+`twine check` on every artifact. Inspect archives for credentials, machine
+paths, private source, test corpora, and untracked build output. Build
+directories and `dist/` files stay ignored and are not committed. GitHub push
+and PyPI upload are explicit maintainer actions and must never be automated by
+an agent without a direct request.
 
 ## Adding A New VM
 
