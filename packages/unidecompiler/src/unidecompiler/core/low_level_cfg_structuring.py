@@ -194,6 +194,8 @@ def _structure_exact_empty_jump_chains(function: FunctionIR) -> FunctionIR | Non
         if (
             block.id in loop_blocks
             or block.id in phi_predecessors
+            or block.exception_edge is not None
+            or block.active_exception_handlers
             or block.statements
             or not isinstance(block.terminator, Jump)
         ):
@@ -254,7 +256,11 @@ def _structure_exact_empty_jump_chains(function: FunctionIR) -> FunctionIR | Non
             # any VM-visible exception or call effects in the expression.
             statements = (*statements, ExprStmt(source=terminator.condition.source, value=terminator.condition))
             terminator = Jump(source=terminator.source, target=terminator.true_target)
-        return BasicBlock(id=block.id, statements=statements, terminator=terminator)
+        # Preserve handler ownership even when this particular block is not
+        # itself a candidate for removal.  Ordinary CFG cleanup may run in a
+        # function that contains a disjoint protected region, but it must
+        # never erase exception provenance while rebuilding unaffected blocks.
+        return replace(block, statements=statements, terminator=terminator)
 
     kept = tuple(
         rewrite_block(block)

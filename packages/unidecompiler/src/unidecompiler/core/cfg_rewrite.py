@@ -117,7 +117,18 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         reasons.append("original CFG contains duplicate block ids")
     if _has_duplicate_block_ids(rewritten.blocks):
         reasons.append("rewritten CFG contains duplicate block ids")
-    if _has_exceptional_context(original) or _has_exceptional_context(rewritten):
+    original_exceptional = _exceptional_context_signature(original)
+    rewritten_exceptional = _exceptional_context_signature(rewritten)
+    if original_exceptional != rewritten_exceptional:
+        reasons.append("rewrite changed exceptional CFG context")
+    elif original_exceptional and not _exception_blocks_unchanged(original, rewritten):
+        reasons.append("rewrite changed an exception-bearing block")
+    elif original_exceptional and not _exception_boundary_edges_unchanged(original, rewritten):
+        reasons.append("rewrite changed CFG edges at an exception boundary")
+    elif original_exceptional and rewritten == original:
+        # Preserve the historical diagnostic for callers that submit an
+        # exceptional CFG as an ordinary no-op candidate.  Real ordinary
+        # region rewrites are allowed only when this signature is unchanged.
         reasons.append("ordinary CFG rewriting cannot own exceptional context")
 
     rewritten_cfg = build_cfg(rewritten)
@@ -202,11 +213,107 @@ def _has_duplicate_block_ids(blocks: tuple[BasicBlock, ...]) -> bool:
     return len(block_ids) != len(set(block_ids))
 
 
-def _has_exceptional_context(function: FunctionIR) -> bool:
-    return any(
-        block.exception_edge is not None or block.active_exception_handlers
-        for block in function.blocks
+def _exceptional_context_signature(
+    function: FunctionIR,
+) -> tuple[tuple[str, str | None, object | None, tuple[str, ...]], ...]:
+    """Return the immutable exception facts ordinary rewrites must preserve.
+
+    Ordinary region reduction may now proceed around handlers, but it may not
+    move, delete, retarget, or alter a block's exception state.  Comparing the
+    complete signature keeps this rule independent of block ordering and
+    prevents a rewrite from silently changing handler ownership.
+    """
+
+    return tuple(
+        sorted(
+            (
+                (
+                    block.id,
+                    block.exception_edge.target if block.exception_edge is not None else None,
+                    block.exception_edge.source if block.exception_edge is not None else None,
+                    tuple(block.active_exception_handlers),
+                )
+                for block in function.blocks
+                if block.exception_edge is not None or block.active_exception_handlers
+            ),
+            key=lambda item: item[0],
+        )
     )
+
+
+def _exception_blocks_unchanged(original: FunctionIR, rewritten: FunctionIR) -> bool:
+    """Require exact preservation of blocks carrying exception state.
+
+    A rewrite may simplify a disconnected ordinary region in a function that
+    also contains handlers, but it must not retarget or rewrite the blocks
+    that establish/receive exception control flow.  Comparing the complete
+    ``BasicBlock`` value also catches accidental changes to their terminators
+    and statements, not just changes to the exception metadata.
+    """
+
+    original_blocks = {block.id: block for block in original.blocks}
+    rewritten_blocks = {block.id: block for block in rewritten.blocks}
+    protected_ids = _exception_protected_block_ids(original)
+    return all(
+        rewritten_blocks.get(block_id) == original_blocks[block_id]
+        for block_id in protected_ids
+    )
+
+
+def _block_source_offsets(block: BasicBlock) -> frozenset[int]:
+    """Return direct executable source offsets carried by one basic block."""
+
+    offsets: set[int] = set()
+    for value in (*block.statements, block.terminator):
+        source = getattr(value, "source", None)
+        offset = getattr(source, "offset", None)
+        if isinstance(offset, int):
+            offsets.add(offset)
+    return frozenset(offsets)
+
+
+def _exception_protected_block_ids(function: FunctionIR) -> set[str]:
+    """Return exception blocks plus same-source handler-state clones."""
+
+    protected_ids = {
+        block.id
+        for block in function.blocks
+        if block.exception_edge is not None or block.active_exception_handlers
+    }
+    exceptional_offsets = {
+        getattr(block.exception_edge.source, "offset", None)
+        for block in function.blocks
+        if block.exception_edge is not None
+        and getattr(block.exception_edge.source, "offset", None) is not None
+    }
+    if exceptional_offsets:
+        protected_ids.update(
+            block.id
+            for block in function.blocks
+            if _block_source_offsets(block) & exceptional_offsets
+        )
+    return protected_ids
+
+
+def _exception_boundary_edges_unchanged(original: FunctionIR, rewritten: FunctionIR) -> bool:
+    """Require exact concrete CFG edges at protected block boundaries."""
+
+    protected_ids = _exception_protected_block_ids(original)
+    if not protected_ids:
+        return True
+    original_cfg = build_cfg(original)
+    rewritten_cfg = build_cfg(rewritten)
+    original_boundary = {
+        (edge.source, edge.target, edge.kind, edge.ordinal)
+        for edge in original_cfg.edges
+        if edge.source in protected_ids or edge.target in protected_ids
+    }
+    rewritten_boundary = {
+        (edge.source, edge.target, edge.kind, edge.ordinal)
+        for edge in rewritten_cfg.edges
+        if edge.source in protected_ids or edge.target in protected_ids
+    }
+    return original_boundary == rewritten_boundary
 
 
 def _metadata_was_lost(original: FunctionIR, rewritten: FunctionIR) -> bool:

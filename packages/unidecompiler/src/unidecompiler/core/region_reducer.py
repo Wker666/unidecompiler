@@ -44,8 +44,6 @@ class RegionReducer:
         *,
         is_safe: SafetyCheck[FunctionT] | None = None,
     ) -> FunctionT | None:
-        if _has_exceptional_context(function):
-            return None
         current = function
         normalized = False
         # Keep tuple membership rather than hashing callbacks: callers may
@@ -137,11 +135,3 @@ def _is_low_level_function(function: object) -> bool:
 def _rule_name(function: object, reducer: Reducer[FunctionT]) -> str:
     metadata = getattr(function, "metadata", {})
     return metadata.get("low_level_cfg_structured", getattr(reducer, "__name__", "region-reducer"))
-
-
-def _has_exceptional_context(function: object) -> bool:
-    return any(
-        getattr(block, "exception_edge", None) is not None
-        or bool(getattr(block, "active_exception_handlers", ()))
-        for block in getattr(function, "blocks", ())
-    )
