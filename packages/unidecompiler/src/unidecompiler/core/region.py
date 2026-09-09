@@ -11,8 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from unidecompiler.core.cfg import CFG, build_cfg, find_irreducible_blocks
-from unidecompiler.core.ir import FunctionIR, SourceRef
+from unidecompiler.core.cfg import CFG, build_cfg, find_irreducible_blocks, validate_cfg_consistency
+from unidecompiler.core.ir import ExceptionalTransfer, FunctionIR, SourceRef, exceptional_transfers
 
 
 RegionEdgeRole = Literal[
@@ -34,6 +34,11 @@ class RegionEdge:
     provenance: SourceRef | None = None
     roles: frozenset[RegionEdgeRole] = frozenset({"ordinary"})
     ordinal: int = 0
+    # A derived region edge may have different visible endpoints after one or
+    # more collapses.  Keep the concrete preservation-CFG identities that it
+    # represents so later proofs never have to infer them from rewritten node
+    # names or ordinals.
+    origin_edge_ids: tuple[str, ...] = ()
 
     @property
     def edge_id(self) -> str:
@@ -42,6 +47,12 @@ class RegionEdge:
     @property
     def id(self) -> str:
         return self.edge_id
+
+    @property
+    def concrete_edge_ids(self) -> tuple[str, ...]:
+        """Return the preservation-CFG edges represented by this edge."""
+
+        return self.origin_edge_ids or (self.edge_id,)
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,104 @@ class RegionNode:
     members: frozenset[str]
     kind: str = "basic"
     internal_edges: tuple[RegionEdge, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProtectedRegionView:
+    """Immutable proof facts for one exception-isolated block region.
+
+    The view does not authorize a CFG rewrite by itself.  It proves only that
+    every member observes the same active handler scope and the same handler
+    entry contract, while retaining every concrete exceptional edge.  A
+    collapse matcher must still prove normal-edge topology, Phi remapping,
+    statement ordering, and simulator dispatch before consuming the region.
+    """
+
+    members: tuple[str, ...]
+    active_handler_chain: tuple[str, ...] = ()
+    handler_target: str | None = None
+    handler_stack_snapshot: tuple[object, ...] = ()
+    handler_chain: tuple[str, ...] = ()
+    transfers: tuple[tuple[str, ExceptionalTransfer], ...] = ()
+    edge_ids: tuple[str, ...] = ()
+    snapshot_key: tuple[tuple[object, ...], ...] = ()
+    rejections: tuple[str, ...] = ()
+
+    @property
+    def eligible(self) -> bool:
+        return not self.rejections
+
+    @classmethod
+    def from_cfg(
+        cls,
+        cfg: CFG,
+        members: frozenset[str],
+    ) -> "ProtectedRegionView":
+        ordered_members = tuple(block_id for block_id in cfg.block_ids if block_id in members)
+        reasons: list[str] = []
+        if not members:
+            reasons.append("protected region is empty")
+        if len(ordered_members) != len(members):
+            reasons.append("protected region references a missing block")
+        consistency = validate_cfg_consistency(cfg)
+        if consistency:
+            reasons.append("CFG consistency check failed: " + "; ".join(consistency))
+
+        blocks = tuple(cfg.blocks[block_id] for block_id in ordered_members if block_id in cfg.blocks)
+        active_chains = {tuple(block.active_exception_handlers) for block in blocks}
+        if len(active_chains) > 1:
+            reasons.append("protected blocks have different active handler chains")
+        active_chain = next(iter(active_chains), ())
+
+        transfers = tuple(
+            (block.id, transfer)
+            for block in blocks
+            for transfer in exceptional_transfers(block)
+        )
+        if not transfers:
+            reasons.append("protected region has no exceptional transfers")
+        if any(transfer.source is None for _block_id, transfer in transfers):
+            reasons.append("exceptional transfer lacks source provenance")
+        contracts = {
+            (
+                transfer.target,
+                tuple(transfer.stack_snapshot),
+                tuple(transfer.handler_chain),
+            )
+            for _block_id, transfer in transfers
+        }
+        if len(contracts) > 1:
+            reasons.append("protected blocks have different handler-entry contracts")
+        contract = next(iter(contracts), (None, (), ()))
+
+        exceptional_edges = tuple(
+            edge
+            for edge in cfg.edges
+            if edge.kind == "exception" and edge.source in members
+        )
+        if len(exceptional_edges) != len(transfers):
+            reasons.append("protected region does not retain every exceptional edge")
+        if any(edge.target in members for edge in exceptional_edges):
+            reasons.append("protected region contains a nested exceptional transfer")
+
+        analysis = cfg.analyze()
+        if any(
+            edge.source in members or edge.target in members
+            for edge in analysis.irreducible_edges
+        ):
+            reasons.append("protected region crosses an irreducible edge")
+
+        return cls(
+            members=ordered_members,
+            active_handler_chain=tuple(active_chain),
+            handler_target=contract[0],
+            handler_stack_snapshot=tuple(contract[1]),
+            handler_chain=tuple(contract[2]),
+            transfers=transfers,
+            edge_ids=tuple(edge.edge_id for edge in exceptional_edges),
+            snapshot_key=cfg.snapshot_key,
+            rejections=tuple(dict.fromkeys(reasons)),
+        )
 
 
 @dataclass(frozen=True)
@@ -77,25 +186,27 @@ class RegionGraph:
         # pass can accidentally observe stale loop information.
         analysis = cfg.analyze()
         loop_infos = analysis.loop_infos
+        # Keep role assignment edge-keyed.  Parallel edges may share source
+        # and target but represent different control alternatives; assigning
+        # roles by a node pair would silently mark or consume all of them.
         back_edges = {
-            (source, loop.header)
-            for loop in loop_infos
-            for source in loop.backedge_sources
+            edge.edge_id
+            for edge in analysis.backedges
         }
         loop_exit_edges = {
-            (edge.source, edge.target)
+            edge.edge_id
             for loop in loop_infos
             for edge in loop.exits
         }
         irreducible_blocks = find_irreducible_blocks(cfg)
 
-        def roles(source: str, target: str, kind: str) -> frozenset[RegionEdgeRole]:
+        def roles(edge_id: str, source: str, target: str, kind: str) -> frozenset[RegionEdgeRole]:
             result: set[RegionEdgeRole] = set()
             if kind == "exception":
                 result.add("exceptional")
-            if (source, target) in back_edges:
+            if edge_id in back_edges:
                 result.add("back")
-            if (source, target) in loop_exit_edges:
+            if edge_id in loop_exit_edges:
                 result.add("loop-exit")
             if source in irreducible_blocks or target in irreducible_blocks:
                 result.add("irreducible")
@@ -113,8 +224,9 @@ class RegionGraph:
                 target=edge.target,
                 kind=edge.kind,
                 provenance=edge.provenance,
-                roles=roles(edge.source, edge.target, edge.kind),
+                roles=roles(edge.edge_id, edge.source, edge.target, edge.kind),
                 ordinal=edge.ordinal,
+                origin_edge_ids=(edge.edge_id,),
             )
             for edge in cfg.edges
         )
@@ -342,20 +454,41 @@ class RegionGraph:
         def endpoint(node_id: str) -> str:
             return region_id if node_id in members else node_id
 
-        rewritten_edges: list[RegionEdge] = []
+        pending_edges: list[RegionEdge] = []
         for edge in self.edges:
             source = endpoint(edge.source)
             target = endpoint(edge.target)
             if source == target:
                 continue
-            rewritten_edges.append(
+            pending_edges.append(
                 RegionEdge(
                     source=source,
                     target=target,
                     kind=edge.kind,
                     provenance=edge.provenance,
                     roles=edge.roles,
-                    ordinal=edge.ordinal,
+                    # Reassigned below.  A collapse can make edges from
+                    # several member nodes outgoing from one region node, so
+                    # retaining their old source-local ordinals is ambiguous.
+                    ordinal=0,
+                    origin_edge_ids=edge.concrete_edge_ids,
+                )
+            )
+
+        outgoing_ordinals: dict[str, int] = {}
+        rewritten_edges: list[RegionEdge] = []
+        for edge in pending_edges:
+            ordinal = outgoing_ordinals.get(edge.source, 0)
+            outgoing_ordinals[edge.source] = ordinal + 1
+            rewritten_edges.append(
+                RegionEdge(
+                    source=edge.source,
+                    target=edge.target,
+                    kind=edge.kind,
+                    provenance=edge.provenance,
+                    roles=edge.roles,
+                    ordinal=ordinal,
+                    origin_edge_ids=edge.concrete_edge_ids,
                 )
             )
         return RegionGraph(
@@ -366,6 +499,6 @@ class RegionGraph:
             irreducible_edge_ids=frozenset(
                 edge.edge_id
                 for edge in rewritten_edges
-                if edge.edge_id in self.irreducible_edge_ids
+                if "irreducible" in edge.roles
             ),
         )

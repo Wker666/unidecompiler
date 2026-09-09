@@ -33,8 +33,38 @@ class CurrentExceptionRef(AstExpr):
 
 
 @dataclass(frozen=True)
+class ExceptionResumePositionExpr(AstExpr):
+    pass
+
+
+@dataclass(frozen=True)
 class ResumeInputExpr(AstExpr):
     pass
+
+
+@dataclass(frozen=True)
+class ExceptionRewriteExpr(AstExpr):
+    """VM-neutral conditional exception value transformation.
+
+    The predicate and replacement remain explicit operands so a renderer does
+    not invent a source-language exception family or helper call.
+    """
+
+    value: AstExpr = field(default_factory=AstExpr)
+    predicate: AstExpr = field(default_factory=AstExpr)
+    replacement: AstExpr = field(default_factory=AstExpr)
+    retain_input_as_cause: bool = False
+
+
+@dataclass(frozen=True)
+class ExceptionCleanupValueExpr(AstExpr):
+    """Conditional cleanup result with an explicit propagation alternative."""
+
+    value: AstExpr = field(default_factory=AstExpr)
+    input_exception: AstExpr | None = None
+    propagate_input: bool = True
+    predicate: AstExpr | None = None
+    predicate_operand: AstExpr | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +108,7 @@ class MultiReturnExpr(AstExpr):
 @dataclass(frozen=True)
 class PhiExpr(AstExpr):
     incoming: tuple[tuple[str, AstExpr], ...] = ()
+    edge_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -228,12 +259,23 @@ class WhileStmt(AstStmt):
 
 
 @dataclass(frozen=True)
+class DoWhileStmt(AstStmt):
+    body: tuple[AstStmt, ...] = ()
+    condition: AstExpr = field(default_factory=AstExpr)
+
+
+@dataclass(frozen=True)
 class BreakStmt(AstStmt):
     pass
 
 
 @dataclass(frozen=True)
 class ContinueStmt(AstStmt):
+    pass
+
+
+@dataclass(frozen=True)
+class FallthroughStmt(AstStmt):
     pass
 
 
@@ -296,7 +338,15 @@ class RaiseStmt(AstStmt):
 
 @dataclass(frozen=True)
 class ReraiseStmt(AstStmt):
-    pass
+    """A rethrow of either the active handler value or an explicit value.
+
+    Resume slots retain opaque VM provenance.  They are not printed as source
+    constructs, but keeping them in the AST prevents an AST conversion from
+    silently changing an explicit rethrow into a bare one.
+    """
+
+    value: AstExpr | None = None
+    resume_slots: tuple[AstExpr, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -306,7 +356,7 @@ class YieldStmt(AstStmt):
 
 @dataclass(frozen=True)
 class ExceptHandlerStmt:
-    exception_type: AstExpr = field(default_factory=AstExpr)
+    exception_type: AstExpr | None = None
     binding: VarRef | None = None
     body: tuple[AstStmt, ...] = ()
 

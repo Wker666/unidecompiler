@@ -31,15 +31,47 @@ def validate_value_invariants(function: FunctionIR) -> tuple[str, ...]:
                 continue
             labels = tuple(label for label, _ in value.incoming)
             if len(labels) != len(set(labels)):
-                diagnostics.append(f"block {block.id}: phi has duplicate predecessor labels")
-                continue
+                if not value.edge_ids:
+                    diagnostics.append(f"block {block.id}: phi has duplicate predecessor labels")
+                    continue
+            if value.edge_ids:
+                if len(value.edge_ids) != len(value.incoming):
+                    diagnostics.append(f"block {block.id}: phi edge identity count does not match incoming values")
+                    continue
+                if len(set(value.edge_ids)) != len(value.edge_ids):
+                    diagnostics.append(f"block {block.id}: phi has duplicate concrete edge identities")
+                    continue
+                # Only a Phi assigned at the physical block entry is keyed by
+                # this block's outer CFG predecessors.  Nested Phis can carry
+                # concrete identities from an already-collapsed child region;
+                # comparing those identities with the outer block's incoming
+                # edges would falsely reject a valid structured value.
+                if _is_block_entry_phi(block, value):
+                    incoming_edges = {edge.edge_id: edge for edge in cfg.incoming_edges(block.id)}
+                    if any(edge_id not in incoming_edges for edge_id in value.edge_ids):
+                        diagnostics.append(f"block {block.id}: phi references an incoming edge outside the CFG")
+                        continue
+                    if set(value.edge_ids) != set(incoming_edges):
+                        diagnostics.append(
+                            f"block {block.id}: phi concrete edges do not completely cover CFG predecessors"
+                        )
+                        continue
+                    # The logical label remains useful for structured
+                    # diagnostics, but a supplied concrete edge must agree
+                    # with its source.
+                    if any(
+                        label not in {edge_id, incoming_edges[edge_id].source}
+                        for label, edge_id in zip(labels, value.edge_ids, strict=True)
+                    ):
+                        diagnostics.append(f"block {block.id}: phi label does not match concrete edge source")
+                        continue
             # Only a Phi assignment at block entry is directly keyed by this
             # block's CFG predecessors.  Nested structured regions have their
             # own logical predecessor labels and are checked for duplicates,
             # but must not be compared with the outer low-level block.
             if not _is_block_entry_phi(block, value):
                 continue
-            if edge_ambiguous:
+            if edge_ambiguous and not value.edge_ids:
                 # A block-keyed Phi cannot prove which parallel edge supplied
                 # an input.  This is a preservation-floor condition, not a
                 # malformed value; callers should retain low-level CFG form.

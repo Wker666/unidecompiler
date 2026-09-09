@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Callable, Generic, Literal, TypeVar
 
 from unidecompiler.core.vm_bytecode import VMBytecodeStep, run_vm_steps
+from unidecompiler.core.cfg import normal_edge_ordinal
 from unidecompiler.core.effects import (
     AssignValueOnBranch,
     BuildArray,
@@ -13,6 +14,7 @@ from unidecompiler.core.effects import (
     InvokeMethod,
     LoadLocal,
     RaiseTop,
+    ReraiseTop,
     ReturnValues,
     ReturnTop,
     ReturnVoid,
@@ -33,6 +35,8 @@ from unidecompiler.core.ir import (
     Const,
     Continue,
     CurrentException,
+    ExceptionResumePosition,
+    ExceptionalTransfer,
     Expr,
     ForEach,
     GetItem,
@@ -215,6 +219,7 @@ class VMControlCFGResult:
     blocks: tuple[tuple[str, tuple[Stmt, ...], Terminator | None], ...]
     issues: tuple["VMControlDiagnostic", ...] = ()
     exception_edges: tuple[tuple[str, "VMExceptionalEdge"], ...] = ()
+    exception_transfers: tuple[tuple[str, ExceptionalTransfer], ...] = ()
     active_exception_handlers: tuple[tuple[str, tuple[str, ...]], ...] = ()
     control_provenance: tuple[SourceRef, ...] = ()
 
@@ -258,6 +263,19 @@ class _ExceptionEdgeState:
 
 
 @dataclass(frozen=True)
+class _ExceptionRegionFact:
+    """A declared protected interval and its neutral handler-entry layout."""
+
+    start: int
+    end: int
+    handler_index: int
+    stack_depth: int | None
+    stack_suffix: tuple[Literal["resume-position", "exception"], ...]
+    source: SourceRef
+    exception_type: object | None = None
+
+
+@dataclass(frozen=True)
 class VMControlDiagnostic:
     message: str
     instruction: int
@@ -273,6 +291,7 @@ class _HandlerFrameKind(str, Enum):
 class _HandlerFrame:
     kind: _HandlerFrameKind
     handler: int
+    from_region: bool = False
 
 
 def lift_stateful_control_prefix(
@@ -298,17 +317,39 @@ def lift_stateful_low_level_cfg(
     instructions: tuple[InstructionT, ...],
     profile: VMRegionProfile[InstructionT],
     callbacks: VMStatefulCallbacks[InstructionT],
+    *,
+    materialize_exception_regions: bool = True,
+    max_work_items: int | None = None,
 ) -> VMControlCFGResult | None:
-    """Build a semantics-preserving low-level CFG when structuring is unsafe."""
+    """Build a semantics-preserving low-level CFG when structuring is unsafe.
+
+    Stateful lifting can revisit a bytecode leader with a different handler
+    context (and with progressively refined Phi values).  That is a finite
+    operation for ordinary inputs, but malformed or unusually nested handler
+    facts can make the worklist grow without converging.  The worklist budget
+    is therefore part of the safety boundary: exceeding it returns the
+    accumulated preservation candidate with an explicit diagnostic, which the
+    caller turns into analyzable unsupported output.  No partially inferred
+    state is silently treated as a successful CFG.
+    """
 
     if not instructions:
         return VMControlCFGResult(blocks=())
-    leaders = _cfg_leaders(instructions, profile)
+    leaders = _cfg_leaders(
+        instructions,
+        profile,
+        materialize_exception_regions=materialize_exception_regions,
+    )
     if not leaders:
         return None
     sorted_leaders = sorted(leaders)
     leader_positions = {leader: position for position, leader in enumerate(sorted_leaders)}
     issues: list[VMControlDiagnostic] = []
+    region_facts = (
+        _declared_exception_region_facts(instructions, profile, issues)
+        if materialize_exception_regions
+        else ()
+    )
     # A handler stack is ordered.  Keeping protected ranges and active
     # exception contexts in separate tuples loses that order: a protected
     # range pushed from inside a handler must be popped before the handler
@@ -327,7 +368,12 @@ def lift_stateful_low_level_cfg(
         ]
         return f"{base}__{'__'.join(suffixes)}"
 
-    entry_key: StateKey = (sorted_leaders[0], ())
+    entry_key: StateKey = (
+        sorted_leaders[0],
+        _region_handler_frames_for_offset(
+            profile.offset(instructions[sorted_leaders[0]]), (), region_facts
+        ),
+    )
     incoming: dict[StateKey, VMLinearState] = {
         entry_key: VMLinearState(locals=callbacks.initial_locals(), stack=())
     }
@@ -336,9 +382,11 @@ def lift_stateful_low_level_cfg(
     # ``existing`` label for the first path loses information that later core
     # structurers need to materialize a merge safely.
     incoming_predecessors: dict[StateKey, tuple[str, ...]] = {entry_key: ()}
+    incoming_edge_ids: dict[StateKey, tuple[str, ...]] = {entry_key: ()}
     lifted_blocks: dict[StateKey, VMLinearState] = {}
     terminators: dict[StateKey, Terminator | None] = {}
     exception_edges: dict[StateKey, tuple[StateKey, SourceRef]] = {}
+    exception_transfers: dict[StateKey, tuple[ExceptionalTransfer, ...]] = {}
     consumed_control_sources: set[SourceRef] = set()
     worklist = [entry_key]
     max_handler_depth = sum(
@@ -347,8 +395,43 @@ def lift_stateful_low_level_cfg(
         for hint in tuple(getattr(instruction, "hints", ()) or ())
         if hint.kind == "exception-handler"
     )
+    # Bound the amount of stateful propagation using all three dimensions that
+    # drive state explosion: source size, CFG split points, and handler-frame
+    # contexts.  The default is deliberately generous for real bytecode, but
+    # deterministic for a given input.  A smaller explicit value is useful for
+    # hosts that want a tighter resource limit and for focused regression tests.
+    handler_frame_state_count = max(1, len(sorted_leaders)) * max(
+        1, max_handler_depth + 1
+    )
+    default_work_budget = max(
+        128,
+        len(instructions) * 8
+        + len(sorted_leaders) * 8
+        + handler_frame_state_count * 4,
+    )
+    work_budget = (
+        default_work_budget
+        if max_work_items is None
+        else max_work_items
+    )
+    if work_budget < 1:
+        raise ValueError("max_work_items must be positive")
+    work_items = 0
 
     while worklist:
+        work_items += 1
+        if work_items > work_budget:
+            current = worklist[0]
+            _append_control_diagnostic(
+                issues,
+                "stateful-cfg-budget-exhausted: "
+                f"processed {work_budget} work items (instructions="
+                f"{len(instructions)}, leaders={len(sorted_leaders)}, "
+                f"handler-frame-states={handler_frame_state_count}); "
+                "preserving the accumulated low-level CFG candidate",
+                current[0],
+            )
+            break
         key = worklist.pop(0)
         start, handler_frames = key
         position = leader_positions[start]
@@ -394,6 +477,21 @@ def lift_stateful_low_level_cfg(
             if protected_position is not None
             else None
         )
+        if _has_incomparable_region_handlers(
+            profile.offset(instructions[start]), region_facts
+        ):
+            _append_control_diagnostic(
+                issues,
+                f"protected instruction at {profile.offset(instructions[start])} "
+                "has incomparable exception handlers",
+                start,
+                category="exception-fact",
+            )
+            # An exception table with competing handlers needs an explicit
+            # dispatch predicate.  Picking the innermost entry would erase
+            # that decision, so leave this block on the analyzable fallback.
+            protected_handler = None
+            protected_position = None
         outgoing_handler_frames = _apply_exception_handler_hints(
             instructions,
             start,
@@ -432,7 +530,16 @@ def lift_stateful_low_level_cfg(
             lifted_blocks[key] = lifted
             terminator = lifted.terminator
         contextual_names = {
-            index: block_name((index, outgoing_handler_frames))
+            index: block_name(
+                (
+                    index,
+                    _region_handler_frames_for_offset(
+                        profile.offset(instructions[index]),
+                        outgoing_handler_frames,
+                        region_facts,
+                    ),
+                )
+            )
             for index in sorted_leaders
         }
         if terminator is None and control_index is not None:
@@ -490,10 +597,225 @@ def lift_stateful_low_level_cfg(
                 )
                 terminators[key] = terminator
             lifted_blocks[key] = outgoing
-        for successor in successors:
+
+        # ``build_cfg`` emits the block's exceptional edge before its normal
+        # terminator edges and assigns one contiguous ordinal sequence to all
+        # outgoing edges.  Compute the same fact before creating edge-labelled
+        # Phi inputs; otherwise a normal ``true:0`` edge here becomes
+        # ``true:1`` in the final CFG whenever an exception edge is present.
+        exact_raise = _statements_end_with_raise(lifted.statements)
+        exact_raise_state = (
+            outgoing
+            if exact_raise
+            and not _contains_ir_node(lifted.statements[:-1], (Call, Raise, Reraise))
+            and not _contains_ir_node(lifted.statements[-1], (Call,))
+            else None
+        )
+        region_exception_state = _exception_region_edge_state(
+            in_state,
+            profile.offset(instructions[start]),
+            protected_handler,
+            region_facts,
+            issues,
+            start,
+            instructions[start].source,
+        )
+        region_exception_states = _exception_region_edge_states(
+            in_state,
+            profile.offset(instructions[start]),
+            region_facts,
+            issues,
+            start,
+            instructions[start].source,
+        )
+        exact_exception_state = (
+            declared_exception_state.state
+            if declared_exception_state is not None
+            else region_exception_state.state
+            if region_exception_state is not None
+            else exact_raise_state
+        )
+        exception_source = (
+            declared_exception_state.source
+            if declared_exception_state is not None
+            else region_exception_state.source
+            if region_exception_state is not None
+            else _exception_source_for_explicit_raise(
+                lifted,
+                instructions[start],
+            )
+        )
+        exception_destinations: tuple[tuple[int, VMLinearState, SourceRef], ...]
+        if declared_exception_state is not None and protected_handler is not None:
+            exception_destinations = (
+                (protected_handler, declared_exception_state.state, declared_exception_state.source),
+            )
+        elif region_exception_states:
+            exception_destinations = tuple(
+                (fact.handler_index, state.state, state.source)
+                for fact, state in region_exception_states
+            )
+        elif protected_handler is not None and exact_raise_state is not None:
+            exception_destinations = (
+                (protected_handler, exact_raise_state, exception_source),
+            )
+        else:
+            exception_destinations = ()
+        exact_exception_state = (
+            exception_destinations[0][1]
+            if exception_destinations
+            else None
+        )
+        exception_source = (
+            exception_destinations[0][2]
+            if exception_destinations
+            else exception_source
+        )
+        ambiguous_exception = _contains_ir_node(
+            (lifted.statements, terminator),
+            (Call, Raise, Reraise),
+        ) and exact_exception_state is None
+        # An active handler without an enclosing protected frame has no
+        # exceptional CFG successor to materialize.  Its explicit generic
+        # Raise/Reraise remains the exact escape behavior.  Requiring an
+        # entry-state proof there would turn a preserved terminal rethrow into
+        # a false recovery failure.  An outer protected frame, however, still
+        # needs the exact incoming state for its concrete exceptional edge.
+        if protected_handler is not None and ambiguous_exception:
+            _append_control_diagnostic(
+                issues,
+                f"cannot prove exceptional state for block at "
+                f"{profile.offset(instructions[start])}",
+                start,
+            )
+
+        # Commit the exceptional merge before ordinary successors.  This is
+        # both the semantic CFG order and the order used by ``build_cfg`` when
+        # assigning outgoing edge ordinals.
+        exception_edge_emitted = False
+        materialized_exception_transfers: list[ExceptionalTransfer] = []
+        for destination_index, (successor, successor_state, destination_source) in enumerate(
+            exception_destinations
+        ):
+            if successor not in leader_positions:
+                continue
+            # Keep any enclosing frames, but replace the selected protected
+            # frame with the concrete handler receiving this transfer.  Equal
+            # interval handlers are parallel alternatives and each gets its
+            # own active target/context.
+            protected_prefix = (
+                handler_frames[:protected_position]
+                if protected_position is not None
+                else handler_frames
+            )
+            successor_frames = (
+                *protected_prefix,
+                _HandlerFrame(
+                    _HandlerFrameKind.ACTIVE,
+                    successor,
+                    from_region=(
+                        handler_frames[protected_position].from_region
+                        if protected_position is not None
+                        else True
+                    ),
+                ),
+            )
+            successor_key = (
+                successor,
+                _region_handler_frames_for_offset(
+                    profile.offset(instructions[successor]),
+                    successor_frames,
+                    region_facts,
+                ),
+            )
+            current = incoming.get(successor_key)
+            predecessor = block_name(key)
+            merged = _merge_low_level_incoming(
+                current,
+                successor_state,
+                predecessor,
+                profile,
+                instructions[successor],
+                current_predecessors=incoming_predecessors.get(successor_key, ()),
+                current_edge_ids=incoming_edge_ids.get(successor_key, ()),
+                incoming_edge_id=(
+                    f"{predecessor}:{block_name(successor_key)}:exception:"
+                    f"{destination_index}"
+                ),
+            )
+            if merged is None:
+                _append_control_diagnostic(
+                    issues,
+                    f"cannot merge exceptional state from "
+                    f"{profile.offset(instructions[start])} into handler "
+                    f"{profile.offset(instructions[successor])}",
+                    start,
+                )
+                _append_control_diagnostic(
+                    issues,
+                    f"exceptional state merge target is handler "
+                    f"{profile.offset(instructions[successor])}",
+                    successor,
+                )
+            else:
+                exception_edge_emitted = True
+                exception_edges.setdefault(key, (successor_key, destination_source))
+                # A worklist revisit refines the incoming stack/Phi state of
+                # this same throwing source.  Replace only that concrete
+                # transfer; another source in the same block remains a real
+                # parallel exceptional edge and must not be discarded.
+                handler_chain = tuple(
+                    f"handler_{profile.offset(instructions[frame.handler])}"
+                    for frame in successor_frames
+                    if frame.kind is _HandlerFrameKind.ACTIVE
+                )
+                replacement = ExceptionalTransfer(
+                    target=block_name(successor_key),
+                    source=destination_source,
+                    ordinal=destination_index,
+                    stack_snapshot=tuple(successor_state.stack),
+                    handler_chain=handler_chain,
+                )
+                materialized_exception_transfers.append(replacement)
+                previous_predecessors = incoming_predecessors.get(successor_key, ())
+                previous_edge_ids = incoming_edge_ids.get(successor_key, ())
+                edge_id = (
+                    f"{predecessor}:{block_name(successor_key)}:exception:"
+                    f"{destination_index}"
+                )
+                if edge_id not in previous_edge_ids:
+                    incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
+                    incoming_edge_ids[successor_key] = (*previous_edge_ids, edge_id)
+                if merged != current:
+                    incoming[successor_key] = merged
+                    if successor_key not in worklist:
+                        worklist.append(successor_key)
+
+        # Replace the complete transfer set for this immutable state key on
+        # every revisit.  A refined incoming state must not leave an obsolete
+        # exceptional edge behind, and equal source/target pairs remain
+        # distinct by their deterministic destination ordinal.
+        exception_transfers[key] = tuple(materialized_exception_transfers)
+
+        successor_edges = (
+            ()
+            if block_raises
+            else _low_level_successor_edges(
+                terminator, contextual_names, sorted_leaders, position
+            )
+        )
+        for successor, edge_kind, edge_ordinal in successor_edges:
+            cfg_edge_ordinal = normal_edge_ordinal(
+                edge_ordinal,
+                exception_transfer_count=len(exception_transfers.get(key, ())),
+            )
             successor_key: StateKey = (
                 successor,
-                outgoing_handler_frames,
+                _region_handler_frames_for_offset(
+                    profile.offset(instructions[successor]),
+                    outgoing_handler_frames,
+                    region_facts,
+                ),
             )
             successor_outgoing = _low_level_successor_state(
                 outgoing,
@@ -513,6 +835,10 @@ def lift_stateful_low_level_cfg(
                 profile,
                 instructions[successor],
                 current_predecessors=incoming_predecessors.get(successor_key, ()),
+                current_edge_ids=incoming_edge_ids.get(successor_key, ()),
+                incoming_edge_id=(
+                    f"{predecessor}:{contextual_names[successor]}:{edge_kind}:{cfg_edge_ordinal}"
+                ),
             )
             if merged is None:
                 _append_control_diagnostic(
@@ -530,92 +856,15 @@ def lift_stateful_low_level_cfg(
                 )
                 continue
             previous_predecessors = incoming_predecessors.get(successor_key, ())
-            if predecessor not in previous_predecessors:
+            previous_edge_ids = incoming_edge_ids.get(successor_key, ())
+            edge_id = f"{predecessor}:{contextual_names[successor]}:{edge_kind}:{cfg_edge_ordinal}"
+            if edge_id not in previous_edge_ids:
                 incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
+                incoming_edge_ids[successor_key] = (*previous_edge_ids, edge_id)
             if merged != current:
                 incoming[successor_key] = merged
                 if successor_key not in worklist:
                     worklist.append(successor_key)
-
-        exact_raise = _statements_end_with_raise(lifted.statements)
-        exact_raise_state = (
-            outgoing
-            if exact_raise
-            and not _contains_ir_node(lifted.statements[:-1], (Call, Raise, Reraise))
-            and not _contains_ir_node(lifted.statements[-1], (Call,))
-            else None
-        )
-        exact_exception_state = (
-            declared_exception_state.state
-            if declared_exception_state is not None
-            else exact_raise_state
-        )
-        exception_source = (
-            declared_exception_state.source
-            if declared_exception_state is not None
-            else _exception_source_for_explicit_raise(
-                lifted,
-                instructions[start],
-            )
-        )
-        ambiguous_exception = _contains_ir_node(
-            (lifted.statements, terminator),
-            (Call, Raise, Reraise),
-        ) and exact_exception_state is None
-        if handler_context is not None and ambiguous_exception:
-            _append_control_diagnostic(
-                issues,
-                f"cannot prove exceptional state for block at "
-                f"{profile.offset(instructions[start])}",
-                start,
-            )
-        if (
-            protected_handler is not None
-            and protected_handler in leader_positions
-            and exact_exception_state is not None
-        ):
-            successor = protected_handler
-            assert protected_position is not None
-            successor_key = (
-                successor,
-                    (
-                        *handler_frames[:protected_position],
-                        _HandlerFrame(_HandlerFrameKind.ACTIVE, protected_handler),
-                    ),
-            )
-            current = incoming.get(successor_key)
-            predecessor = block_name(key)
-            merged = _merge_low_level_incoming(
-                current,
-                exact_exception_state,
-                predecessor,
-                profile,
-                instructions[successor],
-                current_predecessors=incoming_predecessors.get(successor_key, ()),
-            )
-            if merged is None:
-                _append_control_diagnostic(
-                    issues,
-                    f"cannot merge exceptional state from "
-                    f"{profile.offset(instructions[start])} into handler "
-                    f"{profile.offset(instructions[successor])}",
-                    start,
-                )
-                _append_control_diagnostic(
-                    issues,
-                    f"exceptional state merge target is handler "
-                    f"{profile.offset(instructions[successor])}",
-                    successor,
-                )
-            else:
-                exception_edges[key] = (successor_key, exception_source)
-                previous_predecessors = incoming_predecessors.get(successor_key, ())
-                if predecessor not in previous_predecessors:
-                    incoming_predecessors[successor_key] = (*previous_predecessors, predecessor)
-                if merged != current:
-                    incoming[successor_key] = merged
-                    if successor_key not in worklist:
-                        worklist.append(successor_key)
 
     blocks: list[tuple[str, tuple[Stmt, ...], Terminator | None]] = []
     ordered_keys = sorted(
@@ -641,6 +890,11 @@ def lift_stateful_low_level_cfg(
             )
             for source, (target, edge_source) in exception_edges.items()
             if source in lifted_blocks and target in lifted_blocks
+        ),
+        exception_transfers=tuple(
+            (block_name(source), transfer)
+            for source in ordered_keys
+            for transfer in exception_transfers.get(source, ())
         ),
         active_exception_handlers=tuple(
             (
@@ -754,8 +1008,11 @@ def _lift_stateful_control_range(
 def _cfg_leaders(
     instructions: tuple[InstructionT, ...],
     profile: VMRegionProfile[InstructionT],
+    *,
+    materialize_exception_regions: bool = True,
 ) -> set[int]:
     leaders = {0}
+    protected_ranges: list[tuple[int, int]] = []
     for index, instruction in enumerate(instructions):
         for hint in tuple(getattr(instruction, "hints", ()) or ()):
             if hint.kind == "exception-edge-state":
@@ -784,6 +1041,21 @@ def _cfg_leaders(
                 target_index = _instruction_index_by_offset(instructions, offset, profile)
                 if target_index is not None:
                     leaders.add(target_index)
+            start = hint.value.get("start")
+            end = hint.value.get("end")
+            has_edge_layout = materialize_exception_regions and (
+                "stack_depth" in hint.value
+                or "stack_suffix" in hint.value
+                or "push_exception" in hint.value
+            )
+            if (
+                has_edge_layout
+                and isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+            ):
+                protected_ranges.append((start, end))
         if _instruction_has_terminal_effect(instruction):
             leaders.add(index)
             if index + 1 < len(instructions):
@@ -796,6 +1068,15 @@ def _cfg_leaders(
                 leaders.add(target_index)
         if index + 1 < len(instructions):
             leaders.add(index + 1)
+    # An exception can arise at any protected instruction.  Splitting these
+    # blocks gives the exceptional edge the exact pre-instruction stack state;
+    # a later core collapse may merge only a region whose proof survives it.
+    for index, instruction in enumerate(instructions):
+        offset = profile.offset(instruction)
+        if isinstance(offset, int) and any(start <= offset < end for start, end in protected_ranges):
+            leaders.add(index)
+            if index + 1 < len(instructions):
+                leaders.add(index + 1)
     return leaders
 
 
@@ -860,6 +1141,8 @@ def _apply_exception_handler_hints(
                     issues,
                 )
             elif hint.kind == "exception-region":
+                if hint.value is None:
+                    continue
                 if not isinstance(hint.value, dict):
                     consumed_sources.add(hint.source)
                     _append_control_diagnostic(
@@ -880,6 +1163,272 @@ def _apply_exception_handler_hints(
                         hint.source,
                     )
     return tuple(stack)
+
+
+def _declared_exception_region_facts(
+    instructions: tuple[InstructionT, ...],
+    profile: VMRegionProfile[InstructionT],
+    issues: list[VMControlDiagnostic],
+) -> tuple[_ExceptionRegionFact, ...]:
+    """Decode neutral protected-interval facts without recovering structure."""
+
+    facts: list[_ExceptionRegionFact] = []
+    seen: set[tuple[int, int, int, object | None]] = set()
+    for index, instruction in enumerate(instructions):
+        for hint in tuple(getattr(instruction, "hints", ()) or ()):
+            if hint.kind != "exception-region" or not isinstance(hint.value, dict):
+                continue
+            value = hint.value
+            start, end, target = (value.get(name) for name in ("start", "end", "target"))
+            if not all(
+                isinstance(item, int) and not isinstance(item, bool)
+                for item in (start, end, target)
+            ):
+                continue
+            handler_index = _instruction_index_by_offset(instructions, target, profile)
+            if handler_index is None:
+                _append_control_diagnostic(
+                    issues,
+                    f"exception region at {profile.offset(instruction)} references "
+                    f"missing handler {target}",
+                    index,
+                    category="exception-fact",
+                )
+                continue
+            key = (start, end, target, value.get("exception_type"))
+            if key in seen:
+                continue
+            seen.add(key)
+            # A generic ``depth`` is already consumed by the existing typed
+            # Try recovery and is not automatically an exception-entry stack
+            # layout.  Only the explicit layout field opts into CFG edge
+            # materialization here.
+            stack_depth = value.get("stack_depth")
+            if stack_depth is not None and (
+                not isinstance(stack_depth, int)
+                or isinstance(stack_depth, bool)
+                or stack_depth < 0
+            ):
+                _append_control_diagnostic(
+                    issues,
+                    f"exception region at {profile.offset(instruction)} requires "
+                    "a non-negative stack_depth",
+                    index,
+                    category="exception-fact",
+                )
+                continue
+            stack_suffix = value.get("stack_suffix")
+            if stack_suffix is None:
+                legacy_push = value.get("push_exception")
+                if legacy_push is not None and not isinstance(legacy_push, bool):
+                    _append_control_diagnostic(
+                        issues,
+                        f"exception region at {profile.offset(instruction)} requires "
+                        "boolean push_exception",
+                        index,
+                        category="exception-fact",
+                    )
+                    continue
+                if stack_depth is None and legacy_push is None:
+                    continue
+                stack_suffix = (("exception",) if legacy_push else ())
+            if (
+                not isinstance(stack_suffix, (tuple, list))
+                or any(slot not in {"resume-position", "exception"} for slot in stack_suffix)
+                or len(set(stack_suffix)) != len(stack_suffix)
+            ):
+                _append_control_diagnostic(
+                    issues,
+                    f"exception region at {profile.offset(instruction)} has invalid "
+                    "stack_suffix",
+                    index,
+                    category="exception-fact",
+                )
+                continue
+            facts.append(
+                _ExceptionRegionFact(
+                    start=start,
+                    end=end,
+                    handler_index=handler_index,
+                    stack_depth=stack_depth,
+                    stack_suffix=tuple(stack_suffix),
+                    source=hint.source,
+                    exception_type=value.get("exception_type"),
+                )
+            )
+    return tuple(
+        sorted(
+            facts,
+            key=lambda fact: (fact.start, -fact.end, fact.handler_index),
+        )
+    )
+
+
+def _region_handler_frames_for_offset(
+    offset: int | None,
+    frames: tuple[_HandlerFrame, ...],
+    facts: tuple[_ExceptionRegionFact, ...],
+) -> tuple[_HandlerFrame, ...]:
+    """Refresh only interval-owned protected frames at one CFG location."""
+
+    explicit = tuple(
+        frame
+        for frame in frames
+        if not (frame.from_region and frame.kind is _HandlerFrameKind.PROTECTED)
+    )
+    if offset is None:
+        return explicit
+    covering = tuple(
+        fact
+        for fact in facts
+        if fact.stack_depth is not None and fact.start <= offset < fact.end
+    )
+    region_frames = tuple(
+        _HandlerFrame(
+            kind=_HandlerFrameKind.PROTECTED,
+            handler=fact.handler_index,
+            from_region=True,
+        )
+        for fact in covering
+    )
+    return (*explicit, *region_frames)
+
+
+def _has_incomparable_region_handlers(
+    offset: int | None,
+    facts: tuple[_ExceptionRegionFact, ...],
+) -> bool:
+    """Detect overlapping exception facts that lack a unique dispatch path.
+
+    Properly nested intervals are ordered: an exception transfers to the
+    innermost handler and its active handler chain preserves the outer scope.
+    Equal or crossing intervals with different targets are incomparable.  The
+    generic exceptional-transfer model deliberately has no frontend-specific
+    matching predicate, so selecting one of those entries would be a lossy
+    recovery decision.
+    """
+
+    if offset is None:
+        return False
+    covering = tuple(
+        fact for fact in facts if fact.start <= offset < fact.end
+    )
+    return any(
+        left.handler_index != right.handler_index
+        and (
+            left.start < right.start < left.end < right.end
+            or right.start < left.start < right.end < left.end
+        )
+        for index, left in enumerate(covering)
+        for right in covering[index + 1 :]
+    )
+
+
+def _exception_region_edge_state(
+    incoming: VMLinearState,
+    offset: int | None,
+    handler: int | None,
+    facts: tuple[_ExceptionRegionFact, ...],
+    issues: list[VMControlDiagnostic],
+    index: int,
+    source: SourceRef,
+) -> _ExceptionEdgeState | None:
+    """Materialize one proven handler-entry stack from a protected interval."""
+
+    if offset is None or handler is None:
+        return None
+    matches = tuple(
+        fact
+        for fact in facts
+        if fact.handler_index == handler and fact.start <= offset < fact.end
+    )
+    if not matches:
+        return None
+    if len(matches) != 1:
+        _append_control_diagnostic(
+            issues,
+            f"protected instruction at {offset} has ambiguous exception handlers",
+            index,
+            category="exception-fact",
+        )
+        return None
+    fact = matches[0]
+    if fact.stack_depth is None or fact.stack_depth > len(incoming.stack):
+        _append_control_diagnostic(
+            issues,
+            f"protected instruction at {offset} cannot prove exception entry "
+            "stack depth",
+            index,
+            category="exception-fact",
+        )
+        return None
+    suffix: list[Expr] = []
+    for slot in fact.stack_suffix:
+        if slot == "resume-position":
+            suffix.append(ExceptionResumePosition(source=source))
+        elif slot == "exception":
+            suffix.append(CurrentException(source=source))
+        else:  # The fact decoder rejects unknown slots before this point.
+            raise AssertionError(f"unexpected exception stack slot {slot!r}")
+    return _ExceptionEdgeState(
+        state=VMLinearState(
+            locals=incoming.locals.copy(),
+            stack=(*incoming.stack[:fact.stack_depth], *suffix),
+        ),
+        source=source,
+    )
+
+
+def _exception_region_edge_states(
+    incoming: VMLinearState,
+    offset: int | None,
+    facts: tuple[_ExceptionRegionFact, ...],
+    issues: list[VMControlDiagnostic],
+    index: int,
+    source: SourceRef,
+) -> tuple[tuple[_ExceptionRegionFact, _ExceptionEdgeState], ...]:
+    """Materialize every handler edge for the innermost protected interval.
+
+    Equal JVM-style exception-table entries are ordered parallel dispatch
+    alternatives, not an ambiguous overlap.  Preserve one concrete state per
+    handler target; only crossing intervals remain rejected by
+    ``_has_incomparable_region_handlers``.  Properly nested intervals select
+    the innermost ``(start, end)`` pair and retain its full parallel set.
+    """
+
+    if offset is None:
+        return ()
+    covering = tuple(fact for fact in facts if fact.start <= offset < fact.end)
+    if not covering:
+        return ()
+    if _has_incomparable_region_handlers(offset, facts):
+        # Crossing intervals have no neutral dispatch order.  The caller
+        # will retain the preservation CFG/diagnostic rather than selecting
+        # one handler and silently losing another edge.
+        return ()
+    innermost_start = max(fact.start for fact in covering)
+    innermost_end = min(
+        fact.end for fact in covering if fact.start == innermost_start
+    )
+    selected = tuple(
+        fact
+        for fact in covering
+        if fact.start == innermost_start and fact.end == innermost_end
+    )
+    states: list[tuple[_ExceptionRegionFact, _ExceptionEdgeState]] = []
+    for fact in selected:
+        state = _exception_region_edge_state(
+            incoming,
+            offset,
+            fact.handler_index,
+            facts,
+            issues,
+            index,
+            source,
+        )
+        if state is not None:
+            states.append((fact, state))
+    return tuple(states)
 
 
 def _apply_exception_handler_pop_hint(
@@ -1202,7 +1751,10 @@ def _first_terminal_effect_index(
 
 def _instruction_has_terminal_effect(instruction: InstructionT) -> bool:
     return any(
-        isinstance(effect, (ReturnTop, ReturnValues, ReturnVoid, RaiseTop))
+        isinstance(
+            effect,
+            (ReturnTop, ReturnValues, ReturnVoid, RaiseTop, ReraiseTop),
+        )
         for effect in tuple(getattr(instruction, "effects", ()) or ())
     )
 
@@ -1349,28 +1901,48 @@ def _low_level_successors(
     sorted_leaders: list[int],
     position: int,
 ) -> tuple[int, ...]:
+    return tuple(dict.fromkeys(
+        target
+        for target, _kind, _ordinal in _low_level_successor_edges(
+            terminator, leader_names, sorted_leaders, position
+        )
+    ))
+
+
+def _low_level_successor_edges(
+    terminator: Terminator | None,
+    leader_names: dict[int, str],
+    sorted_leaders: list[int],
+    position: int,
+) -> tuple[tuple[int, str, int], ...]:
+    """Return concrete successor edges without collapsing parallel targets."""
+
     name_to_leader = {name: leader for leader, name in leader_names.items()}
+    result: list[tuple[int, str, int]] = []
+
+    def add(name: str, kind: str) -> None:
+        target = name_to_leader.get(name)
+        if target is None:
+            return
+        ordinal = len(result)
+        result.append((target, kind, ordinal))
+
     if isinstance(terminator, Jump):
-        target = name_to_leader.get(terminator.target)
-        return () if target is None else (target,)
+        add(terminator.target, "jump")
+        return tuple(result)
     if isinstance(terminator, Branch):
-        targets = []
-        for name in (terminator.true_target, terminator.false_target):
-            target = name_to_leader.get(name)
-            if target is not None and target not in targets:
-                targets.append(target)
-        return tuple(targets)
+        add(terminator.true_target, "true")
+        add(terminator.false_target, "false")
+        return tuple(result)
     if isinstance(terminator, MultiBranch):
-        targets = []
-        for name in (*[target for _value, target in terminator.cases], terminator.default_target):
-            target = name_to_leader.get(name)
-            if target is not None and target not in targets:
-                targets.append(target)
-        return tuple(targets)
+        for value, target_name in terminator.cases:
+            add(target_name, f"case:{getattr(value, 'value', value)}")
+        add(terminator.default_target, "default")
+        return tuple(result)
     if isinstance(terminator, Return):
         return ()
     if position + 1 < len(sorted_leaders):
-        return (sorted_leaders[position + 1],)
+        return ((sorted_leaders[position + 1], "fallthrough", 0),)
     return ()
 
 
@@ -1554,6 +2126,8 @@ def _merge_low_level_incoming(
     instruction: InstructionT,
     *,
     current_predecessors: tuple[str, ...] = (),
+    current_edge_ids: tuple[str, ...] = (),
+    incoming_edge_id: str | None = None,
 ) -> VMLinearState | None:
     if current is None:
         return incoming
@@ -1571,6 +2145,8 @@ def _merge_low_level_incoming(
             source,
             suffix=name,
             current_predecessors=current_predecessors,
+            current_edge_ids=current_edge_ids,
+            incoming_edge_id=incoming_edge_id,
         )
         if isinstance(merged, Phi):
             merged = _collapse_redundant_phi(merged)
@@ -1588,6 +2164,8 @@ def _merge_low_level_incoming(
             source,
             suffix=f"stack{index}",
             current_predecessors=current_predecessors,
+            current_edge_ids=current_edge_ids,
+            incoming_edge_id=incoming_edge_id,
         )
         if isinstance(merged, Phi):
             merged = _collapse_redundant_phi(merged)
@@ -1611,6 +2189,8 @@ def _merge_phi_expr(
     *,
     suffix: str = "value",
     current_predecessors: tuple[str, ...] = (),
+    current_edge_ids: tuple[str, ...] = (),
+    incoming_edge_id: str | None = None,
 ) -> Expr:
     if isinstance(current, Phi):
         normalized_current = _collapse_redundant_phi(current)
@@ -1624,8 +2204,37 @@ def _merge_phi_expr(
                 source,
                 suffix=suffix,
                 current_predecessors=current_predecessors,
+                current_edge_ids=current_edge_ids,
+                incoming_edge_id=incoming_edge_id,
             )
         pairs = list(current.incoming)
+        edge_ids = list(current.edge_ids)
+        if not edge_ids and len(current_edge_ids) == len(pairs):
+            edge_ids = list(current_edge_ids)
+        if edge_ids and incoming_edge_id is not None:
+            for index, edge_id in enumerate(edge_ids):
+                if edge_id != incoming_edge_id:
+                    continue
+                if index < len(pairs) and not isinstance(incoming, Phi):
+                    pairs[index] = (pairs[index][0], incoming)
+                return _collapse_redundant_phi(
+                    Phi(
+                        source=current.source or source,
+                        incoming=tuple(pairs),
+                        edge_ids=tuple(edge_ids),
+                    )
+                )
+            # Concrete edge identity is authoritative. Parallel edges may
+            # share one predecessor label but carry different values.
+            pairs.append((predecessor, incoming))
+            edge_ids.append(incoming_edge_id)
+            return _collapse_redundant_phi(
+                Phi(
+                    source=current.source or source,
+                    incoming=tuple(pairs),
+                    edge_ids=tuple(edge_ids),
+                )
+            )
         # A merge may revisit the same concrete predecessor while a loop
         # header is being evaluated.  Phi labels are edge identities and must
         # remain unique; update an existing label rather than appending a
@@ -1641,12 +2250,30 @@ def _merge_phi_expr(
                     return _collapse_redundant_phi(current)
                 pairs[index] = (pred, incoming)
                 return _collapse_redundant_phi(
-                    Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+                    Phi(
+                        source=current.source or source,
+                        incoming=(
+                            tuple(pairs)
+                            if edge_ids
+                            else tuple(sorted(pairs, key=lambda item: item[0]))
+                        ),
+                        edge_ids=tuple(edge_ids),
+                    )
                 )
             return current
         pairs.append((predecessor, incoming))
+        if edge_ids or incoming_edge_id is not None:
+            edge_ids.append(incoming_edge_id or predecessor)
         return _collapse_redundant_phi(
-            Phi(source=current.source or source, incoming=tuple(sorted(pairs, key=lambda item: item[0])))
+            Phi(
+                source=current.source or source,
+                incoming=(
+                    tuple(pairs)
+                    if edge_ids
+                    else tuple(sorted(pairs, key=lambda item: item[0]))
+                ),
+                edge_ids=tuple(edge_ids),
+            )
         )
     if _same_logical_expr(current, incoming):
         return current
@@ -1654,6 +2281,35 @@ def _merge_phi_expr(
     # when a loop backedge reaches a header more than once.  Build a keyed
     # sequence and replace that label instead of emitting duplicate Phi
     # predecessors (which are invalid and cannot be rendered safely).
+    if current_edge_ids or incoming_edge_id is not None:
+        previous_edges = current_edge_ids or tuple(current_predecessors)
+        # A worklist may revisit a block after the state on an already known
+        # concrete edge becomes more precise.  That is a data-flow update,
+        # not a second predecessor.  Replacing the value at the existing
+        # edge position keeps Phi cardinality aligned with the final CFG and
+        # avoids manufacturing duplicate labels such as ``P, P``.
+        if incoming_edge_id is not None and incoming_edge_id in previous_edges:
+            edge_index = previous_edges.index(incoming_edge_id)
+            labelled_current = tuple(
+                (pred, incoming if index == edge_index else current)
+                for index, (pred, _edge_id) in enumerate(
+                    zip(current_predecessors, previous_edges, strict=False)
+                )
+            )
+            if edge_index >= len(labelled_current):
+                return current
+            return _collapse_redundant_phi(
+                Phi(source=source, incoming=labelled_current, edge_ids=previous_edges)
+            )
+        labelled_current = tuple(
+            (pred, current)
+            for pred, _edge_id in zip(current_predecessors, previous_edges, strict=False)
+        )
+        labelled_current += ((predecessor, incoming),)
+        edge_ids = (*previous_edges, incoming_edge_id or predecessor)
+        return _collapse_redundant_phi(
+            Phi(source=source, incoming=labelled_current, edge_ids=edge_ids)
+        )
     unique_predecessors = tuple(dict.fromkeys(current_predecessors))
     if unique_predecessors:
         predecessor_values = {
@@ -1689,20 +2345,28 @@ def _collapse_redundant_phi(value: Phi) -> Expr:
         # and must remain visible to the invariant validator rather than being
         # silently collapsed through a dictionary.
         normalized = tuple(
-            (label, _collapse_redundant_phi(incoming) if isinstance(incoming, Phi) else incoming)
-            for label, incoming in current.incoming
-        )
+                (label, _collapse_redundant_phi(incoming) if isinstance(incoming, Phi) else incoming)
+                for label, incoming in current.incoming
+            )
         if len(normalized) == 1:
             label, nested = normalized[0]
             if isinstance(nested, Phi):
                 # A one-edge Phi wrapping another Phi is only a merge-state
-                # artifact.  The nested node already carries all known edge
-                # values; retaining the wrapper creates repeated labels such
-                # as ``P: phi(P: ...)`` and violates the Phi contract.
-                current = nested
-                continue
+                # artifact when both nodes describe the same concrete edge
+                # domain.  If the wrapper edge is different, it represents a
+                # real region boundary (for example ``block_40 -> block_64``
+                # containing a child merge from ``block_30``/``block_136``)
+                # and must remain visible to the outer CFG validator.
+                if not current.edge_ids or not nested.edge_ids or current.edge_ids == nested.edge_ids:
+                    current = nested
+                    continue
         if normalized != current.incoming:
-            current = Phi(source=current.source, type=current.type, incoming=normalized)
+            current = Phi(
+                source=current.source,
+                type=current.type,
+                incoming=normalized,
+                edge_ids=current.edge_ids,
+            )
         break
     return current
 
@@ -1728,6 +2392,8 @@ def _same_logical_expr_seen(left: Expr, right: Expr, seen: set[tuple[int, int]])
         return True
     if isinstance(left, Phi) and isinstance(right, Phi):
         if len(left.incoming) != len(right.incoming):
+            return False
+        if left.edge_ids != right.edge_ids:
             return False
         left_incoming = dict(left.incoming)
         right_incoming = dict(right.incoming)

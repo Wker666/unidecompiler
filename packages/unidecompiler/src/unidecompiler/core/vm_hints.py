@@ -25,6 +25,7 @@ VMHintKind = Literal[
 
 VMControlFlowKind = Literal["conditional", "unconditional", "multiway"]
 VMExceptionHandlerFrameKind = Literal["active", "protected", "any"]
+VMExceptionStackSlot = Literal["resume-position", "exception"]
 
 
 class VMExceptionEdgeStateValue(TypedDict, total=False):
@@ -36,6 +37,7 @@ class VMExceptionEdgeStateValue(TypedDict, total=False):
 
     stack_depth: int
     push_exception: bool
+    stack_suffix: tuple[VMExceptionStackSlot, ...]
     handler: int
 
 

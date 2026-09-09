@@ -42,6 +42,7 @@ from unidecompiler.core.effects import (
     RaiseTop,
     RaiseWithCause,
     ReraiseTop,
+    RewriteException,
     ResumeValue,
     ReturnTop,
     ReturnVoid,
@@ -261,7 +262,29 @@ def _load_from_dict_or_globals(_context, instruction, source: SourceRef) -> tupl
 
 
 def _call_intrinsic_1(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
-    return (CallTopAs(source=source, callee_name=str(instruction.argval or instruction.argrepr or "intrinsic")),)
+    name = str(instruction.argrepr or instruction.argval or "intrinsic")
+    if name == "INTRINSIC_STOPITERATION_ERROR":
+        # CPython conditionally replaces StopIteration-family exceptions and
+        # retains the original as cause/context.  This remains a generic
+        # value rewrite; core owns its stack lift and conservative rendering.
+        return (
+            RewriteException(
+                source=source,
+                predicate=Const(value="stop-iteration-family", source=source),
+                replacement=Const(value="runtime-error-from-input", source=source),
+                retain_input_as_cause=True,
+            ),
+        )
+    # ``arg``/``argval`` is an implementation ordinal.  The decoded text is
+    # the only presentation-safe identity for an opaque intrinsic operation;
+    # retain it as data and leave any execution semantics outside this thin
+    # effect table.
+    return (
+        CallTopAs(
+            source=source,
+            callee_name=name,
+        ),
+    )
 
 
 def _before_with(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
@@ -527,6 +550,17 @@ def _raise_varargs(_context, instruction, source: SourceRef) -> tuple[Effect, ..
     return (RaiseTop(source=source),)
 
 
+def _reraise(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
+    count = _instruction_count(instruction)
+    return (
+        ReraiseTop(
+            source=source,
+            consume_stack_exception=True,
+            resume_slot_count=count,
+        ),
+    )
+
+
 def _yield_value(_context, instruction, source: SourceRef) -> tuple[Effect, ...]:
     if instruction.arg in {1, 2}:
         return ()
@@ -704,7 +738,7 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
         "RETURN_CONST": _return_const,
         "INSTRUMENTED_RETURN_CONST": _return_const,
         "RAISE_VARARGS": _raise_varargs,
-        "RERAISE": lambda _context, _instruction, source: (ReraiseTop(source=source),),
+        "RERAISE": _reraise,
         "YIELD_VALUE": _yield_value,
         "INSTRUMENTED_YIELD_VALUE": _yield_value,
         "SEND": _send,
@@ -808,6 +842,14 @@ def _python_bytecode_steps(
                     "target": region.target,
                     "depth": region.depth,
                     "lasti": region.lasti,
+                    # The exception table declares the handler's input stack
+                    # layout.  These are VM-neutral stack facts; core owns
+                    # all CFG construction and recovery decisions.
+                    "stack_depth": region.depth,
+                    "stack_suffix": (
+                        *(("resume-position",) if region.lasti else ()),
+                        "exception",
+                    ),
                 },
                 label="protected-region",
             )

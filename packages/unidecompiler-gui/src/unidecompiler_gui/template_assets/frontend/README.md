@@ -46,3 +46,11 @@ return arity, and raise/suspend/mutation facts. It is metadata, never an
 executor. Unknown calls conservatively form mutation barriers for deferred
 stack values. Core's pass manager owns fixed-point budgets and repeated-state
 diagnostics; a frontend must not implement its own CFG recovery loop.
+
+Core records recovery evidence on the generic function. Accepted rewrites carry
+the rule, concrete block/edge IDs, CFG snapshot key, and raw context in
+`metadata["recovery_proofs"]`; rejected candidates use
+`metadata["recovery_rejections"]`. The shared validator checks edge targets,
+parallel-edge ordinals, exception provenance, metadata preservation, terminal
+behavior, and literal content before allowing a rewrite. Frontend code must
+only submit facts and must not consume these records to steer recovery.

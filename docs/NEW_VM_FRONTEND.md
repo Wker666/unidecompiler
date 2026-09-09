@@ -171,6 +171,18 @@ non-progress is reported with the last verified `FunctionIR`; it must never be
 silently converted into guessed structure. Refinement diagnostics retain the
 available instruction window, raw opcode, decoded operands, and branch hints.
 
+### 0.5.3 Rewrite proof and CFG consistency evidence
+
+Before core accepts a region rewrite, a shared validator checks the immutable
+CFG snapshot, concrete parallel-edge identities and ordinals, block/target
+existence, exception metadata/provenance, preserved metadata, terminal behavior,
+literal atoms, and the candidate's progress proof. Accepted candidates record
+`metadata["recovery_proofs"]`; rejected candidates record
+`metadata["recovery_rejections"]` with the rule, block/edge IDs, and reasons. Fixed
+point repetition or budget exhaustion is recorded as a diagnostic and returns
+the last verified function. These are audit records only: a frontend must not
+use them as a substitute for thin IR facts or perform recovery itself.
+
 ## 0. First clarify the boundaries of frontend
 
 Frontend can do:

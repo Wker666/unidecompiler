@@ -4,8 +4,8 @@ from dataclasses import dataclass, fields, is_dataclass
 from dataclasses import replace
 from typing import Any, Callable, Generic, TypeVar
 
-from unidecompiler.core.cfg import build_cfg
-from unidecompiler.core.effects import BuildArray, ExceptionMatch, Push, RaiseTop, RaiseWithCause, ReraiseTop, ReturnTop, StoreLocal
+from unidecompiler.core.cfg import build_cfg, validate_cfg_consistency
+from unidecompiler.core.effects import BuildArray, Copy, ExceptionMatch, Pop, Push, RaiseTop, RaiseWithCause, ReraiseTop, ReturnTop, StoreLocal, Swap
 from unidecompiler.core.function_assembly import FunctionBlockSpec, assemble_entry_function
 from unidecompiler.core.function_assembly import assemble_function
 from unidecompiler.core.function_assembly import assemble_function_without_blocks
@@ -25,11 +25,15 @@ from unidecompiler.core.ir import (
     Const,
     Continue,
     CurrentException,
+    ExceptionResumePosition,
+    DoWhile,
     Expr,
     ExprStmt,
     ExceptionalEdge,
+    ExceptionalTransfer,
     ForEach,
     ForRange,
+    Fallthrough,
     FunctionIR,
     GetAttr,
     GetItem,
@@ -58,12 +62,14 @@ from unidecompiler.core.ir import (
     Var,
     While,
     Yield,
+    exceptional_transfers,
 )
 from unidecompiler.core.stack_machine import StackLiftResult
 from unidecompiler.core.vm_bytecode import VMBytecodeStep, normalize_vm_steps, run_vm_steps
 from unidecompiler.core.vm_region import (
     VMRegionCallbacks,
     VMLinearState,
+    VMRegionSlice,
     VMRegionProfile,
     VMStatefulCallbacks,
     lift_control_region,
@@ -71,6 +77,7 @@ from unidecompiler.core.vm_region import (
     lift_stateful_control_prefix,
 )
 from unidecompiler.core.vm_structures import contains_vm_unsupported, is_vm_return, vm_return
+from unidecompiler.core.region import ProtectedRegionView
 
 
 InputT = TypeVar("InputT")
@@ -141,22 +148,22 @@ def lift_linear_vm_function(
     if result.stopped_at is not None and result.state.terminator is None:
         return unsupported_vm_function(spec, (result.stopped_at.opcode,), structured_lift=structured_lift)
     if result.state.terminator is None and _ends_with_raise(tuple(result.state.statements)):
-        return entry_vm_function(
+        return finalize_recovered_vm_function(spec, entry_vm_function(
             spec,
             statements=tuple(result.state.statements),
             terminator=None,
             status="ok",
             structured_lift=structured_lift,
-        )
+        ))
     if result.state.terminator is None:
         return unsupported_vm_function(spec, ("missing-return",), structured_lift=structured_lift)
-    return entry_vm_function(
+    return finalize_recovered_vm_function(spec, entry_vm_function(
         spec,
         statements=tuple(result.state.statements),
         terminator=result.state.terminator,
         status="ok",
         structured_lift=structured_lift,
-    )
+    ))
 
 
 def lift_vm_step_function(
@@ -186,10 +193,15 @@ def lift_vm_step_function(
         and not metadata.get("unsupported_context")
     ):
         unsupported_opcodes = frozenset(metadata.get("unsupported_opcodes", ()))
+        unsupported_sources = frozenset(
+            source
+            for source in metadata.get("unrenderable_expression_sources", ())
+            if isinstance(source, SourceRef)
+        )
         indexes = tuple(
             index
             for index, step in enumerate(steps)
-            if step.opcode in unsupported_opcodes
+            if step.opcode in unsupported_opcodes or step.source in unsupported_sources
         )
         metadata["unsupported_context"] = _unsupported_context_for_indexes(
             steps,
@@ -289,6 +301,16 @@ def _lift_vm_step_function(
     if not steps:
         return entry_vm_function(spec, terminator=vm_return(source=SourceRef(frontend=spec.frontend)), structured_lift="empty")
     if profile is not None and stateful_callbacks is not None and _has_exception_region_facts(steps):
+        transparent_body = _lift_transparent_exception_body(
+            spec,
+            steps,
+            profile,
+            callbacks,
+            stateful_callbacks,
+            raw_window,
+        ) if callbacks is not None else None
+        if transparent_body is not None:
+            return transparent_body
         protected = _lift_exception_region_candidate(
             spec,
             steps,
@@ -299,6 +321,41 @@ def _lift_vm_step_function(
         )
         if protected is not None:
             return protected
+        transparent_exception_regions = _has_pure_propagating_exception_regions(
+            steps, profile
+        )
+        propagating = _lift_propagating_exception_region_candidate(
+            spec,
+            steps,
+            profile,
+            stateful_callbacks,
+            raw_window,
+        )
+        if propagating is not None:
+            return propagating
+        if not transparent_exception_regions:
+            # An exception-region hint is an executable control-flow fact,
+            # not a best-effort structuring suggestion.  If the narrow
+            # structured proof above cannot establish a safe representation,
+            # retain the exact exceptional CFG or report it as unsupported.
+            low_level = _lift_low_level_cfg_candidate(
+                spec, steps, profile, stateful_callbacks, raw_window
+            )
+            if (
+                low_level is not None
+                and _low_level_preserves_exception_regions(low_level, steps)
+            ):
+                return low_level
+            return _unsupported_low_level_failure(
+                spec,
+                steps,
+                reason=(
+                    "exception-region could not be safely represented; "
+                    "the preservation CFG lacks complete exceptional edges"
+                ),
+                raw_window=raw_window,
+                indexes=tuple(range(len(steps))),
+            )
     if (
         profile is not None
         and stateful_callbacks is not None
@@ -442,6 +499,234 @@ def _lift_vm_step_function(
         unsupported_opcodes=_unsupported_opcodes_from_statements(statements),
         structured_lift="generic-vm-pipeline",
     ))
+
+
+def _lift_transparent_exception_body(
+    spec: VMFunctionSpec,
+    steps: tuple[VMBytecodeStep, ...],
+    profile: VMRegionProfile[VMBytecodeStep],
+    callbacks: VMRegionCallbacks[VMBytecodeStep],
+    stateful_callbacks: VMStatefulCallbacks[VMBytecodeStep],
+    raw_window: Callable[[int], tuple[str, ...]] | None,
+) -> FunctionIR | None:
+    """Recover a complete normal body with a proven propagating cleanup tail.
+
+    Some stack VMs append compiler cleanup blocks after an otherwise ordinary
+    function body.  When every declared exception range enters one of those
+    tails and the normal prefix is fully structured, a catch-all generic
+    rethrow preserves the observable exceptional outcome without exposing VM
+    cleanup instructions as low-level CFG.  The proof declines any region
+    whose handler contains a normal continuation or non-terminal operation.
+    """
+
+    groups = _non_overlapping_exception_region_groups(steps)
+    if not groups:
+        return None
+    # This shortcut may only replace one *complete* protected interval.  It
+    # cannot turn a prefix containing uncovered spans into a Try: whether an
+    # expression raises in one of those gaps is observable.  More complicated
+    # interval layouts stay in the preservation CFG until protected-region
+    # collapse has a proof for each interval.
+    outer_entries = tuple(
+        entry
+        for group in groups
+        for entry in group.get("entries", ())
+        if isinstance(entry, dict)
+        and entry.get("depth") == 0
+        and isinstance(entry.get("target"), int)
+    )
+    if not outer_entries:
+        return None
+    preservation = lift_stateful_low_level_cfg(
+        steps, profile, stateful_callbacks, materialize_exception_regions=True
+    )
+    if preservation is None or not preservation.blocks:
+        return None
+    preservation_function = _assemble_low_level_cfg(spec, preservation)
+    preservation_cfg = build_cfg(preservation_function)
+    if preservation_cfg.diagnostics or validate_cfg_consistency(preservation_cfg):
+        return None
+    targets = {entry["target"] for entry in outer_entries}
+    if len(targets) != 1:
+        return None
+    # This shortcut synthesizes only the two generic handler values it can
+    # prove (optional resume position and current exception).  Richer entry
+    # contracts must stay on the preservation CFG until a dedicated protected
+    # region rewrite remaps their concrete stack snapshot exactly.
+    entry_contracts = {
+        (
+            entry.get("target"),
+            entry.get("depth"),
+            entry.get("lasti"),
+            entry.get("stack_depth"),
+            tuple(entry.get("stack_suffix", ()))
+            if isinstance(entry.get("stack_suffix", ()), (tuple, list))
+            else entry.get("stack_suffix"),
+            entry.get("push_exception"),
+        )
+        for entry in outer_entries
+    }
+    if len(entry_contracts) != 1:
+        return None
+    contract = next(iter(entry_contracts))
+    stack_depth = contract[3]
+    stack_suffix = contract[4]
+    push_exception = contract[5]
+    if stack_depth not in (None, 0):
+        return None
+    if stack_suffix not in (None, ()) and (
+        not isinstance(stack_suffix, tuple)
+        or any(slot not in {"resume-position", "exception"} for slot in stack_suffix)
+        or len(set(stack_suffix)) != len(stack_suffix)
+    ):
+        return None
+    if stack_suffix in (None, ()) and push_exception not in (None, False, True):
+        return None
+    target = next(iter(targets))
+    assert isinstance(target, int)
+    target_index = _step_index_at_offset(steps, target, profile)
+    starts = [entry.get("start") for entry in outer_entries]
+    ends = [entry.get("end") for entry in outer_entries]
+    if not all(isinstance(value, int) for value in (*starts, *ends)):
+        return None
+    start = min(starts)
+    end = max(ends)
+    if (
+        target_index is None
+        or not steps
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+    ):
+        return None
+    start_index = _step_index_at_offset(steps, start, profile)
+    if start_index is None:
+        return None
+    # Every instruction pulled into the synthesized Try must either be
+    # protected by a declared entry or demonstrably non-throwing.  Checking
+    # only the interval envelope is insufficient: bytecode between the final
+    # protected endpoint and the cleanup handler is also included in ``body``
+    # below, and widening exception coverage across a throwing instruction
+    # changes observable handler side effects and escape behavior.
+    intervals = tuple(
+        (hint.value["start"], hint.value["end"])
+        for step in steps
+        for hint in step.hints
+        if hint.kind == "exception-region"
+        and isinstance(hint.value, dict)
+        and isinstance(hint.value.get("start"), int)
+        and isinstance(hint.value.get("end"), int)
+    )
+    normal_end = target_index
+    for index in range(0, normal_end):
+        offset = profile.offset(steps[index])
+        if not isinstance(offset, int) or any(left <= offset < right for left, right in intervals):
+            continue
+        if not _step_exception_free_gap(steps[index]):
+            return None
+    body = lift_control_region(steps, 0, normal_end, profile, callbacks, ())
+    if not body or any(contains_vm_unsupported(statement) for statement in body):
+        return None
+    # A target reached by an ordinary branch is not a cleanup-only handler;
+    # wrapping it as catch-all would change normal control flow.
+    if any(
+        profile.is_control(step)
+        and profile.target_offset(step) == target
+        and profile.is_jump(step)
+        for step in steps[:normal_end]
+    ):
+        return None
+    handler_sources: list[SourceRef] = []
+    handler_bodies: list[tuple[Stmt | object, ...]] = []
+    index = target_index
+    region = outer_entries[0]
+    # A handler's declared suffix is ordered VM state.  Preserve the concrete
+    # values used by any generic cleanup/rewrite before its terminal rethrow;
+    # never manufacture an empty stack for it.
+    declared_suffix = region.get("stack_suffix")
+    if isinstance(declared_suffix, (tuple, list)):
+        suffix_slots = tuple(declared_suffix)
+    elif region.get("push_exception"):
+        suffix_slots = ("exception",)
+    elif region.get("lasti"):
+        suffix_slots = ("resume-position", "exception")
+    else:
+        suffix_slots = ()
+    initial_stack = tuple(
+        ExceptionResumePosition(source=steps[index].source)
+        if slot == "resume-position"
+        else CurrentException(source=steps[index].source)
+        for slot in suffix_slots
+    )
+    terminal = next(
+        (
+            cursor
+            for cursor in range(index, len(steps))
+            if any(
+                isinstance(effect, ReraiseTop)
+                for effect in tuple(steps[cursor].effects or ())
+            )
+        ),
+        None,
+    )
+    if terminal is None:
+        return None
+    lifted_value = callbacks.lift_slice(index, terminal + 1, initial_stack)
+    if not isinstance(lifted_value, VMRegionSlice) or lifted_value.stopped_at is not None:
+        return None
+    handler_body = tuple(_handler_statements_through_terminal(tuple(lifted_value.statements)))
+    if not handler_body or not isinstance(handler_body[-1], Reraise):
+        return None
+    handler_bodies.append(handler_body)
+    handler_sources.append(handler_body[-1].source or steps[index].source)
+    source = steps[normal_end - 1].source if normal_end else steps[0].source
+    function = entry_vm_function(
+        spec,
+        statements=(Try(
+            source=source,
+            body=tuple(body),
+            handlers=tuple(
+                ExceptHandler(exception_type=None, body=handler_body)
+                for handler_body in handler_bodies
+            ),
+        ),),
+        terminator=None,
+        status="ok",
+        structured_lift="generic-vm-pipeline",
+    )
+    proof = {
+        "rule": "transparent-exception-body",
+        "block_ids": preservation_cfg.block_ids,
+        "edge_ids": tuple(
+            edge.edge_id
+            for edge in preservation_cfg.edges
+            if edge.kind == "exception"
+        ),
+        "snapshot_key": preservation_cfg.snapshot_key,
+        "raw_context": tuple(
+            raw
+            for source_ref in handler_sources
+            for index, step in enumerate(steps)
+            if step.source == source_ref
+            for raw in (raw_window(index) if raw_window is not None else (step.raw,))
+            if raw
+        ),
+    }
+    return replace(
+        function,
+        control_provenance=tuple(dict.fromkeys((*function.control_provenance, *handler_sources))),
+        metadata={**function.metadata, "recovery_proofs": (proof,)},
+    )
+
+
+def _step_exception_free_gap(step: VMBytecodeStep) -> bool:
+    """Return whether an uncovered compiler gap cannot raise user code."""
+
+    if step.effects is None:
+        return False
+    effects = tuple(step.effects)
+    if not effects:
+        return True
+    return all(isinstance(effect, (Pop, Swap, Copy, StoreLocal)) for effect in effects)
 
 
 def entry_vm_function(
@@ -720,8 +1005,8 @@ def _function_has_empty_control_body(function: FunctionIR) -> bool:
 
 def _statements_have_empty_control_body(statements: tuple[Stmt, ...]) -> bool:
     for statement in statements:
-        if isinstance(statement, (If, While, ForEach, ForRange)):
-            if not tuple(getattr(statement, "body", ()) or ()) and isinstance(statement, (While, ForEach, ForRange)):
+        if isinstance(statement, (If, While, DoWhile, ForEach, ForRange)):
+            if not tuple(getattr(statement, "body", ()) or ()) and isinstance(statement, (While, DoWhile, ForEach, ForRange)):
                 return True
             if isinstance(statement, If) and not statement.then_body and not statement.else_body:
                 return True
@@ -772,7 +1057,7 @@ def _statements_have_one_shot_loop_condition(
             # a separate inner loop behind its own ``Continue``; keep the
             # conservative guard active there until that inner loop is
             # independently proven and recovered.
-            inside_loop=inside_loop or isinstance(statement, While),
+            inside_loop=inside_loop or isinstance(statement, (While, DoWhile)),
         ):
             return True
         if isinstance(statement, Try) and (
@@ -893,6 +1178,11 @@ def _collect_unbound_from_statements(
             body_bound = set(bound)
             _collect_unbound_from_statements(statement.body, local_names, body_bound, unbound)
             continue
+        if isinstance(statement, DoWhile):
+            body_bound = set(bound)
+            _collect_unbound_from_statements(statement.body, local_names, body_bound, unbound)
+            _collect_unbound_from_expr(statement.condition, local_names, body_bound, unbound)
+            continue
         if isinstance(statement, ForEach):
             _collect_unbound_from_expr(statement.iterable, local_names, bound, unbound)
             body_bound = set(bound)
@@ -912,7 +1202,8 @@ def _collect_unbound_from_statements(
             _collect_unbound_from_statements(statement.body, local_names, body_bound, unbound)
             exit_bounds = [body_bound]
             for handler in statement.handlers:
-                _collect_unbound_from_expr(handler.exception_type, local_names, bound, unbound)
+                if handler.exception_type is not None:
+                    _collect_unbound_from_expr(handler.exception_type, local_names, bound, unbound)
                 handler_bound = set(bound)
                 if handler.binding is not None:
                     handler_bound.add(handler.binding.name)
@@ -1256,6 +1547,9 @@ def _can_replace_non_ok_recovery_with_low_level_cfg(
 def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
     status = "ok" if not result.diagnostics else "partial"
     exception_edges = dict(result.exception_edges)
+    exception_transfers = {}
+    for block_id, transfer in getattr(result, "exception_transfers", ()):
+        exception_transfers.setdefault(block_id, []).append(transfer)
     active_exception_handlers = dict(result.active_exception_handlers)
     function = assemble_function(
         name=spec.name,
@@ -1266,12 +1560,13 @@ def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
                 id=block_id,
                 statements=statements,
                 terminator=terminator,
+                exception_transfers=tuple(exception_transfers.get(block_id, ())),
                 exception_edge=(
                     ExceptionalEdge(
                         target=exception_edges[block_id].target,
                         source=exception_edges[block_id].source,
                     )
-                    if block_id in exception_edges
+                    if block_id in exception_edges and block_id not in exception_transfers
                     else None
                 ),
                 active_exception_handlers=active_exception_handlers.get(block_id, ()),
@@ -1295,8 +1590,18 @@ def _assemble_low_level_cfg(spec: VMFunctionSpec, result) -> FunctionIR:
 
 
 def _has_exception_region_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
+    """Return whether the stream declares an actual protected CFG range.
+
+    A value-less ``exception-region`` hint is an operation marker used by
+    stack VMs around exception-matching instructions.  It is
+    useful provenance, but it does not identify a protected interval or a
+    handler edge and cannot drive Try recovery.  Only a supplied mapping (or
+    malformed supplied value, which must be diagnosed) enters the strict
+    protected-range path.
+    """
+
     return any(
-        hint.kind == "exception-region"
+        hint.kind == "exception-region" and hint.value is not None
         for step in steps
         for hint in step.hints
     )
@@ -1311,6 +1616,236 @@ def _has_exception_handler_facts(steps: tuple[VMBytecodeStep, ...]) -> bool:
     )
 
 
+def _lift_propagating_exception_region_candidate(
+    spec: VMFunctionSpec,
+    steps: tuple[VMBytecodeStep, ...],
+    profile: VMRegionProfile[VMBytecodeStep],
+    callbacks: VMStatefulCallbacks[VMBytecodeStep],
+    raw_window: Callable[[int], tuple[str, ...]] | None,
+) -> FunctionIR | None:
+    """Erase only exception regions whose handler is an exact bare rethrow.
+
+    Such a region has the same observable outcome as direct propagation: the
+    protected computation runs once and the identical active exception leaves
+    the function.  The proof deliberately rejects cleanup, matching, binding,
+    normal entries into the handler, and handlers with any additional effect.
+    This lets ordinary core structuring continue without approximating handler
+    behavior or teaching a frontend about source constructs.
+    """
+
+    groups = _non_overlapping_exception_region_groups(steps)
+    if not groups or not _has_pure_propagating_exception_regions(steps, profile):
+        return None
+    handler_targets: set[int] = set()
+    regions: list[dict[str, object]] = []
+    for group in groups:
+        entries = group.get("entries")
+        if not isinstance(entries, tuple):
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            target = entry.get("target")
+            if not isinstance(target, int) or isinstance(target, bool):
+                return None
+            handler_targets.add(target)
+            regions.append(entry)
+
+    handler_sources: list[SourceRef] = []
+    for target in sorted(handler_targets):
+        index = _step_index_at_offset(steps, target, profile)
+        if index is None:
+            return None
+        terminal_index = _pure_cleanup_reraise_index(steps, index)
+        if terminal_index is None:
+            return None
+        handler_sources.append(steps[terminal_index].source)
+
+    recovered = _lift_stateful_candidate(spec, steps, profile, callbacks, raw_window)
+    if (
+        recovered is None
+        or recovered.metadata.get("decompile_status") != "ok"
+        or _function_has_unsupported(recovered)
+        or _function_has_unbound_loop_control(recovered)
+        or _function_reads_unbound_locals(recovered)
+    ):
+        return None
+    preservation = lift_stateful_low_level_cfg(
+        steps, profile, callbacks, materialize_exception_regions=True
+    )
+    if preservation is None or not preservation.blocks:
+        return None
+    preservation_function = _assemble_low_level_cfg(spec, preservation)
+    preservation_cfg = build_cfg(preservation_function)
+    if preservation_cfg.diagnostics or validate_cfg_consistency(preservation_cfg):
+        return None
+    protected_members = frozenset(
+        block.id
+        for block in preservation_function.blocks
+        if exceptional_transfers(block)
+        and any(
+            isinstance(entry.get("start"), int)
+            and isinstance(entry.get("end"), int)
+            and entry["start"] <= (_block_start_offset(block.id) or -1) < entry["end"]
+            for entry in regions
+        )
+    )
+    protected_view = ProtectedRegionView.from_cfg(preservation_cfg, protected_members)
+    if not protected_view.eligible:
+        return None
+    proof = {
+        "rule": "propagating-exception-region",
+        "block_ids": preservation_cfg.block_ids,
+        "edge_ids": tuple(
+            edge.edge_id for edge in preservation_cfg.edges if edge.kind == "exception"
+        ),
+        "snapshot_key": preservation_cfg.snapshot_key,
+        "protected_region": {
+            "members": protected_view.members,
+            "handler_target": protected_view.handler_target,
+            "handler_stack_snapshot": protected_view.handler_stack_snapshot,
+            "handler_chain": protected_view.handler_chain,
+        },
+        "raw_context": tuple(
+            raw
+            for source in handler_sources
+            for index, step in enumerate(steps)
+            if step.source == source
+            for raw in ((raw_window(index) if raw_window is not None else (step.raw,)))
+            for raw in raw
+            if raw
+        ),
+        "exception_regions": tuple(
+            (entry.get("start"), entry.get("end"), entry.get("target"))
+            for entry in regions
+        ),
+    }
+    return replace(
+        recovered,
+        control_provenance=tuple(
+            dict.fromkeys((*recovered.control_provenance, *handler_sources))
+        ),
+        metadata={
+            **recovered.metadata,
+            "recovery_proofs": (
+                *tuple(recovered.metadata.get("recovery_proofs", ())),
+                proof,
+            ),
+        },
+    )
+
+
+def _has_pure_propagating_exception_regions(
+    steps: tuple[VMBytecodeStep, ...],
+    profile: VMRegionProfile[VMBytecodeStep],
+) -> bool:
+    """Return whether every declared region has an unreachable cleanup-reraise handler."""
+
+    groups = _non_overlapping_exception_region_groups(steps)
+    if not groups:
+        return False
+    targets: set[int] = set()
+    for group in groups:
+        entries = group.get("entries")
+        if not isinstance(entries, tuple):
+            return False
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("target"), int):
+                return False
+            targets.add(entry["target"])
+    if any(
+        hint.kind in {"branch-target", "loop-backedge", "case-target", "default-target"}
+        and hint.target in targets
+        for step in steps
+        for hint in step.hints
+    ):
+        return False
+    return all(
+        (index := _step_index_at_offset(steps, target, profile)) is not None
+        and _pure_cleanup_reraise_index(steps, index) is not None
+        for target in targets
+    )
+
+
+def _pure_cleanup_reraise_index(
+    steps: tuple[VMBytecodeStep, ...],
+    start: int,
+) -> int | None:
+    """Prove a handler only reshapes private VM state before rethrowing.
+
+    These effects neither call user code nor select/catch an exception.  A
+    local restoration immediately followed by ``ReraiseTop`` cannot change
+    the exception observed by the caller, whereas any other effect keeps the
+    full exceptional CFG on the preservation floor.
+    """
+
+    cleanup_effects = (Pop, Swap, Copy, StoreLocal)
+    for index in range(start, len(steps)):
+        effects = tuple(steps[index].effects or ())
+        if len(effects) == 1 and isinstance(effects[0], ReraiseTop):
+            return index
+        if not effects or any(not isinstance(effect, cleanup_effects) for effect in effects):
+            return None
+    return None
+
+
+def _low_level_preserves_exception_regions(
+    function: FunctionIR,
+    steps: tuple[VMBytecodeStep, ...],
+) -> bool:
+    """Prove that a preservation CFG retains every declared protected edge.
+
+    An ``exception-region`` declares executable control flow, even when a
+    frontend has not supplied a separately materializable exception-stack
+    state.  Returning an ordinary CFG in that situation loses catch behavior.
+    A low-level fallback is consequently admissible only when every physical
+    block inside each non-overlapping protected interval still owns an exact
+    exceptional edge to that interval's handler entry.  This deliberately
+    rejects partial coverage: an omitted edge is not a harmless rendering
+    detail and must become analyzable unsupported instead.
+    """
+
+    groups = _non_overlapping_exception_region_groups(steps)
+    if not groups:
+        return False
+    blocks_by_offset = {
+        offset: block
+        for block in function.blocks
+        if (offset := _block_start_offset(block.id)) is not None
+    }
+    for group in groups:
+        start = group["start"]
+        end = group["end"]
+        entries = group["entries"]
+        if not isinstance(start, int) or not isinstance(end, int):
+            return False
+        handler_offsets = {
+            entry.get("target")
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("target"), int)
+        }
+        if not handler_offsets:
+            return False
+        protected = tuple(
+            block
+            for offset, block in blocks_by_offset.items()
+            if start <= offset < end
+        )
+        if not protected:
+            return False
+        handler_ids = {f"block_{offset}" for offset in handler_offsets}
+        if any(
+            {
+                transfer.target.split("__", 1)[0]
+                for transfer in exceptional_transfers(block)
+            }
+            != handler_ids
+            for block in protected
+        ):
+            return False
+    return True
+
+
 def _lift_exception_region_candidate(
     spec: VMFunctionSpec,
     steps: tuple[VMBytecodeStep, ...],
@@ -1322,11 +1857,16 @@ def _lift_exception_region_candidate(
     """Recover simple typed handlers from neutral protected-region facts.
 
     The frontend supplies offsets and stack effects only. This core pass proves
-    that a handler tests one exception type then terminates (return or raise)
-    before replacing the protected CFG block with a structured generic region.
+    either a terminal typed handler or one that rejoins the protected path's
+    exact ordinary continuation before creating a structured generic region.
     """
 
-    cfg = lift_stateful_low_level_cfg(steps, profile, callbacks)
+    cfg = lift_stateful_low_level_cfg(
+        steps,
+        profile,
+        callbacks,
+        materialize_exception_regions=False,
+    )
     if cfg is None or not cfg.blocks:
         return None
     if cfg.exception_fact_diagnostics:
@@ -1362,6 +1902,7 @@ def _lift_exception_region_candidate(
             # prevent recovery of an independently proven outer range.
             continue
         handlers: list[ExceptHandler] = []
+        continuation = _ordinary_continuation_after(low_level, protected_block)
         for region in region_group["entries"]:
             recovered_handlers = _lift_typed_exception_handlers(
                 steps,
@@ -1374,6 +1915,15 @@ def _lift_exception_region_candidate(
                 regions=_flatten_exception_region_groups(region_groups),
                 region_callbacks=region_callbacks,
             )
+            if recovered_handlers is None and continuation is not None:
+                recovered_handlers = _lift_direct_handler_to_continuation(
+                    steps,
+                    target_offset=region["target"],
+                    continuation_offset=_block_start_offset(continuation.id),
+                    exception_type=region.get("exception_type"),
+                    profile=profile,
+                    callbacks=callbacks,
+                )
             if recovered_handlers is None:
                 return None
             handlers.extend(recovered_handlers)
@@ -1382,7 +1932,7 @@ def _lift_exception_region_candidate(
         # observable generic-IR effect.  Keep the original low-level CFG in
         # that exact case instead of introducing a second representation of
         # the same exceptional path.
-        if _handlers_are_identity_reraises(handlers_tuple):
+        if _handlers_are_identity_reraises(handlers_tuple) or _handlers_are_bare_reraises(handlers_tuple):
             continue
         # A protected range can span several basic blocks.  Preserve every
         # ordinary CFG edge by wrapping the effects in each covered block,
@@ -1422,7 +1972,7 @@ def _lift_exception_region_candidate(
             # the exception range would require a richer structured CFG
             # region and this candidate must not guess.
             if (
-                candidate.exception_edge is not None
+                exceptional_transfers(candidate)
                 or candidate.active_exception_handlers
                 or (
                     embedded_terminator is None
@@ -1447,13 +1997,100 @@ def _lift_exception_region_candidate(
                     ),
                 ),
                 terminator=None if embedded_terminator is not None else candidate.terminator,
-                exception_edge=candidate.exception_edge,
+                exception_transfers=exceptional_transfers(candidate),
                 active_exception_handlers=candidate.active_exception_handlers,
             )
     if not replacements:
         return low_level
     function = replace(low_level, blocks=tuple(replacements.get(block.id, block) for block in low_level.blocks))
     return finalize_recovered_vm_function(spec, function)
+
+
+def _ordinary_continuation_after(
+    function: FunctionIR,
+    protected: BasicBlock,
+) -> BasicBlock | None:
+    """Find the exact ordinary continuation after a protected block.
+
+    A handler can be physically adjacent to the normal continuation while the
+    low-level CFG represents only the normal jump.  Follow empty ordinary
+    jump carriers so a typed handler can rejoin the same existing block.  Any
+    effects, Phi, handler state, or non-jump terminator ends this proof.
+    """
+
+    if not isinstance(protected.terminator, Jump):
+        return None
+    blocks = {block.id: block for block in function.blocks}
+    current_id = protected.terminator.target
+    visited: set[str] = set()
+    while current_id not in visited:
+        visited.add(current_id)
+        current = blocks.get(current_id)
+        if current is None:
+            return None
+        if exceptional_transfers(current) or current.active_exception_handlers:
+            return None
+        if current.statements:
+            return current
+        if not isinstance(current.terminator, Jump):
+            return current
+        current_id = current.terminator.target
+    return None
+
+
+def _lift_direct_handler_to_continuation(
+    steps: tuple[VMBytecodeStep, ...],
+    *,
+    target_offset: object,
+    continuation_offset: int | None,
+    exception_type: object,
+    profile: VMRegionProfile[VMBytecodeStep],
+    callbacks: VMStatefulCallbacks[VMBytecodeStep],
+) -> tuple[ExceptHandler, ...] | None:
+    """Lift a typed linear handler that rejoins a shared continuation.
+
+    This proof is deliberately narrow and VM-neutral: the handler binds the
+    raised value, performs a stack-balanced linear slice, and reaches the
+    exact continuation already selected by the protected block's ordinary
+    jump chain.  No handler control transfer is moved or invented.
+    """
+
+    if (
+        not isinstance(target_offset, int)
+        or isinstance(target_offset, bool)
+        or continuation_offset is None
+        or not isinstance(exception_type, str)
+        or not exception_type
+    ):
+        return None
+    entry = _step_index_at_offset(steps, target_offset, profile)
+    continuation = _step_index_at_offset(steps, continuation_offset, profile)
+    if entry is None or continuation is None or not entry < continuation:
+        return None
+    entry_effects = tuple(steps[entry].effects or ())
+    if len(entry_effects) != 1 or not isinstance(entry_effects[0], StoreLocal):
+        return None
+    binding_effect = entry_effects[0]
+    binding = (
+        binding_effect.target
+        if isinstance(binding_effect.target, Var)
+        else Var(name=binding_effect.name, source=binding_effect.source)
+    )
+    initial_locals = dict(callbacks.initial_locals())
+    initial_locals[binding_effect.name] = binding
+    body_start = entry + 1
+    if any(profile.is_control(step) for step in steps[body_start:continuation]):
+        return None
+    lifted = callbacks.lift_linear(body_start, continuation, initial_locals, ())
+    if lifted is None or lifted.stack or lifted.terminator is not None:
+        return None
+    return (
+        ExceptHandler(
+            exception_type=Global(name=exception_type, source=steps[entry].source),
+            binding=binding,
+            body=tuple(lifted.statements),
+        ),
+    )
 
 
 def _block_start_offset(block_id: str) -> int | None:
@@ -1478,6 +2115,15 @@ def _handlers_are_identity_reraises(handlers: tuple[ExceptHandler, ...]) -> bool
         and isinstance(handler.body[0].value, Var)
         and handler.body[0].value.name == handler.binding.name
         and handler.body[0].cause is None
+        for handler in handlers
+    )
+
+
+def _handlers_are_bare_reraises(handlers: tuple[ExceptHandler, ...]) -> bool:
+    """Recognize a catch-all generic handler that only propagates again."""
+
+    return bool(handlers) and all(
+        len(handler.body) == 1 and isinstance(handler.body[0], Reraise)
         for handler in handlers
     )
 
@@ -1532,6 +2178,9 @@ def _non_overlapping_exception_region_groups(
                 "target": target,
                 "depth": value.get("depth"),
                 "lasti": value.get("lasti"),
+                "stack_depth": value.get("stack_depth"),
+                "stack_suffix": value.get("stack_suffix"),
+                "push_exception": value.get("push_exception"),
                 "exception_type": value.get("exception_type"),
             })
     handler_offsets = {entry["target"] for entry in decoded}
@@ -1701,7 +2350,10 @@ def _lift_first_terminal_linear_slice(
         lifted = callbacks.lift_linear(start, end, initial_locals, initial_stack)
         if lifted is None or lifted.stack:
             continue
-        if isinstance(lifted.terminator, (Return, Raise, Reraise)):
+        if (
+            isinstance(lifted.terminator, (Return, Raise, Reraise))
+            or _ends_with_raise(tuple(lifted.statements))
+        ):
             return lifted
     return None
 
@@ -1773,7 +2425,43 @@ def _lift_one_typed_exception_handler(
         profile,
         callbacks,
     )
-    lifted = short_circuit or callbacks.lift_linear(body_start, body_end, initial_locals, initial_stack)
+    # Compiler cleanup tails can follow a terminal handler raise.  They are a
+    # separate exceptional path, not part of the matched handler body.  Stop
+    # at the first callback-proven terminal so later cleanup reraises cannot
+    # impose an incompatible handler-stack layout on this body.
+    if short_circuit is not None:
+        lifted = short_circuit
+    elif jump_index is not None:
+        # A matched handler may acknowledge the exception, update a local
+        # bookkeeping value, and jump back to an already-proven loop head
+        # instead of terminating.  This is still safe to structure when the
+        # callback proves a stack-balanced, straight-line body with no hidden
+        # terminal or unsupported instruction.  Requiring the explicit jump
+        # keeps this path distinct from a handler whose fallthrough would
+        # accidentally consume the outer function body.
+        lifted = callbacks.lift_linear(
+            body_start,
+            body_end,
+            initial_locals,
+            initial_stack,
+        )
+        if (
+            lifted is None
+            or lifted.stack
+            or lifted.terminator is not None
+            or lifted.stopped_at is not None
+        ):
+            return None
+    else:
+        lifted = _lift_first_terminal_linear_slice(
+            callbacks,
+            steps,
+            profile,
+            body_start,
+            body_end,
+            initial_locals,
+            initial_stack,
+        )
     if lifted is None or lifted.stack:
         return None
     statements = _handler_statements_through_terminal(tuple(lifted.statements))
@@ -2069,7 +2757,7 @@ def _expr_has_collection_projection(expr: Expr) -> bool:
 
 def _statements_have_loop_construct(statements: tuple[object, ...]) -> bool:
     for statement in statements:
-        if isinstance(statement, (While, ForEach, ForRange)):
+        if isinstance(statement, (While, DoWhile, ForEach, ForRange)):
             return True
         then_body = tuple(getattr(statement, "then_body", ()) or ())
         else_body = tuple(getattr(statement, "else_body", ()) or ())
@@ -2279,7 +2967,7 @@ def _has_unbound_loop_control(statements: tuple[object, ...], *, in_loop: bool =
             ):
                 return True
             continue
-        if isinstance(statement, (While, ForEach, ForRange)):
+        if isinstance(statement, (While, DoWhile, ForEach, ForRange)):
             if _has_unbound_loop_control(tuple(statement.body), in_loop=True):
                 return True
             continue

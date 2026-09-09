@@ -15,11 +15,15 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     Continue,
+    ExceptionRewrite,
+    ExceptionCleanupValue,
     Delete,
+    DoWhile,
     Expr,
     ExprStmt,
     ForEach,
     ForRange,
+    Fallthrough,
     FunctionIR,
     GetAttr,
     GetItem,
@@ -48,6 +52,7 @@ from unidecompiler.core.ir import (
     Var,
     While,
     Yield,
+    exceptional_transfers,
 )
 
 
@@ -77,6 +82,7 @@ class PhiPlacement:
     block_id: str
     variable: str
     incoming: tuple[tuple[str, Var], ...]
+    edge_ids: tuple[str, ...] = ()
 
 
 def index_assignments(function: FunctionIR) -> SSAIndex:
@@ -115,7 +121,10 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
     cfg = build_cfg(function)
     placements = _phi_placements(function)
     ambiguous_blocks = _ambiguous_phi_blocks(function, cfg)
-    if not placements and not ambiguous_blocks:
+    unresolved_ambiguous = ambiguous_blocks - {
+        placement.block_id for placement in placements if placement.edge_ids
+    }
+    if not placements and not unresolved_ambiguous:
         return function
 
     updated_blocks: list[BasicBlock] = []
@@ -127,7 +136,7 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
         phi_statements = [
             Assign(
                 target=Var(name=placement.variable),
-                value=Phi(incoming=placement.incoming),
+                value=Phi(incoming=placement.incoming, edge_ids=placement.edge_ids),
             )
             for placement in block_placements
         ]
@@ -136,7 +145,7 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
                 id=block.id,
                 statements=tuple(phi_statements + list(block.statements)),
                 terminator=block.terminator,
-                exception_edge=block.exception_edge,
+                exception_transfers=exceptional_transfers(block),
                 active_exception_handlers=block.active_exception_handlers,
             )
         )
@@ -156,10 +165,10 @@ def insert_phi_nodes(function: FunctionIR) -> FunctionIR:
                 {
                     "ssa_phi_diagnostics": tuple(
                         f"block {block_id}: parallel incoming edges require edge-keyed Phi"
-                        for block_id in sorted(ambiguous_blocks)
+                        for block_id in sorted(unresolved_ambiguous)
                     )
                 }
-                if ambiguous_blocks
+                if unresolved_ambiguous
                 else {}
             ),
         },
@@ -223,7 +232,7 @@ def convert_straight_line_to_ssa(function: FunctionIR) -> SSAConversion:
                     id=block.id,
                     statements=tuple(statements),
                     terminator=terminator,
-                    exception_edge=block.exception_edge,
+                    exception_transfers=exceptional_transfers(block),
                     active_exception_handlers=block.active_exception_handlers,
                 ),
             ),
@@ -335,6 +344,14 @@ def _rewrite_statement(
             condition=_rewrite_expr(statement.condition, current),
             body=_rewrite_statement_sequence(statement.body, body_current, body_versions),
         )
+    if isinstance(statement, DoWhile):
+        body_current = current.copy()
+        body_versions = versions.copy() if versions is not None else None
+        return DoWhile(
+            source=statement.source,
+            body=_rewrite_statement_sequence(statement.body, body_current, body_versions),
+            condition=_rewrite_expr(statement.condition, body_current),
+        )
     if isinstance(statement, ForEach):
         body_current = current.copy()
         body_versions = versions.copy() if versions is not None else None
@@ -368,7 +385,7 @@ def _rewrite_statement(
                 for handler in statement.handlers
             ),
         )
-    if isinstance(statement, (Break, Continue)):
+    if isinstance(statement, (Break, Continue, Fallthrough)):
         return statement
     if isinstance(statement, Unsupported):
         return statement
@@ -379,7 +396,17 @@ def _rewrite_statement(
             cause=_rewrite_expr(statement.cause, current) if statement.cause is not None else None,
         )
     if isinstance(statement, Reraise):
-        return statement
+        return Reraise(
+            source=statement.source,
+            value=(
+                _rewrite_expr(statement.value, current)
+                if statement.value is not None
+                else None
+            ),
+            resume_slots=tuple(
+                _rewrite_expr(value, current) for value in statement.resume_slots
+            ),
+        )
     if isinstance(statement, Yield):
         return Yield(source=statement.source, value=_rewrite_expr(statement.value, current))
     if isinstance(statement, Return):
@@ -435,7 +462,11 @@ def _rewrite_handler(
         else _bind_local(handler.binding, handler_current, handler_versions)
     )
     return ExceptHandler(
-        exception_type=_rewrite_expr(handler.exception_type, current),
+        exception_type=(
+            _rewrite_expr(handler.exception_type, current)
+            if handler.exception_type is not None
+            else None
+        ),
         binding=binding,
         body=_rewrite_statement_sequence(
             handler.body,
@@ -590,10 +621,40 @@ def _rewrite_expr(expr: Expr, current: dict[str, str]) -> Expr:
             ),
             args=tuple(_rewrite_expr(arg, current) for arg in expr.args),
         )
+    if isinstance(expr, ExceptionRewrite):
+        return ExceptionRewrite(
+            source=expr.source,
+            type=expr.type,
+            value=_rewrite_expr(expr.value, current),
+            predicate=_rewrite_expr(expr.predicate, current),
+            replacement=_rewrite_expr(expr.replacement, current),
+            retain_input_as_cause=expr.retain_input_as_cause,
+        )
+    if isinstance(expr, ExceptionCleanupValue):
+        return ExceptionCleanupValue(
+            source=expr.source,
+            type=expr.type,
+            value=_rewrite_expr(expr.value, current),
+            input_exception=(
+                None
+                if expr.input_exception is None
+                else _rewrite_expr(expr.input_exception, current)
+            ),
+            propagate_input=expr.propagate_input,
+            predicate=(
+                None if expr.predicate is None else _rewrite_expr(expr.predicate, current)
+            ),
+            predicate_operand=(
+                None
+                if expr.predicate_operand is None
+                else _rewrite_expr(expr.predicate_operand, current)
+            ),
+        )
     if isinstance(expr, Phi):
         return Phi(
             source=expr.source,
             type=expr.type,
+            edge_ids=expr.edge_ids,
             incoming=tuple(
                 (pred, _rewrite_expr(value, current))
                 for pred, value in expr.incoming
@@ -638,6 +699,8 @@ def _assigned_names(statement) -> tuple[str, ...]:
             for name in _assigned_names(inner)
         )
     if isinstance(statement, While):
+        return tuple(name for inner in statement.body for name in _assigned_names(inner))
+    if isinstance(statement, DoWhile):
         return tuple(name for inner in statement.body for name in _assigned_names(inner))
     if isinstance(statement, (ForEach, ForRange)):
         return (statement.target.name,) + tuple(
@@ -701,6 +764,11 @@ def _used_names(statement) -> tuple[str, ...]:
             *_expr_used_names(statement.condition),
             *(name for inner in statement.body for name in _used_names(inner)),
         )
+    if isinstance(statement, DoWhile):
+        return (
+            *(name for inner in statement.body for name in _used_names(inner)),
+            *_expr_used_names(statement.condition),
+        )
     if isinstance(statement, ForEach):
         return (*_expr_used_names(statement.iterable), *(name for inner in statement.body for name in _used_names(inner)))
     if isinstance(statement, ForRange):
@@ -716,7 +784,11 @@ def _used_names(statement) -> tuple[str, ...]:
             *(
                 name
                 for handler in statement.handlers
-                for name in _expr_used_names(handler.exception_type)
+                for name in (
+                    ()
+                    if handler.exception_type is None
+                    else _expr_used_names(handler.exception_type)
+                )
             ),
             *(name for handler in statement.handlers for inner in handler.body for name in _used_names(inner)),
         )
@@ -726,7 +798,10 @@ def _used_names(statement) -> tuple[str, ...]:
             *(_expr_used_names(statement.cause) if statement.cause is not None else ()),
         )
     if isinstance(statement, Reraise):
-        return ()
+        return (
+            *(_expr_used_names(statement.value) if statement.value is not None else ()),
+            *(name for value in statement.resume_slots for name in _expr_used_names(value)),
+        )
     if isinstance(statement, Yield):
         return _expr_used_names(statement.value)
     if isinstance(statement, Return):
@@ -783,6 +858,19 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
             *(() if expr.constructor is None else _expr_used_names(expr.constructor)),
             *(name for arg in expr.args for name in _expr_used_names(arg)),
         )
+    if isinstance(expr, ExceptionRewrite):
+        return (
+            *_expr_used_names(expr.value),
+            *_expr_used_names(expr.predicate),
+            *_expr_used_names(expr.replacement),
+        )
+    if isinstance(expr, ExceptionCleanupValue):
+        return (
+            *_expr_used_names(expr.value),
+            *(() if expr.input_exception is None else _expr_used_names(expr.input_exception)),
+            *(() if expr.predicate is None else _expr_used_names(expr.predicate)),
+            *(() if expr.predicate_operand is None else _expr_used_names(expr.predicate_operand)),
+        )
     if isinstance(expr, Phi):
         return tuple(name for _, value in expr.incoming for name in _expr_used_names(value))
     if isinstance(expr, IndirectCall):
@@ -795,21 +883,16 @@ def _expr_used_names(expr: Expr) -> tuple[str, ...]:
 def _phi_placements(function: FunctionIR) -> tuple[PhiPlacement, ...]:
     cfg = build_cfg(function)
     preds = _predecessors(cfg)
-    # ``Phi`` currently labels inputs by predecessor block, not by concrete
-    # edge.  A switch (or other VM-neutral terminator) may contain parallel
-    # edges from one block to the same join; collapsing those edges would make
-    # the value selected at the join unknowable.  Keep the preservation CFG in
-    # that case until an edge-keyed Phi representation is available.
-    ambiguous_blocks = _ambiguous_phi_blocks(function, cfg)
+    # Parallel incoming edges are represented by concrete edge IDs on Phi;
+    # ordinary joins continue to use their source block as the logical label.
     successors = {block_id: set(cfg.successors(block_id)) for block_id in cfg.blocks}
     live_in = _live_in_by_block(function, successors)
     reaching_out = _reaching_definitions(function, preds)
     placements: list[PhiPlacement] = []
     for block in function.blocks:
-        if block.id in ambiguous_blocks:
-            continue
+        incoming_edges = cfg.incoming_edges(block.id)
         predecessors = preds.get(block.id, set())
-        if len(predecessors) < 2:
+        if len(predecessors) < 2 and len(incoming_edges) < 2:
             continue
         incoming_vars = set().union(*(reaching_out.get(pred, {}) for pred in predecessors))
         for variable in sorted(incoming_vars & live_in.get(block.id, set())):
@@ -821,14 +904,27 @@ def _phi_placements(function: FunctionIR) -> tuple[PhiPlacement, ...]:
             if len(reaching_sources) < 2:
                 continue
             incoming = []
-            for pred in sorted(predecessors):
-                if variable in reaching_out.get(pred, {}):
-                    incoming.append((pred, Var(name=variable)))
+            edge_ids: list[str] = []
+            parallel_edges = len(incoming_edges) != len(predecessors)
+            for edge in incoming_edges:
+                if variable not in reaching_out.get(edge.source, {}):
+                    continue
+                incoming.append(
+                    (
+                        edge.edge_id if parallel_edges else edge.source,
+                        Var(name=variable),
+                    )
+                )
+                if parallel_edges:
+                    edge_ids.append(edge.edge_id)
+            if len(incoming) != len(incoming_edges):
+                continue
             placements.append(
                 PhiPlacement(
                     block_id=block.id,
                     variable=variable,
                     incoming=tuple(incoming),
+                    edge_ids=tuple(edge_ids),
                 )
             )
     return tuple(placements)
@@ -916,6 +1012,7 @@ def _phi_metadata(placements: tuple[PhiPlacement, ...]) -> list[dict[str, object
             "block": placement.block_id,
             "variable": placement.variable,
             "incoming": list(placement.incoming),
+            "edge_ids": list(placement.edge_ids),
         }
         for placement in placements
     ]

@@ -15,6 +15,9 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    ExceptionRewriteExpr,
+    ExceptionCleanupValueExpr,
+    ExceptionResumePositionExpr,
     DeleteStmt,
     ResumeInputExpr,
     UndefinedLiteralExpr,
@@ -55,6 +58,8 @@ from unidecompiler.core.ast import (
     VarRef,
     YieldStmt,
     ContinueStmt,
+    DoWhileStmt,
+    FallthroughStmt,
     WhileStmt,
 )
 from unidecompiler.core.astify import module_to_ast
@@ -162,12 +167,13 @@ def _emit_function_body(
         lines.append("}")
         return lines
 
-    declared: set[str] = set(function.params)
-    declared.update(
+    predeclared = tuple(
         name
         for name in function.metadata.get("predeclared_names", ())
         if isinstance(name, str)
     )
+    declared: set[str] = set(function.params)
+    declared.update(predeclared)
     inline_values: dict[str, AstExpr] = {}
     body_lines, declared = _emit_stmt_sequence(
         function.body,
@@ -176,6 +182,10 @@ def _emit_function_body(
         declared=declared,
         inline_values=inline_values,
     )
+    # A declaration is only a lexical carrier for a value core has proved is
+    # assigned before observation.  ``null`` is the established pseudocode
+    # placeholder for that carrier; it is not a recovered VM value.
+    lines.extend(f"    let {name} = null" for name in predeclared)
     lines.extend(body_lines)
 
     for nested in function.nested_functions:
@@ -276,6 +286,8 @@ def _emit_stmt(
         return ["    break"], declared
     if isinstance(statement, ContinueStmt):
         return ["    continue"], declared
+    if isinstance(statement, FallthroughStmt):
+        return ["    fallthrough"], declared
     if isinstance(statement, LabelStmt):
         return [f"  {statement.name}:"], declared
     if isinstance(statement, GotoStmt):
@@ -299,6 +311,8 @@ def _emit_stmt(
         return _emit_switch(statement, source_language, local_names, declared, inline_values)
     if isinstance(statement, WhileStmt):
         return _emit_while(statement, source_language, local_names, declared, inline_values)
+    if isinstance(statement, DoWhileStmt):
+        return _emit_do_while(statement, source_language, local_names, declared, inline_values)
     if isinstance(statement, ForEachStmt):
         return _emit_for_each(statement, source_language, local_names, declared, inline_values)
     if isinstance(statement, ForRangeStmt):
@@ -314,6 +328,11 @@ def _emit_stmt(
         cause = _emit_expr(_resolve_expr(statement.cause, inline_values))
         return [f"    raise {value} from {cause}"], declared
     if isinstance(statement, ReraiseStmt):
+        if statement.value is not None:
+            # Resume slots are VM provenance.  They were already evaluated by
+            # the generic IR before this terminal and do not denote a source
+            # expression that a backend may invent.
+            return [f"    raise {_emit_expr(_resolve_expr(statement.value, inline_values))}"], declared
         return ["    raise"], declared
     if isinstance(statement, YieldStmt):
         return [f"    yield {_emit_expr(_resolve_expr(statement.value, inline_values))}"], declared
@@ -340,7 +359,11 @@ def _emit_try(
     lines.extend(_indent(body_lines, "    "))
     lines.append("    }")
     for handler in statement.handlers:
-        type_text = _emit_expr(_resolve_expr(handler.exception_type, inline_values))
+        type_text = (
+            "any"
+            if handler.exception_type is None
+            else _emit_expr(_resolve_expr(handler.exception_type, inline_values))
+        )
         binding = f" {handler.binding.name}" if handler.binding is not None else ""
         lines[-1] += f" catch ({type_text}{binding}) {{"
         handler_inline = inline_values.copy()
@@ -430,7 +453,7 @@ def _control_assignment_names(statements: tuple[object, ...]) -> set[str]:
             names.update(_control_assignment_names(statement.default_body))
             for _value, body in statement.cases:
                 names.update(_control_assignment_names(body))
-        elif isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+        elif isinstance(statement, (WhileStmt, DoWhileStmt, ForEachStmt, ForRangeStmt)):
             names.update(_control_assignment_names(statement.body))
         elif isinstance(statement, TryStmt):
             names.update(_control_assignment_names(statement.body))
@@ -499,7 +522,10 @@ def _emit_switch(
 
 
 def _switch_body_terminates(body: tuple[object, ...]) -> bool:
-    return bool(body) and isinstance(body[-1], (ContinueStmt, ReturnStmt, RaiseStmt, ReraiseStmt))
+    return bool(body) and isinstance(
+        body[-1],
+        (ContinueStmt, ReturnStmt, RaiseStmt, ReraiseStmt, FallthroughStmt),
+    )
 
 
 def _emit_while(
@@ -516,6 +542,27 @@ def _emit_while(
     body_lines, _ = _emit_stmt_sequence(statement.body, source_language, local_names, body_declared, body_inline)
     lines.extend(_indent(body_lines, "    "))
     lines.append("    }")
+    return lines, declared
+
+
+def _emit_do_while(
+    statement: DoWhileStmt,
+    source_language: str,
+    local_names: set[str],
+    declared: set[str],
+    inline_values: dict[str, AstExpr],
+) -> tuple[list[str], set[str]]:
+    lines = ["    do {"]
+    body_lines, _ = _emit_stmt_sequence(
+        statement.body,
+        source_language,
+        local_names,
+        declared.copy(),
+        inline_values.copy(),
+    )
+    lines.extend(_indent(body_lines, "    "))
+    condition = _resolve_expr(statement.condition, inline_values)
+    lines.append(f"    }} while ({_emit_expr(condition)})")
     return lines, declared
 
 
@@ -601,6 +648,33 @@ def _emit_expr(expr: AstExpr) -> str:
         return f"unsupported_expr({expr.message + detail!r})"
     if isinstance(expr, CurrentExceptionRef):
         return "current_exception"
+    if isinstance(expr, ExceptionRewriteExpr):
+        cause = ", retain_input_as_cause=true" if expr.retain_input_as_cause else ""
+        return (
+            "exception_rewrite("
+            f"{_emit_expr(expr.value)}, predicate={_emit_expr(expr.predicate)}, "
+            f"replacement={_emit_expr(expr.replacement)}{cause})"
+        )
+    if isinstance(expr, ExceptionCleanupValueExpr):
+        predicate = (
+            "true" if expr.predicate is None else _emit_expr(expr.predicate)
+        )
+        input_exception = (
+            "null" if expr.input_exception is None else _emit_expr(expr.input_exception)
+        )
+        operand = (
+            "null"
+            if expr.predicate_operand is None
+            else _emit_expr(expr.predicate_operand)
+        )
+        return (
+            "exception_cleanup("
+            f"{_emit_expr(expr.value)}, predicate={predicate}, "
+            f"input_exception={input_exception}, propagate_input={str(expr.propagate_input).lower()}, "
+            f"predicate_operand={operand})"
+        )
+    if isinstance(expr, ExceptionResumePositionExpr):
+        return "exception_resume_position"
     if isinstance(expr, ResumeInputExpr):
         return "resume_input()"
     if isinstance(expr, GlobalRef):
@@ -608,7 +682,10 @@ def _emit_expr(expr: AstExpr) -> str:
     if isinstance(expr, CapturedVarRef):
         return expr.name
     if isinstance(expr, PhiExpr):
-        parts = ", ".join(f"{pred}: {_emit_expr(value)}" for pred, value in expr.incoming)
+        parts = ", ".join(
+            f"{(expr.edge_ids[index] + ' / ') if index < len(expr.edge_ids) else ''}{pred}: {_emit_expr(value)}"
+            for index, (pred, value) in enumerate(expr.incoming)
+        )
         return f"phi({parts})"
     if isinstance(expr, VarRef):
         return expr.name
@@ -842,6 +919,31 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
             type=expr.type,
             value=_resolve_expr(expr.value, inline_values),
         )
+    if isinstance(expr, ExceptionRewriteExpr):
+        return ExceptionRewriteExpr(
+            source=expr.source,
+            type=expr.type,
+            value=_resolve_expr(expr.value, inline_values),
+            predicate=_resolve_expr(expr.predicate, inline_values),
+            replacement=_resolve_expr(expr.replacement, inline_values),
+            retain_input_as_cause=expr.retain_input_as_cause,
+        )
+    if isinstance(expr, ExceptionCleanupValueExpr):
+        return ExceptionCleanupValueExpr(
+            source=expr.source,
+            type=expr.type,
+            value=_resolve_expr(expr.value, inline_values),
+            input_exception=(
+                None if expr.input_exception is None else _resolve_expr(expr.input_exception, inline_values)
+            ),
+            propagate_input=expr.propagate_input,
+            predicate=(
+                None if expr.predicate is None else _resolve_expr(expr.predicate, inline_values)
+            ),
+            predicate_operand=(
+                None if expr.predicate_operand is None else _resolve_expr(expr.predicate_operand, inline_values)
+            ),
+        )
     if isinstance(expr, PhiExpr):
         return PhiExpr(
             source=expr.source,
@@ -850,6 +952,7 @@ def _resolve_expr(expr: AstExpr, inline_values: dict[str, AstExpr]) -> AstExpr:
                 (pred, _resolve_expr(value, inline_values))
                 for pred, value in expr.incoming
             ),
+            edge_ids=expr.edge_ids,
         )
     if isinstance(expr, TableLiteralExpr):
         return TableLiteralExpr(
@@ -967,7 +1070,21 @@ def _should_inline_assignment(
 ) -> bool:
     if target_name in local_names:
         return False
-    if target_name.startswith("order_tmp_") or target_name.startswith("tmp_value_"):
+    if target_name.startswith("order_tmp_"):
+        # Low-level stack recovery materializes values under deterministic
+        # ``order_tmp_*`` names.  Pure expressions may be substituted at the
+        # presentation boundary; calls and other effectful nodes remain
+        # named so evaluation count and ordering are unchanged.
+        return (
+            source_language == "python"
+            and not isinstance(value, CallExpr)
+            and _is_python_scalar_presentation_expr(value)
+            and not isinstance(
+                value,
+                (SetLiteralExpr, TableLiteralExpr, ObjectLiteralExpr, MapLiteralExpr),
+            )
+        )
+    if target_name.startswith("tmp_value_"):
         return False
     if source_language != "lua":
         return (
@@ -981,7 +1098,16 @@ def _should_inline_assignment(
 
 
 def _is_safe_inline_expr(expr: AstExpr) -> bool:
-    if isinstance(expr, (ConstExpr, UndefinedLiteralExpr, CurrentExceptionRef, ResumeInputExpr)):
+    if isinstance(
+        expr,
+        (
+            ConstExpr,
+            UndefinedLiteralExpr,
+            CurrentExceptionRef,
+            ExceptionResumePositionExpr,
+            ResumeInputExpr,
+        ),
+    ):
         return True
     if isinstance(expr, UnaryExpr):
         return _is_safe_inline_expr(expr.value)
@@ -1000,4 +1126,20 @@ def _is_safe_inline_expr(expr: AstExpr) -> bool:
         return all(_is_safe_inline_expr(field.key) and _is_safe_inline_expr(field.value) for field in expr.fields)
     if isinstance(expr, MapLiteralExpr):
         return all(_is_safe_inline_expr(field.key) and _is_safe_inline_expr(field.value) for field in expr.fields)
+    return False
+
+
+def _is_python_scalar_presentation_expr(expr: AstExpr) -> bool:
+    """Allow scalar stack temporaries to inline at the presentation boundary."""
+
+    if isinstance(expr, (VarRef, ConstExpr)):
+        return True
+    if isinstance(expr, UnaryExpr):
+        return _is_python_scalar_presentation_expr(expr.value)
+    if isinstance(expr, BinaryExpr):
+        # Binary operands are restricted to scalar values with no calls or
+        # container construction.  The operation itself remains visible in
+        # the recovered expression, preserving the original evaluation site
+        # for the stack VM's materialized temporary.
+        return _is_python_scalar_presentation_expr(expr.left) and _is_python_scalar_presentation_expr(expr.right)
     return False

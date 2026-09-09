@@ -112,6 +112,15 @@ preservation; unknown calls form conservative barriers for deferred values.
 Fixed-point pass scheduling and CFG rewrite evidence remain core-owned and
 diagnosable, including the instruction context available when recovery stops.
 
+Every accepted region rewrite records a proof entry in `FunctionIR.metadata`
+with its rule, concrete block/edge identities, CFG snapshot key, and raw bytecode
+context. Rejected candidates record the rule and rejection diagnostics. The
+shared CFG validator also checks edge targets, contiguous parallel-edge
+ordinals, exception-edge provenance, and entry consistency before a rewrite is
+admitted. These records are analysis evidence, not frontend control-flow
+instructions; they let a remaining `goto` be traced to a specific proof
+boundary without weakening the preservation fallback.
+
 ## Package Architecture
 
 `unidecompiler` is an embeddable core library. It has no command-line entry

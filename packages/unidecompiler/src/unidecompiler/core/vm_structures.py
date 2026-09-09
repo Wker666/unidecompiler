@@ -4,9 +4,11 @@ from unidecompiler.core.ir import (
     Branch,
     Break,
     Continue,
+    DoWhile,
     Expr,
     ForEach,
     ForRange,
+    Fallthrough,
     Return,
     SourceRef,
     Stmt,
@@ -19,7 +21,7 @@ from unidecompiler.core.ir import (
 )
 
 
-VM_STRUCTURE_NODE_TYPES = (If, While, ForEach, ForRange)
+VM_STRUCTURE_NODE_TYPES = (If, While, DoWhile, ForEach, ForRange)
 
 
 def vm_return(source: SourceRef | None = None, values: tuple[Expr, ...] = ()) -> Return:
@@ -53,6 +55,15 @@ def vm_while(
     body: tuple[Stmt, ...] = (),
 ) -> While:
     return While(source=source, condition=condition, body=body)
+
+
+def vm_do_while(
+    *,
+    source: SourceRef | None = None,
+    body: tuple[Stmt, ...] = (),
+    condition: Expr,
+) -> DoWhile:
+    return DoWhile(source=source, body=body, condition=condition)
 
 
 def vm_foreach(
@@ -95,6 +106,10 @@ def vm_continue(source: SourceRef | None = None) -> Continue:
     return Continue(source=source)
 
 
+def vm_fallthrough(source: SourceRef | None = None) -> Fallthrough:
+    return Fallthrough(source=source)
+
+
 def vm_no_terminator() -> Terminator | None:
     return None
 
@@ -112,7 +127,7 @@ def contains_vm_unsupported(value: object) -> bool:
         return True
     if isinstance(value, If):
         return any(contains_vm_unsupported(inner) for inner in (*value.then_body, *value.else_body))
-    if isinstance(value, (While, ForEach, ForRange)):
+    if isinstance(value, (While, DoWhile, ForEach, ForRange)):
         return any(contains_vm_unsupported(inner) for inner in value.body)
     if isinstance(value, Try):
         return any(contains_vm_unsupported(inner) for inner in value.body) or any(

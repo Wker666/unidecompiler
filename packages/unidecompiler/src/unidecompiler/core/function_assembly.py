@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from unidecompiler.core.ir import BasicBlock, ExceptionalEdge, FunctionIR, ModuleIR, SourceRef, Stmt, Terminator
+from unidecompiler.core.ir import BasicBlock, ExceptionalEdge, ExceptionalTransfer, FunctionIR, ModuleIR, SourceRef, Stmt, Terminator
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,9 @@ class FunctionBlockSpec:
     terminator: Terminator | None = None
     exception_edge: ExceptionalEdge | None = None
     active_exception_handlers: tuple[str, ...] = ()
+    # Appended after the legacy fields to preserve positional construction for
+    # existing frontend/core callers.  New code should pass it by keyword.
+    exception_transfers: tuple[ExceptionalTransfer, ...] = ()
 
 
 def assemble_entry_function(
@@ -52,6 +55,7 @@ def assemble_function(
                 id=block.id,
                 statements=block.statements,
                 terminator=block.terminator,
+                exception_transfers=block.exception_transfers,
                 exception_edge=block.exception_edge,
                 active_exception_handlers=block.active_exception_handlers,
             )

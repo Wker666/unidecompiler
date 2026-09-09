@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import fields, is_dataclass, replace
 
-from unidecompiler.core.cfg import build_cfg
+from unidecompiler.core.cfg import build_cfg, validate_cfg_consistency
 from unidecompiler.core.ir import (
     Assign,
     AssignMany,
     BasicBlock,
     BinaryOp,
     Const,
+    DoWhile,
     Expr,
     FunctionIR,
     ForEach,
@@ -21,6 +22,7 @@ from unidecompiler.core.ir import (
     Stmt,
     Var,
     While,
+    exceptional_transfers,
 )
 
 
@@ -95,7 +97,13 @@ def refine_recovered_function(
             from unidecompiler.core.low_level_cfg_structuring import structure_low_level_cfg
 
             structured = structure_low_level_cfg(current, is_safe=is_safe)
-            if structured is not None and _function_fingerprint(structured) != fingerprint:
+            if structured is not None and (
+                _function_fingerprint(structured) != fingerprint
+                # Rejection/proof records do not alter the scheduling key,
+                # but they are required diagnostics for a preserved CFG and
+                # must survive this coordinator boundary.
+                or structured.metadata != current.metadata
+            ):
                 if (
                     current.recovery_kind == "generic-vm-low-level-cfg-structured"
                     and structured.recovery_kind != "generic-vm-low-level-cfg-structured"
@@ -323,23 +331,33 @@ def _next_refinement(function: FunctionIR) -> FunctionIR | None:
             )
 
     # An explicit jump to the physically next block is exactly the existing
-    # implicit fallthrough edge.  In an exceptional CFG, retain empty routing
-    # blocks as the preservation floor; a non-empty block's jump is still a
-    # proven no-op, and removing it does not touch its exceptional edge.
+    # implicit fallthrough edge.  On the low-level preservation floor we only
+    # remove it when the successor has one concrete predecessor.  That extra
+    # guard keeps normalization from changing which shared join a later
+    # structurer sees; the structured path already has its own topology proof.
+    # In an exceptional CFG, retain empty routing blocks as the preservation
+    # floor; a non-empty block's jump is still a proven no-op, and removing it
+    # does not touch its exceptional edge.
     exceptional_context = _has_exceptional_context(function)
     allow_fallthrough_cleanup = (
-        function.recovery_kind == "generic-vm-low-level-cfg-structured"
-        and not exceptional_context
-    ) or (
         function.recovery_kind == "generic-vm-low-level-cfg"
-        and exceptional_context
+        or (
+            function.recovery_kind == "generic-vm-low-level-cfg-structured"
+            and not exceptional_context
+        )
     )
     if allow_fallthrough_cleanup:
         for index, block in enumerate(function.blocks[:-1]):
             if (
+                (index > 0 or function.recovery_kind != "generic-vm-low-level-cfg")
+                and
                 (not exceptional_context or block.statements)
                 and isinstance(block.terminator, Jump)
                 and block.terminator.target == function.blocks[index + 1].id
+                and (
+                    function.recovery_kind != "generic-vm-low-level-cfg"
+                    or len(cfg.predecessors(function.blocks[index + 1].id)) == 1
+                )
             ):
                 provenance = function.control_provenance
                 if block.terminator.source is not None:
@@ -443,7 +461,7 @@ def _rewrite_first_expression(
             continue
         field_value = getattr(value, field.name)
         child_nested_control = nested_control or isinstance(
-            value, (If, While, ForEach, ForRange)
+            value, (If, While, DoWhile, ForEach, ForRange)
         )
         rewritten, changed = _rewrite_first_expression(
             field_value,
@@ -639,7 +657,7 @@ def _nested_statement_sequences(
 ) -> tuple[tuple[str, tuple[Stmt, ...]], ...]:
     if isinstance(statement, If):
         return (("then_body", statement.then_body), ("else_body", statement.else_body))
-    if isinstance(statement, (While, ForEach, ForRange)):
+    if isinstance(statement, (While, DoWhile, ForEach, ForRange)):
         return (("body", statement.body),)
     return ()
 
@@ -677,7 +695,7 @@ def _refinement_is_valid(original: FunctionIR, rewritten: FunctionIR) -> bool:
     ):
         return False
     if any(
-        left.exception_edge != right.exception_edge
+        exceptional_transfers(left) != exceptional_transfers(right)
         or left.active_exception_handlers != right.active_exception_handlers
         for left, right in zip(original.blocks, rewritten.blocks)
     ):
@@ -695,18 +713,27 @@ def _refinement_is_valid(original: FunctionIR, rewritten: FunctionIR) -> bool:
 
     original_cfg = build_cfg(original)
     rewritten_cfg = build_cfg(rewritten)
-    if original_cfg.diagnostics or rewritten_cfg.diagnostics:
+    if (
+        original_cfg.diagnostics
+        or rewritten_cfg.diagnostics
+        or validate_cfg_consistency(original_cfg)
+        or validate_cfg_consistency(rewritten_cfg)
+    ):
+        return False
+    if original_cfg.block_ids != rewritten_cfg.block_ids:
         return False
     return _semantic_edges(original_cfg) == _semantic_edges(rewritten_cfg)
 
 
-def _semantic_edges(cfg) -> tuple[tuple[str, str, str], ...]:
+def _semantic_edges(cfg) -> tuple[tuple[str, str, str, int, object], ...]:
     return tuple(
         sorted(
             (
                 edge.source,
                 edge.target,
                 "unconditional" if edge.kind in {"jump", "fallthrough"} else edge.kind,
+                edge.ordinal,
+                edge.provenance,
             )
             for edge in cfg.edges
         )
@@ -715,14 +742,14 @@ def _semantic_edges(cfg) -> tuple[tuple[str, str, str], ...]:
 
 def _has_exceptional_context(function: FunctionIR) -> bool:
     return any(
-        block.exception_edge is not None or block.active_exception_handlers
+        exceptional_transfers(block) or block.active_exception_handlers
         for block in function.blocks
     )
 
 
 def _contains_empty_control_body(function: FunctionIR) -> bool:
     def visit(value: object) -> bool:
-        if isinstance(value, (While, ForEach, ForRange)) and not value.body:
+        if isinstance(value, (While, DoWhile, ForEach, ForRange)) and not value.body:
             return True
         if isinstance(value, If) and not value.then_body and not value.else_body:
             return True
@@ -740,12 +767,26 @@ def _contains_empty_control_body(function: FunctionIR) -> bool:
 
 
 def _function_fingerprint(function: FunctionIR) -> object:
+    # Audit metadata (proofs, matcher attempts, bytecode context, and
+    # diagnostics) is intentionally append-only and can become large on a
+    # handler-heavy CFG.  It does not affect any recovery decision, so
+    # serializing it into every fixed-point key both wastes time and can turn
+    # a finite refinement into quadratic/exponential ``repr`` work.  Include
+    # only the small flags that alter pass scheduling.
+    metadata = function.metadata
+    scheduling_metadata = tuple(
+        sorted(
+            (key, repr(metadata[key]))
+            for key in ("recovery_phi_materialized", "low_level_cfg_structured")
+            if key in metadata
+        )
+    )
     return (
         function.recovery_kind,
         function.blocks,
         function.control_provenance,
         function.bytecode_control_flow,
-        tuple(sorted((str(key), repr(value)) for key, value in function.metadata.items())),
+        scheduling_metadata,
     )
 
 

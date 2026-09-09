@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+from types import MappingProxyType
+from typing import Mapping
 
-from unidecompiler.core.ir import BasicBlock, Branch, FunctionIR, Jump, MultiBranch, Raise, Reraise, Return, SourceRef
+from unidecompiler.core.ir import BasicBlock, Branch, FunctionIR, Jump, MultiBranch, Raise, Reraise, Return, SourceRef, exceptional_transfers
 
 
 @dataclass(frozen=True)
@@ -31,12 +33,50 @@ class CFGEdge:
         return self.edge_id
 
 
+def normal_edge_ordinal(
+    terminator_ordinal: int,
+    *,
+    has_exception_edge: bool | None = None,
+    exception_transfer_count: int | None = None,
+) -> int:
+    """Map a terminator-local edge ordinal to the concrete CFG ordinal.
+
+    ``build_cfg`` emits one exceptional edge before the ordinary terminator
+    edges.  VM region lifting uses the latter's local order while it computes
+    Phi inputs, so both layers must use this single layout rule.
+    """
+
+    if terminator_ordinal < 0:
+        raise ValueError("terminator edge ordinal must be non-negative")
+    if exception_transfer_count is None:
+        exception_transfer_count = int(bool(has_exception_edge))
+    if exception_transfer_count < 0:
+        raise ValueError("exception transfer count must be non-negative")
+    return terminator_ordinal + exception_transfer_count
+
+
 @dataclass(frozen=True)
 class CFG:
     entry: str | None
-    blocks: dict[str, BasicBlock]
+    blocks: Mapping[str, BasicBlock]
     edges: tuple[CFGEdge, ...]
     diagnostics: tuple[str, ...] = ()
+    # Keep the source block sequence separately from the lookup map.  A plain
+    # dict would silently collapse duplicate IDs before the consistency gate
+    # could report them, which would make the snapshot non-auditable.
+    declared_block_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Freeze lookup state even for callers constructing ``CFG`` directly."""
+
+        if not isinstance(self.blocks, MappingProxyType):
+            object.__setattr__(self, "blocks", MappingProxyType(dict(self.blocks)))
+        if not self.declared_block_ids:
+            object.__setattr__(self, "declared_block_ids", tuple(self.blocks))
+        else:
+            object.__setattr__(self, "declared_block_ids", tuple(self.declared_block_ids))
+        object.__setattr__(self, "edges", tuple(self.edges))
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     def successors(self, block_id: str) -> tuple[str, ...]:
         return tuple(edge.target for edge in self.edges if edge.source == block_id)
@@ -64,6 +104,47 @@ class CFG:
 
         return CFGAnalysis.from_cfg(self)
 
+    @property
+    def block_ids(self) -> tuple[str, ...]:
+        """Return the deterministic block identity set for this snapshot."""
+
+        return self.declared_block_ids or tuple(self.blocks)
+
+    @property
+    def snapshot_key(self) -> tuple[tuple[object, ...], ...]:
+        """Return the deterministic identity of this immutable CFG snapshot.
+
+        Topology alone is insufficient for exceptional CFGs: two graphs can
+        have identical endpoints while disagreeing about the precise throwing
+        instruction, handler stack contract, or incoming stack values.  Keep
+        those immutable transfer facts in the snapshot identity so rewrite
+        evidence cannot be replayed against a semantically different graph.
+        """
+
+        edges = tuple(
+            ("edge", edge.source, edge.target, edge.kind, edge.ordinal)
+            for edge in self.edges
+        )
+        transfers = tuple(
+            (
+                "exception-transfer",
+                block.id,
+                transfer.target,
+                transfer.source,
+                transfer.ordinal,
+                tuple(transfer.stack_snapshot),
+                tuple(transfer.handler_chain),
+            )
+            for block in self.blocks.values()
+            for transfer in exceptional_transfers(block)
+        )
+        active_handlers = tuple(
+            ("active-handler-context", block.id, tuple(block.active_exception_handlers))
+            for block in self.blocks.values()
+            if block.active_exception_handlers
+        )
+        return (*edges, *transfers, *active_handlers)
+
 
 @dataclass(frozen=True)
 class CFGAnalysis:
@@ -75,6 +156,12 @@ class CFGAnalysis:
     """
 
     cfg: CFG
+
+    @property
+    def snapshot_key(self) -> tuple[tuple[object, ...], ...]:
+        """Expose the source CFG identity used by all lazy analysis facts."""
+
+        return self.cfg.snapshot_key
 
     @classmethod
     def from_cfg(cls, cfg: CFG) -> "CFGAnalysis":
@@ -116,6 +203,41 @@ class CFGAnalysis:
     def irreducible_blocks(self) -> frozenset[str]:
         return find_irreducible_blocks(self.cfg)
 
+    @cached_property
+    def unreachable_blocks(self) -> frozenset[str]:
+        """Blocks not reachable from the function entry.
+
+        Unreachability is an analysis fact, not a malformed-CFG diagnostic;
+        frontends may legitimately retain detached handler or metadata blocks.
+        """
+
+        return unreachable_blocks(self.cfg)
+
+    @cached_property
+    def exception_edges(self) -> tuple[CFGEdge, ...]:
+        return tuple(edge for edge in self.cfg.edges if edge.kind == "exception")
+
+    @cached_property
+    def backedges(self) -> tuple[CFGEdge, ...]:
+        return tuple(
+            edge
+            for edge in self.cfg.edges
+            if edge.target in self.dominators.get(edge.source, frozenset())
+        )
+
+    @cached_property
+    def loop_exit_edges(self) -> tuple[CFGEdge, ...]:
+        exit_ids = {
+            edge.edge_id
+            for loop in self.loop_infos
+            for edge in loop.exits
+        }
+        return tuple(edge for edge in self.cfg.edges if edge.edge_id in exit_ids)
+
+    @cached_property
+    def irreducible_entry_edges(self) -> tuple[CFGEdge, ...]:
+        return self.irreducible_edges
+
 
 @dataclass(frozen=True)
 class NaturalLoop:
@@ -143,21 +265,24 @@ class LoopInfo:
 
 
 def build_cfg(function: FunctionIR) -> CFG:
-    blocks = {block.id: block for block in function.blocks}
+    block_ids = tuple(block.id for block in function.blocks)
+    blocks = MappingProxyType({block.id: block for block in function.blocks})
     entry = function.blocks[0].id if function.blocks else None
     edges: list[CFGEdge] = []
     diagnostics: list[str] = []
+    if len(block_ids) != len(set(block_ids)):
+        diagnostics.append("CFG contains duplicate block ids")
 
     for index, block in enumerate(function.blocks):
-        if block.exception_edge is not None:
+        for transfer in exceptional_transfers(block):
             _add_edge(
                 edges,
                 diagnostics,
                 blocks,
                 block.id,
-                block.exception_edge.target,
+                transfer.target,
                 "exception",
-                block.exception_edge.source,
+                transfer.source,
             )
         terminator = block.terminator
         if isinstance(terminator, Branch):
@@ -190,7 +315,100 @@ def build_cfg(function: FunctionIR) -> CFG:
         blocks=blocks,
         edges=tuple(edges),
         diagnostics=tuple(diagnostics),
+        declared_block_ids=block_ids,
     )
+
+
+def validate_cfg_consistency(cfg: CFG) -> tuple[str, ...]:
+    """Validate graph facts without collapsing concrete parallel edges.
+
+    This is deliberately representation-level validation.  It does not claim
+    that a CFG is structurally reducible or semantically correct; it checks the
+    invariants required before a rewrite may consume its snapshot.
+    """
+
+    diagnostics = list(cfg.diagnostics)
+    # ``CFG`` can also be constructed directly by analysis clients.  In that
+    # case the lookup map may already have collapsed duplicate IDs, so retain
+    # the declared sequence as the authoritative identity check.
+    if len(cfg.block_ids) != len(set(cfg.block_ids)):
+        diagnostics.append("CFG contains duplicate block ids")
+    if cfg.entry is not None and cfg.entry not in cfg.blocks:
+        diagnostics.append(f"entry points to missing block {cfg.entry}")
+    outgoing: dict[str, list[CFGEdge]] = {}
+    for edge in cfg.edges:
+        if not edge.source:
+            diagnostics.append("CFG edge has an empty source")
+        if not edge.target:
+            diagnostics.append("CFG edge has an empty target")
+        if not edge.kind:
+            diagnostics.append(f"CFG edge {edge.source}->{edge.target} has an empty kind")
+        if edge.ordinal < 0:
+            diagnostics.append(f"CFG edge {edge.edge_id} has a negative ordinal")
+        if edge.source not in cfg.blocks:
+            diagnostics.append(f"edge source {edge.source} is missing")
+        if edge.target not in cfg.blocks:
+            diagnostics.append(f"edge target {edge.target} is missing")
+        outgoing.setdefault(edge.source, []).append(edge)
+
+    for block in cfg.blocks.values():
+        exception_edges = tuple(
+            edge for edge in outgoing.get(block.id, ()) if edge.kind == "exception"
+        )
+        transfers = exceptional_transfers(block)
+        if not transfers:
+            if exception_edges:
+                diagnostics.append(f"exception edge exists for block without exception metadata: {block.id}")
+            continue
+        if len(exception_edges) != len(transfers):
+            diagnostics.append(f"exception metadata for {block.id} does not match CFG edge count")
+            continue
+        ordinals = tuple(transfer.ordinal for transfer in transfers)
+        if ordinals != tuple(range(len(transfers))):
+            diagnostics.append(f"exception transfer ordinals for {block.id} are not contiguous")
+        for transfer, edge in zip(transfers, exception_edges):
+            if edge.target != transfer.target:
+                diagnostics.append(f"exception edge target mismatch for {block.id}")
+            if edge.provenance != transfer.source:
+                diagnostics.append(f"exception edge provenance mismatch for {block.id}")
+            # Exceptional transfers are emitted before ordinary successors,
+            # so their declared ordinal is the concrete CFG edge ordinal.
+            # Reject reordered parallel handler edges instead of silently
+            # accepting a stale stack/Phi association.
+            if edge.ordinal != transfer.ordinal:
+                diagnostics.append(
+                    f"exception transfer ordinal mismatch for {block.id}: "
+                    f"declared {transfer.ordinal}, concrete {edge.ordinal}"
+                )
+            # Legacy ``ExceptionalEdge`` did not require instruction
+            # provenance.  New concrete transfer producers do, while this
+            # compatibility adapter remains readable for existing clients.
+            if transfer.source is None and block.exception_transfers:
+                diagnostics.append(f"exception transfer for {block.id} has no source provenance")
+            if not all(isinstance(handler, str) and handler for handler in transfer.handler_chain):
+                diagnostics.append(f"exception transfer for {block.id} has malformed handler chain")
+
+    for block_id, edges in outgoing.items():
+        ordinals = tuple(edge.ordinal for edge in edges)
+        if ordinals != tuple(range(len(edges))):
+            diagnostics.append(f"outgoing edge ordinals for {block_id} are not contiguous")
+    return tuple(dict.fromkeys(diagnostics))
+
+
+def unreachable_blocks(cfg: CFG) -> frozenset[str]:
+    """Return unreachable blocks as an analysis fact, not a malformed CFG error."""
+
+    if cfg.entry is None:
+        return frozenset(cfg.blocks)
+    reachable = {cfg.entry}
+    pending = [cfg.entry]
+    while pending:
+        current = pending.pop()
+        for edge in cfg.outgoing_edges(current):
+            if edge.target not in reachable and edge.target in cfg.blocks:
+                reachable.add(edge.target)
+                pending.append(edge.target)
+    return frozenset(set(cfg.blocks) - reachable)
 
 
 def compute_dominators(cfg: CFG) -> dict[str, frozenset[str]]:

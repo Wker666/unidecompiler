@@ -532,6 +532,14 @@ def _jvm_bytecode_steps(method: JavaMethodListing) -> tuple[VMBytecodeStep, ...]
                     "end": region.end,
                     "target": region.target,
                     "exception_type": region.exception_type,
+                    # JVM handlers enter with the thrown value as their sole
+                    # operand-stack item.  Keep that neutral contract
+                    # explicit so core can materialize and validate every
+                    # exceptional edge instead of guessing an empty stack.
+                    "depth": 0,
+                    "stack_depth": 0,
+                    "stack_suffix": ("exception",),
+                    "lasti": False,
                 },
                 label="protected-region",
             )

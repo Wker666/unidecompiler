@@ -62,6 +62,22 @@ passes. A rewrite such as Phi cleanup or fallthrough-jump removal is valid only
 when exact predecessor edges, exception state, and data-flow equivalence are
 proved. When those facts are unavailable, retain the low-level CFG/goto form.
 
+The generic `Phi` value retains its logical incoming labels and may additionally
+carry one concrete CFG `edge_id` per incoming value. Parallel predecessor edges
+must use these edge identities; they must never be collapsed into a dictionary
+keyed only by block ID. CFG lookup maps are read-only snapshots and preserve the
+declared block identity sequence for duplicate-ID diagnostics.
+
+The shared CFG validator also checks entry and target existence, contiguous
+parallel-edge ordinals, exception-edge provenance, and malformed edge fields.
+Accepted core rewrites record auditable `recovery_proofs` metadata containing
+the rule, concrete block/edge IDs, CFG snapshot key, and raw context; rejected
+candidates record `recovery_rejections`. These records are diagnostics only and
+must not be consumed by a frontend or backend as control-flow instructions.
+Region reduction has a deterministic fixed-point budget and repeated-state
+diagnostic. It always returns the last verified function when a candidate is
+rejected, a state repeats, or the budget is exhausted.
+
 Useful source metadata should flow through the pipeline when available,
 including source filenames, bytecode versions, constants, debug tables,
 instruction offsets, line info, local variable info, upvalue or member names,

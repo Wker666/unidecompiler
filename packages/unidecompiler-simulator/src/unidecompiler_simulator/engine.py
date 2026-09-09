@@ -22,7 +22,11 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    ExceptionRewrite,
+    ExceptionCleanupValue,
+    ExceptionResumePosition,
     Delete,
+    DoWhile,
     ResumeInput,
     UndefinedLiteral,
     Continue,
@@ -53,6 +57,7 @@ from unidecompiler.core.ir import (
     StoreAttr,
     StoreItem,
     Switch,
+    Fallthrough,
     TableLiteral,
     Try,
     UnaryOp,
@@ -61,6 +66,7 @@ from unidecompiler.core.ir import (
     While,
     Yield,
     ModuleIR,
+    exceptional_transfers,
 )
 from unidecompiler.core.operators import normalize_numeric_operator
 from unidecompiler.input_sources import expand_input_path
@@ -174,9 +180,15 @@ class _SimulationStop(Exception):
 
 
 class _Raised(Exception):
-    def __init__(self, value: Any, cause: Any | None = None) -> None:
+    def __init__(
+        self,
+        value: Any,
+        cause: Any | None = None,
+        source: object | None = None,
+    ) -> None:
         self.value = value
         self.cause = cause
+        self.source = source
 
 
 class _ReturnSignal(Exception):
@@ -192,9 +204,19 @@ class _ContinueSignal(Exception):
     pass
 
 
+class _FallthroughSignal(Exception):
+    pass
+
+
 class _YieldSignal(Exception):
     def __init__(self, value: Any) -> None:
         self.value = value
+
+
+@dataclass(frozen=True)
+class _EvaluatedExceptionRewrite:
+    value: Any
+    cause: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +242,7 @@ class _Frame:
     locals: dict[str, Any]
     context: object | None
     predecessor: str | None = None
+    predecessor_edge: str | None = None
     active_exception: _Raised | None = None
     active_exception_handlers: list[tuple[_Raised, str]] = field(default_factory=list)
 
@@ -454,6 +477,15 @@ class _Runner:
                 events=tuple(self.events),
                 trace_truncated=self.trace_truncated,
             )
+        except _FallthroughSignal:
+            return SimulationResult(
+                status=SimulationStatus.UNSUPPORTED,
+                locals=snapshot_value(self.last_locals),
+                steps=self.steps,
+                diagnostic="fallthrough used outside a switch arm",
+                events=tuple(self.events),
+                trace_truncated=self.trace_truncated,
+            )
         except _Raised as raised:
             locals_ = snapshot_value(self.last_locals)
             return SimulationResult(
@@ -511,23 +543,31 @@ class _Runner:
                             if index >= len(function.blocks):
                                 return ()
                             frame.predecessor = current
+                            frame.predecessor_edge = f"{current}:{function.blocks[index].id}:fallthrough:0"
                             current = function.blocks[index].id
                         elif isinstance(terminator, Return):
                             return self._eval_values(terminator.values)
                         elif isinstance(terminator, Jump):
                             frame.predecessor = current
+                            frame.predecessor_edge = f"{current}:{terminator.target}:jump:0"
                             current = terminator.target
                         elif isinstance(terminator, Branch):
                             frame.predecessor = current
-                            current = (
+                            branch_true = self._truthy(self._eval_expr(terminator.condition))
+                            target = (
                                 terminator.true_target
-                                if self._truthy(self._eval_expr(terminator.condition))
+                                if branch_true
                                 else terminator.false_target
                             )
+                            ordinal = 0 if branch_true else 1
+                            frame.predecessor_edge = f"{current}:{target}:{'true' if branch_true else 'false'}:{ordinal}"
+                            current = target
                         elif isinstance(terminator, MultiBranch):
                             selector = self._eval_expr(terminator.selector)
                             current = terminator.default_target
-                            for value, target in terminator.cases:
+                            selected_ordinal = len(terminator.cases)
+                            selected_kind = "default"
+                            for index, (value, target) in enumerate(terminator.cases):
                                 if self._truthy(
                                     self._binary(
                                         "==",
@@ -538,16 +578,40 @@ class _Runner:
                                     )
                                 ):
                                     current = target
+                                    selected_ordinal = index
+                                    selected_kind = f"case:{getattr(value, 'value', value)}"
                                     break
                             frame.predecessor = block.id
+                            frame.predecessor_edge = f"{block.id}:{current}:{selected_kind}:{selected_ordinal}"
                         else:
                             self._unsupported(
                                 f"unsupported terminator {type(terminator).__name__}"
                             )
                     except _Raised as raised:
-                        if block.exception_edge is None:
+                        transfers = exceptional_transfers(block)
+                        if not transfers:
                             raise
-                        target = block.exception_edge.target
+                        # A generic evaluator does not execute VM opcodes, so
+                        # it can only select a transfer when the recovered IR
+                        # retained a unique target for this block.  Multiple
+                        # transfers require instruction-level raise provenance
+                        # that is not available at this boundary; guessing a
+                        # catch handler would be a semantic error.
+                        matching = tuple(
+                            transfer
+                            for transfer in transfers
+                            if raised.source is not None
+                            and transfer.source == raised.source
+                        )
+                        if len(matching) == 1:
+                            selected = matching[0]
+                        elif len(transfers) == 1 and raised.source is None:
+                            selected = transfers[0]
+                        else:
+                            self._unsupported(
+                                "exceptional transfer is ambiguous or lacks matching source provenance"
+                            )
+                        target = selected.target
                         target_block = blocks.get(target)
                         self._enter_exception_handler(
                             frame,
@@ -556,6 +620,9 @@ class _Runner:
                             raised,
                         )
                         frame.predecessor = current
+                        frame.predecessor_edge = (
+                            f"{current}:{target}:exception:{selected.ordinal}"
+                        )
                         current = target
                         continue
                 except _ReturnSignal as returned:
@@ -694,8 +761,10 @@ class _Runner:
             self._execute_statements(body, block_id)
         elif isinstance(statement, Switch):
             selector = self._eval_expr(statement.selector)
-            body = statement.default_body
-            for value, candidate in statement.cases:
+            bodies = [body for _value, body in statement.cases]
+            bodies.append(statement.default_body)
+            selected = len(bodies) - 1
+            for index, (value, _candidate) in enumerate(statement.cases):
                 if self._truthy(
                     self._binary(
                         "==",
@@ -705,9 +774,16 @@ class _Runner:
                         "dynamic",
                     )
                 ):
-                    body = candidate
+                    selected = index
                     break
-            self._execute_statements(body, block_id)
+            for index in range(selected, len(bodies)):
+                try:
+                    self._execute_statements(bodies[index], block_id)
+                except _FallthroughSignal:
+                    if index == len(bodies) - 1:
+                        self._unsupported("fallthrough from the final switch arm")
+                    continue
+                break
         elif isinstance(statement, While):
             while self._truthy(self._eval_expr(statement.condition)):
                 self._tick(statement.source)
@@ -717,6 +793,17 @@ class _Runner:
                     break
                 except _ContinueSignal:
                     continue
+        elif isinstance(statement, DoWhile):
+            while True:
+                self._tick(statement.source)
+                try:
+                    self._execute_statements(statement.body, block_id)
+                except _BreakSignal:
+                    break
+                except _ContinueSignal:
+                    pass
+                if not self._truthy(self._eval_expr(statement.condition)):
+                    break
         elif isinstance(statement, ForEach):
             for value in self._iter(self._eval_expr(statement.iterable)):
                 frame.locals[statement.target.name] = value
@@ -746,13 +833,33 @@ class _Runner:
             raise _BreakSignal
         elif isinstance(statement, Continue):
             raise _ContinueSignal
+        elif isinstance(statement, Fallthrough):
+            raise _FallthroughSignal
         elif isinstance(statement, Raise):
-            value = self._eval_expr(statement.value)
-            cause = None if statement.cause is None else self._eval_expr(statement.cause)
-            raise _Raised(value, cause)
+            if isinstance(statement.value, ExceptionRewrite):
+                rewritten = self._eval_exception_rewrite(statement.value)
+                value = rewritten.value
+                cause = (
+                    rewritten.cause
+                    if statement.cause is None
+                    else self._eval_expr(statement.cause)
+                )
+            else:
+                value = self._eval_expr(statement.value)
+                cause = None if statement.cause is None else self._eval_expr(statement.cause)
+            raise _Raised(value, cause, statement.source)
         elif isinstance(statement, Return):
             raise _ReturnSignal(self._eval_values(statement.values))
         elif isinstance(statement, Reraise):
+            if statement.value is not None:
+                # A recovered explicit rethrow has already selected its
+                # handler value.  The VM consumes the exception value first,
+                # followed by resume metadata; evaluate in that same order so
+                # deferred expressions cannot observe a reordered side effect.
+                value = self._eval_expr(statement.value)
+                for slot in statement.resume_slots:
+                    self._eval_expr(slot)
+                raise _Raised(value, source=statement.source)
             if frame.active_exception is None:
                 self._unsupported("reraise used outside an active exception handler")
             raise frame.active_exception
@@ -765,8 +872,12 @@ class _Runner:
                 try:
                     handled = False
                     for handler in statement.handlers:
-                        expected = self._eval_expr(handler.exception_type)
-                        if self._matches_exception(raised.value, expected, frame.context):
+                        expected = (
+                            None
+                            if handler.exception_type is None
+                            else self._eval_expr(handler.exception_type)
+                        )
+                        if expected is None or self._matches_exception(raised.value, expected, frame.context):
                             if handler.binding is not None:
                                 frame.locals[handler.binding.name] = raised.value
                             self._execute_statements(handler.body, block_id)
@@ -804,6 +915,54 @@ class _Runner:
                     "current exception used outside an active exception handler"
                 )
             return frame.active_exception.value
+        if isinstance(expr, ExceptionRewrite):
+            return self._eval_exception_rewrite(expr).value
+        if isinstance(expr, ExceptionCleanupValue):
+            value = self._eval_expr(expr.value)
+            operand = (
+                None
+                if expr.predicate_operand is None
+                else self._eval_expr(expr.predicate_operand)
+            )
+            predicate = (
+                True
+                if expr.predicate is None
+                else self._eval_expr(expr.predicate)
+            )
+            if not isinstance(predicate, bool):
+                input_exception = (
+                    None
+                    if expr.input_exception is None
+                    else self._eval_expr(expr.input_exception)
+                )
+                resolved = self._adapter_value(
+                    "cleanup_exception",
+                    value,
+                    input_exception,
+                    predicate,
+                    operand,
+                    expr.propagate_input,
+                    frame.context,
+                )
+                if resolved is NotHandled:
+                    self._unsupported(
+                        "exception cleanup requires an explicit runtime predicate"
+                    )
+                return resolved
+            if predicate:
+                return value
+            input_exception = (
+                None
+                if expr.input_exception is None
+                else self._eval_expr(expr.input_exception)
+            )
+            if expr.propagate_input and input_exception is not None:
+                raise _Raised(input_exception, source=expr.source)
+            return input_exception if input_exception is not None else value
+        if isinstance(expr, ExceptionResumePosition):
+            self._unsupported(
+                "exception resume position requires an explicit VM runtime fact"
+            )
         if isinstance(expr, ResumeInput):
             self._unsupported("generator resume input requires an explicit resumption request")
         if isinstance(expr, Global):
@@ -986,6 +1145,25 @@ class _Runner:
                 self._unsupported("empty phi expression")
             predecessor = frame.predecessor
             labels = tuple(label for label, _value in expr.incoming)
+            if expr.edge_ids:
+                if len(expr.edge_ids) != len(expr.incoming) or len(set(expr.edge_ids)) != len(expr.edge_ids):
+                    self._unsupported("phi expression has invalid concrete edge identities")
+                edge = frame.predecessor_edge
+                if edge is not None and edge in expr.edge_ids:
+                    return self._eval_expr(
+                        expr.incoming[expr.edge_ids.index(edge)][1]
+                    )
+                # A caller may enter a structured region without retaining the
+                # physical edge token.  Only fall back to a unique logical
+                # label; never collapse duplicate labels into a dictionary.
+                matches = [
+                    value for label, value in expr.incoming if label == predecessor
+                ]
+                if len(matches) == 1:
+                    return self._eval_expr(matches[0])
+                self._unsupported(
+                    f"phi has no incoming concrete edge for predecessor {predecessor!r}"
+                )
             if len(labels) != len(set(labels)):
                 self._unsupported("phi expression has duplicate predecessor labels")
             incoming = dict(expr.incoming)
@@ -995,6 +1173,37 @@ class _Runner:
                 return self._eval_expr(next(iter(incoming.values())))
             self._unsupported(f"phi has no incoming value for predecessor {predecessor!r}")
         self._unsupported(f"unsupported expression {type(expr).__name__}")
+
+    def _eval_exception_rewrite(self, expr: ExceptionRewrite) -> _EvaluatedExceptionRewrite:
+        """Evaluate one conditional exception rewrite exactly once."""
+
+        frame = self.frames[-1]
+        value = self._eval_expr(expr.value)
+        predicate = self._eval_expr(expr.predicate)
+        if not isinstance(predicate, bool):
+            resolved = self._adapter_value(
+                "rewrite_exception",
+                value,
+                predicate,
+                self._eval_expr(expr.replacement),
+                expr.retain_input_as_cause,
+                frame.context,
+            )
+            if resolved is not NotHandled:
+                # Adapter-provided runtime facts select the rewritten value;
+                # they do not replace the neutral cause contract.  Preserve
+                # the original input as the cause whenever the IR requested
+                # it, including the opaque-predicate path.
+                return _EvaluatedExceptionRewrite(
+                    resolved,
+                    value if expr.retain_input_as_cause else None,
+                )
+            self._unsupported("exception rewrite requires an explicit runtime predicate")
+        if not predicate:
+            return _EvaluatedExceptionRewrite(value)
+        replacement = self._eval_expr(expr.replacement)
+        cause = value if expr.retain_input_as_cause else None
+        return _EvaluatedExceptionRewrite(replacement, cause)
 
     def _invoke(
         self,
@@ -1080,7 +1289,7 @@ class _Runner:
             stderr=result.stderr,
         )
         if result.status is ExternalCallStatus.RAISED:
-            raise _Raised(result.exception)
+            raise _Raised(result.exception, source=source)
         return self._call_result(tuple(result.values), returns)
 
     def _call_result(self, values: tuple[Any, ...], returns: int | str) -> Any:

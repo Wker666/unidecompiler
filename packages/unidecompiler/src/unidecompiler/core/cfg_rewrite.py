@@ -3,13 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Literal
 
-from unidecompiler.core.cfg import build_cfg
+from unidecompiler.core.cfg import build_cfg, validate_cfg_consistency
+from unidecompiler.core.value_validation import validate_value_invariants
 from unidecompiler.core.ir import (
     BasicBlock,
     Branch,
     Break,
     Const,
     Continue,
+    DoWhile,
+    Fallthrough,
     ForEach,
     ForRange,
     FunctionIR,
@@ -23,6 +26,7 @@ from unidecompiler.core.ir import (
     Try,
     Unsupported,
     While,
+    exceptional_transfers,
 )
 
 
@@ -44,7 +48,10 @@ class RewriteEvidence:
     # Optional immutable identity of the CFG snapshot used by the matcher.
     # When supplied, the common gate recomputes the key from ``original`` and
     # rejects stale evidence instead of trusting a block-id comparison.
-    snapshot_key: tuple[tuple[str, str, str, int], ...] | None = None
+    snapshot_key: tuple[tuple[object, ...], ...] | None = None
+    # Full block identity is kept separately so adding this evidence does not
+    # change the legacy positional order of ``snapshot_key``.
+    block_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,26 @@ class CFGRewriteDecision:
     accepted: bool
     function: FunctionIR
     reasons: tuple[str, ...] = ()
+    evidence: RewriteEvidence = RewriteEvidence()
+    # Keep the producer identity alongside evidence so rejection/acceptance
+    # records remain attributable even when the candidate's metadata is
+    # merged with the preservation function.
+    rule: str = ""
+
+
+@dataclass(frozen=True)
+class RecoveryDecline:
+    """A matcher-owned, auditable refusal to propose a CFG rewrite.
+
+    ``None`` remains a backwards-compatible return value for older matchers,
+    but new core matchers should return this value when they can explain why
+    a local candidate was not safe.  The reducer enriches the evidence with
+    the current immutable CFG snapshot before storing it in recovery
+    metadata.  This type deliberately contains no frontend-specific data.
+    """
+
+    rule: str
+    reasons: tuple[str, ...]
     evidence: RewriteEvidence = RewriteEvidence()
 
 
@@ -95,6 +122,8 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         reasons.append("CFG rewrite rule has no stable identity")
 
     original_cfg = build_cfg(original)
+    original_consistency = validate_cfg_consistency(original_cfg)
+    original_value_diagnostics = validate_value_invariants(original)
     original_edge_ids = {edge.edge_id for edge in original_cfg.edges}
     if any(edge_id not in original_edge_ids for edge_id in candidate.evidence.edge_ids):
         reasons.append("rewrite evidence references an edge outside the original CFG snapshot")
@@ -103,6 +132,8 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         and candidate.evidence.snapshot_key != _cfg_snapshot_key(original_cfg)
     ):
         reasons.append("rewrite evidence does not match the original CFG snapshot")
+    if candidate.evidence.block_ids and candidate.evidence.block_ids != original_cfg.block_ids:
+        reasons.append("rewrite evidence does not match the original CFG block snapshot")
 
     if (
         rewritten.name != original.name
@@ -132,10 +163,26 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         reasons.append("ordinary CFG rewriting cannot own exceptional context")
 
     rewritten_cfg = build_cfg(rewritten)
+    rewritten_consistency = validate_cfg_consistency(rewritten_cfg)
     if original_cfg.diagnostics:
         reasons.append("original CFG has unresolved targets")
     if rewritten_cfg.diagnostics:
         reasons.append("rewritten CFG has unresolved targets")
+    if original_consistency:
+        reasons.append("original CFG consistency check failed: " + "; ".join(original_consistency))
+    if original_value_diagnostics:
+        reasons.append(
+            "original violates generic value invariants: "
+            + "; ".join(original_value_diagnostics)
+        )
+    if rewritten_consistency:
+        reasons.append("rewritten CFG consistency check failed: " + "; ".join(rewritten_consistency))
+    rewritten_value_diagnostics = validate_value_invariants(rewritten)
+    if rewritten_value_diagnostics:
+        reasons.append(
+            "rewrite violates generic value invariants: "
+            + "; ".join(rewritten_value_diagnostics)
+        )
     if _metadata_was_lost(original, rewritten):
         reasons.append("frontend or recovery metadata was lost")
     if not set(original.control_provenance).issubset(rewritten.control_provenance):
@@ -152,6 +199,10 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
         reasons.append("rewrite introduced unsupported IR")
     if _has_invalid_structured_control(rewritten):
         reasons.append("rewrite introduced invalid structured loop control")
+    if _has_nested_low_level_cfg_transfer(rewritten):
+        reasons.append(
+            "rewrite leaves an explicit CFG transfer inside a structured region"
+        )
     if _semantic_literal_atoms(original) != _semantic_literal_atoms(rewritten):
         reasons.append("rewrite changed executable literal content")
     if _terminal_behavior_signature(original) != _terminal_behavior_signature(rewritten):
@@ -184,16 +235,22 @@ def validate_cfg_rewrite(candidate: CFGRewriteCandidate) -> CFGRewriteDecision:
 
     if reasons:
         return CFGRewriteDecision(
-            False, original, tuple(dict.fromkeys(reasons)), candidate.evidence
+            False,
+            original,
+            tuple(dict.fromkeys(reasons)),
+            candidate.evidence,
+            candidate.rule,
         )
-    return CFGRewriteDecision(True, rewritten, evidence=candidate.evidence)
-
-
-def _cfg_snapshot_key(cfg) -> tuple[tuple[str, str, str, int], ...]:
-    return tuple(
-        (edge.source, edge.target, edge.kind, edge.ordinal)
-        for edge in cfg.edges
+    return CFGRewriteDecision(
+        True,
+        rewritten,
+        evidence=candidate.evidence,
+        rule=candidate.rule,
     )
+
+
+def _cfg_snapshot_key(cfg) -> tuple[tuple[object, ...], ...]:
+    return cfg.snapshot_key
 
 
 def _merge_context(original: FunctionIR, rewritten: FunctionIR) -> FunctionIR:
@@ -213,9 +270,7 @@ def _has_duplicate_block_ids(blocks: tuple[BasicBlock, ...]) -> bool:
     return len(block_ids) != len(set(block_ids))
 
 
-def _exceptional_context_signature(
-    function: FunctionIR,
-) -> tuple[tuple[str, str | None, object | None, tuple[str, ...]], ...]:
+def _exceptional_context_signature(function: FunctionIR) -> tuple[tuple[object, ...], ...]:
     """Return the immutable exception facts ordinary rewrites must preserve.
 
     Ordinary region reduction may now proceed around handlers, but it may not
@@ -229,12 +284,11 @@ def _exceptional_context_signature(
             (
                 (
                     block.id,
-                    block.exception_edge.target if block.exception_edge is not None else None,
-                    block.exception_edge.source if block.exception_edge is not None else None,
+                    tuple(exceptional_transfers(block)),
                     tuple(block.active_exception_handlers),
                 )
                 for block in function.blocks
-                if block.exception_edge is not None or block.active_exception_handlers
+                if exceptional_transfers(block) or block.active_exception_handlers
             ),
             key=lambda item: item[0],
         )
@@ -273,18 +327,31 @@ def _block_source_offsets(block: BasicBlock) -> frozenset[int]:
 
 
 def _exception_protected_block_ids(function: FunctionIR) -> set[str]:
-    """Return exception blocks plus same-source handler-state clones."""
+    """Return exception sources, handler entries, and handler-state clones.
+
+    A handler target does not necessarily carry ``active_exception_handlers``
+    itself: that metadata can begin at a successor, or be unavailable in a
+    preservation CFG.  It is nevertheless the receiving endpoint of an
+    exceptional transfer, so an ordinary rewrite must not consume or modify
+    it.  Protect the concrete target directly rather than inferring handler
+    ownership from frontend-specific metadata.
+    """
 
     protected_ids = {
         block.id
         for block in function.blocks
-        if block.exception_edge is not None or block.active_exception_handlers
+        if exceptional_transfers(block) or block.active_exception_handlers
     }
-    exceptional_offsets = {
-        getattr(block.exception_edge.source, "offset", None)
+    protected_ids.update(
+        transfer.target
         for block in function.blocks
-        if block.exception_edge is not None
-        and getattr(block.exception_edge.source, "offset", None) is not None
+        for transfer in exceptional_transfers(block)
+    )
+    exceptional_offsets = {
+        getattr(transfer.source, "offset", None)
+        for block in function.blocks
+        for transfer in exceptional_transfers(block)
+        if getattr(transfer.source, "offset", None) is not None
     }
     if exceptional_offsets:
         protected_ids.update(
@@ -440,6 +507,26 @@ def _nested_control_transfer_count(function: FunctionIR) -> int:
     )
 
 
+def _has_nested_low_level_cfg_transfer(function: FunctionIR) -> bool:
+    """Reject a structured region which still carries an unlabelled CFG edge.
+
+    A top-level block terminator remains representable by the preservation CFG
+    renderer, which emits its block label.  A ``Jump``/``Branch``/``MultiBranch``
+    nested under ``If``/``Try``/loop statements has no independently retained
+    block presentation, so its target can become dangling when a matcher
+    removes the original target block.  Recovery must either consume that edge
+    into a proved structured construct or keep the complete low-level CFG.
+    """
+
+    control_types = (Jump, Branch, MultiBranch)
+    return any(
+        isinstance(value, control_types)
+        for block in function.blocks
+        for statement in block.statements
+        for value in _walk_values(statement)
+    )
+
+
 def _walk_values(value: object):
     if isinstance(value, tuple):
         for item in value:
@@ -463,10 +550,16 @@ def _has_invalid_structured_control(function: FunctionIR) -> bool:
     )
 
 
-def _valid_statement_sequence(statements: tuple[object, ...], *, loop_depth: int) -> bool:
-    for statement in statements:
+def _valid_statement_sequence(
+    statements: tuple[object, ...], *, loop_depth: int, switch_arm: bool = False
+) -> bool:
+    for index, statement in enumerate(statements):
         if isinstance(statement, (Break, Continue)) and loop_depth == 0:
             return False
+        if isinstance(statement, Fallthrough):
+            if not switch_arm or index != len(statements) - 1:
+                return False
+            continue
         if isinstance(statement, If):
             if not _valid_statement_sequence(statement.then_body, loop_depth=loop_depth):
                 return False
@@ -474,13 +567,19 @@ def _valid_statement_sequence(statements: tuple[object, ...], *, loop_depth: int
                 return False
         elif isinstance(statement, Switch):
             if any(
-                not _valid_statement_sequence(body, loop_depth=loop_depth)
+                not _valid_statement_sequence(body, loop_depth=loop_depth, switch_arm=True)
                 for _value, body in statement.cases
             ):
                 return False
-            if not _valid_statement_sequence(statement.default_body, loop_depth=loop_depth):
+            # ``default_body`` is always the final arm in the generic Switch
+            # execution order.  A fallthrough there has no target and the
+            # simulator correctly treats it as unsupported, so reject it at
+            # the common rewrite boundary as well.
+            if not _valid_statement_sequence(
+                statement.default_body, loop_depth=loop_depth, switch_arm=False
+            ):
                 return False
-        elif isinstance(statement, (While, ForEach, ForRange)):
+        elif isinstance(statement, (While, DoWhile, ForEach, ForRange)):
             if not statement.body:
                 return False
             if not _valid_statement_sequence(statement.body, loop_depth=loop_depth + 1):

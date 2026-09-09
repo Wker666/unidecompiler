@@ -12,6 +12,8 @@ from unidecompiler.core.ir import (
     Call,
     Const,
     CurrentException,
+    ExceptionRewrite,
+    ExceptionCleanupValue,
     Delete as IRDelete,
     GetAttr,
     GetItem,
@@ -489,9 +491,10 @@ class RaiseWithCause(Effect):
 
 @dataclass(frozen=True)
 class ReraiseTop(Effect):
-    """Reraise the active exception without manufacturing a new value."""
+    """Propagate an active exception or an explicit stack exception value."""
 
-    pass
+    consume_stack_exception: bool = False
+    resume_slot_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -499,6 +502,40 @@ class ExceptionMatch(Effect):
     """Compare the active exception with a handler type on the stack."""
 
     pass
+
+
+@dataclass(frozen=True)
+class ConditionalExceptionCleanup(Effect):
+    """Describe a VM-neutral conditional exception cleanup operation.
+
+    The effect owns only the successful stack transition.  The exceptional
+    outcome is represented by the enclosing CFG's ``ExceptionalTransfer``;
+    ``propagate_input`` records that the input exception must remain the value
+    propagated on that path.  ``predicate`` and ``predicate_operand`` are
+    generic data facts and never name a source-language exception type.
+    """
+
+    consumed_slots: int = 0
+    success_values: tuple[Expr, ...] = ()
+    input_exception: Expr | None = None
+    propagate_input: bool = True
+    predicate: Expr | None = None
+    predicate_operand: Expr | None = None
+
+
+@dataclass(frozen=True)
+class RewriteException(Effect):
+    """Rewrite an active exception only when a neutral predicate matches.
+
+    The stack argument is always consumed.  A matching value is replaced by
+    ``replacement`` while an unmatched value is preserved.  The effect is a
+    value transformation, not an exception handler: surrounding generic IR
+    still owns the eventual ``Raise``/``Reraise`` and its CFG transfer.
+    """
+
+    predicate: Expr = field(default_factory=Expr)
+    replacement: Expr = field(default_factory=Expr)
+    retain_input_as_cause: bool = False
 
 
 @dataclass(frozen=True)
@@ -1477,7 +1514,26 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
     if isinstance(effect, ReraiseTop):
         from unidecompiler.core.ir import Reraise
 
-        state.append_statement(Reraise(source=effect.source))
+        if effect.resume_slot_count < 0:
+            return False
+        if not effect.consume_stack_exception:
+            if effect.resume_slot_count:
+                return False
+            state.append_statement(Reraise(source=effect.source))
+            return True
+        exception = state.pop()
+        if exception is None:
+            return False
+        resume_slots = state.pop_many(effect.resume_slot_count)
+        if resume_slots is None:
+            return False
+        state.append_statement(
+            Reraise(
+                source=effect.source,
+                value=exception,
+                resume_slots=resume_slots,
+            )
+        )
         return True
     if isinstance(effect, ExceptionMatch):
         expected = state.pop()
@@ -1493,6 +1549,72 @@ def apply_effect(state: StackMachineState, effect: Effect) -> bool:
                 source=effect.source,
                 callee=Global(name="exception_matches", source=effect.source),
                 args=(active, expected),
+            )
+        )
+        return True
+    if isinstance(effect, ConditionalExceptionCleanup):
+        if effect.consumed_slots < 0 or len(state.stack) < effect.consumed_slots:
+            return False
+        consumed = tuple(state.stack[-effect.consumed_slots:]) if effect.consumed_slots else ()
+        if effect.consumed_slots:
+            del state.stack[-effect.consumed_slots:]
+        # Only an explicitly supplied ``input_exception`` may be retained on
+        # the successful stack value.  Older callers use ``consumed_slots``
+        # merely to discard VM bookkeeping values; inferring the last
+        # consumed slot as an exception would silently change that legacy
+        # stack contract by wrapping otherwise ordinary success values in an
+        # ``ExceptionCleanupValue``.  Frontends that need propagation must
+        # pass the neutral input value explicitly.
+        input_exception = effect.input_exception
+        if (
+            input_exception is not None
+            or effect.predicate is not None
+            or effect.predicate_operand is not None
+            or not effect.propagate_input
+        ):
+            # These operands describe one cleanup decision, even when the
+            # effect yields multiple success values.  Materialize deferred
+            # expressions once before attaching them to each value so calls
+            # and other side effects are never repeated by later execution.
+            if input_exception is not None:
+                input_exception = state.materialize_value(
+                    input_exception, effect.source, label="cleanup_input"
+                )
+            predicate = effect.predicate
+            if predicate is not None:
+                predicate = state.materialize_value(
+                    predicate, effect.source, label="cleanup_predicate"
+                )
+            predicate_operand = effect.predicate_operand
+            if predicate_operand is not None:
+                predicate_operand = state.materialize_value(
+                    predicate_operand, effect.source, label="cleanup_operand"
+                )
+            state.stack.extend(
+                ExceptionCleanupValue(
+                    source=effect.source,
+                    value=value,
+                    input_exception=input_exception,
+                    propagate_input=effect.propagate_input,
+                    predicate=predicate,
+                    predicate_operand=predicate_operand,
+                )
+                for value in effect.success_values
+            )
+        else:
+            state.stack.extend(effect.success_values)
+        return True
+    if isinstance(effect, RewriteException):
+        value = state.pop()
+        if value is None:
+            return False
+        state.push(
+            ExceptionRewrite(
+                source=effect.source,
+                value=value,
+                predicate=effect.predicate,
+                replacement=effect.replacement,
+                retain_input_as_cause=effect.retain_input_as_cause,
             )
         )
         return True

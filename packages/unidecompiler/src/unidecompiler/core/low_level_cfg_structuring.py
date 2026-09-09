@@ -39,6 +39,7 @@ from unidecompiler.core.ir import (
     Var,
     While,
     Yield,
+    exceptional_transfers,
 )
 from unidecompiler.core.structuring import (
     StructuredWhile,
@@ -51,6 +52,19 @@ from unidecompiler.core.cfg import (
 )
 from unidecompiler.core.region import RegionGraph
 from unidecompiler.core.region_reducer import RegionReducer
+from unidecompiler.core.local_region_structuring import (
+    collapse_local_if_diamond,
+    collapse_local_infinite_loop,
+    collapse_local_linear_chain,
+    collapse_local_multi_backedge_while,
+    collapse_local_posttested_do_while,
+    collapse_local_pretested_while,
+    collapse_local_proper_if,
+    collapse_local_short_circuit,
+    collapse_local_switch,
+    collapse_local_switch_fallthrough,
+    collapse_local_while_break_continue,
+)
 
 
 LowLevelCfgStructurer = Callable[[FunctionIR], FunctionIR | None]
@@ -114,16 +128,70 @@ def structure_low_level_cfg(
         reducers=low_level_cfg_structurers(),
         normalizers=_LOW_LEVEL_CFG_NORMALIZERS,
     )
-    return reducer.reduce(function, is_safe=is_safe)
+    structured = reducer.reduce(function, is_safe=is_safe)
+    if structured is None:
+        return None
+
+    # Keep the historical exact-registry contract (one selected exact
+    # rewrite), then run only core-owned local rules as a worklist.  The local
+    # reducer accepts one atomic region at a time, rebuilds its CFG snapshot,
+    # and restarts until no further independently proven region remains.
+    if structured.recovery_kind not in {
+        "generic-vm-low-level-cfg",
+        "generic-vm-low-level-cfg-structured",
+    }:
+        return structured
+    local_reducer = RegionReducer(
+        reducers=(
+            collapse_local_linear_chain,
+            collapse_local_short_circuit,
+            collapse_local_proper_if,
+            collapse_local_if_diamond,
+            # Preserve Ghidra's collapse ordering, adapted to the generic
+            # stack-VM proof gate: loops before switches, with every accepted
+            # candidate rebuilding its CFG snapshot in RegionReducer.
+            collapse_local_pretested_while,
+            collapse_local_while_break_continue,
+            collapse_local_multi_backedge_while,
+            collapse_local_posttested_do_while,
+            collapse_local_infinite_loop,
+            collapse_local_switch,
+            collapse_local_switch_fallthrough,
+        ),
+        continue_after_structural=True,
+        # Keep an auditable no-candidate record when exception state prevents
+        # every local matcher from proving a safe collapse.  The rejection is
+        # metadata only; the preservation CFG remains untouched.
+        record_no_candidate_rejection=True,
+    )
+    return local_reducer.reduce(structured, is_safe=is_safe) or structured
 
 
 def _has_exceptional_block_context(function: FunctionIR) -> bool:
     """Keep exceptional edges and active re-raise scopes on their exact CFG floor."""
 
     return any(
-        block.exception_edge is not None or block.active_exception_handlers
+        exceptional_transfers(block) or block.active_exception_handlers
         for block in function.blocks
     )
+
+
+def _exception_context_block_ids(function: FunctionIR) -> frozenset[str]:
+    """Return blocks whose control-flow boundary is owned by exception state."""
+
+    protected = {
+        block.id
+        for block in function.blocks
+        if exceptional_transfers(block) or block.active_exception_handlers
+    }
+    if not protected:
+        return frozenset()
+    cfg = build_cfg(function)
+    for edge in cfg.edges:
+        if edge.kind == "exception":
+            protected.add(edge.source)
+            protected.add(edge.target)
+    return frozenset(protected)
 
 
 def _structure_exact_single_block_cfg(function: FunctionIR) -> FunctionIR | None:
@@ -194,7 +262,7 @@ def _structure_exact_empty_jump_chains(function: FunctionIR) -> FunctionIR | Non
         if (
             block.id in loop_blocks
             or block.id in phi_predecessors
-            or block.exception_edge is not None
+            or exceptional_transfers(block)
             or block.active_exception_handlers
             or block.statements
             or not isinstance(block.terminator, Jump)
@@ -321,7 +389,7 @@ def _structure_exact_empty_jump_splices(function: FunctionIR) -> FunctionIR | No
             or empty.statements
             or not isinstance(empty.terminator, Jump)
             or empty.terminator.target == empty.id
-            or empty.exception_edge is not None
+            or exceptional_transfers(empty)
             or empty.active_exception_handlers
         ):
             continue
@@ -353,7 +421,7 @@ def _structure_exact_empty_jump_splices(function: FunctionIR) -> FunctionIR | No
             continue
         if any(
             block_map.get(predecessor) is None
-            or block_map[predecessor].exception_edge is not None
+            or exceptional_transfers(block_map[predecessor])
             or block_map[predecessor].active_exception_handlers
             for predecessor in predecessors
         ):
@@ -463,9 +531,9 @@ def _structure_exact_loop_linear_block_merges(function: FunctionIR) -> FunctionI
             # that edge explicit rather than moving it across the source block.
             continue
         if (
-            source.exception_edge is not None
+            exceptional_transfers(source)
             or source.active_exception_handlers
-            or successor.exception_edge is not None
+            or exceptional_transfers(successor)
             or successor.active_exception_handlers
             or _contains_terminal_statement(successor.statements)
             or _contains_unscoped_loop_control(successor.statements)
@@ -1645,7 +1713,7 @@ def _structure_exact_optional_phi_diamond_region(function: FunctionIR) -> Functi
     """
 
     cfg = build_cfg(function)
-    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+    if cfg.entry is None or cfg.diagnostics:
         return None
     block_map = cfg.blocks
     loops = find_natural_loops(cfg)
@@ -2814,7 +2882,7 @@ def _structure_exact_partial_multiway_arm_splice(function: FunctionIR) -> Functi
             ):
                 valid = False
                 break
-            if arm.exception_edge is not None or arm.active_exception_handlers:
+            if exceptional_transfers(arm) or arm.active_exception_handlers:
                 valid = False
                 break
             statements = _statements_without_trivial_phi_assignments(
@@ -2917,11 +2985,12 @@ def _structure_exact_partial_branch_arm_splice(function: FunctionIR) -> Function
     """
 
     cfg = build_cfg(function)
-    if cfg.entry is None or cfg.diagnostics or _has_exceptional_block_context(function):
+    if cfg.entry is None or cfg.diagnostics:
         return None
     block_map = cfg.blocks
     loops = find_natural_loops(cfg)
     loop_headers = frozenset(loop.header for loop in loops)
+    exceptional_blocks = _exception_context_block_ids(function)
 
     def loop_membership(block_id: str) -> frozenset[str]:
         return frozenset(loop.header for loop in loops if block_id in loop.blocks)
@@ -2932,6 +3001,12 @@ def _structure_exact_partial_branch_arm_splice(function: FunctionIR) -> Function
             continue
         targets = (terminator.true_target, terminator.false_target)
         if targets[0] == targets[1] or any(target == source.id for target in targets):
+            continue
+        # This local rule may operate around an exception-bearing function,
+        # but it may not consume a block that owns handler state or an
+        # exceptional edge.  The unchanged boundary is then checked again by
+        # validate_cfg_rewrite before the candidate is committed.
+        if source.id in exceptional_blocks:
             continue
 
         join_candidates: set[str] = set()
@@ -2956,6 +3031,8 @@ def _structure_exact_partial_branch_arm_splice(function: FunctionIR) -> Function
         join = block_map.get(join_id)
         if join is None or join.id == source.id:
             continue
+        if join.id in exceptional_blocks:
+            continue
         if source.id in loop_headers or join.id in loop_headers:
             continue
 
@@ -2973,7 +3050,7 @@ def _structure_exact_partial_branch_arm_splice(function: FunctionIR) -> Function
             if arm.terminator.target != join_id or cfg.predecessors(arm.id) != (source.id,):
                 valid = False
                 break
-            if arm.exception_edge is not None or arm.active_exception_handlers:
+            if exceptional_transfers(arm) or arm.active_exception_handlers:
                 valid = False
                 break
             statements = _statements_without_trivial_phi_assignments(
@@ -3374,6 +3451,11 @@ def _rename_phi_predecessor(
         if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
             statements.append(statement)
             continue
+        # Renaming the logical predecessor also replaces a concrete CFG edge.
+        # This helper has no old-to-new edge map, so retaining an edge-keyed
+        # Phi would attach the value to a stale edge identity.
+        if statement.value.edge_ids:
+            return None
         incoming = list(statement.value.incoming)
         if len({block_id for block_id, _value in incoming}) != len(incoming):
             return None
@@ -3420,6 +3502,12 @@ def _merge_phi_predecessors(
         if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
             statements.append(statement)
             continue
+        # This rewrite changes the number and source of concrete predecessor
+        # edges.  Logical labels alone are not a valid replacement for an
+        # existing edge identity, and the helper has no old-to-new edge map.
+        # Keep the preservation CFG until a dedicated mapper can prove one.
+        if statement.value.edge_ids:
+            return None
         incoming = tuple(statement.value.incoming)
         incoming_ids = {predecessor for predecessor, _value in incoming}
         if len(incoming_ids) != len(incoming):
@@ -3481,6 +3569,10 @@ def _expand_phi_predecessor(
         if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
             statements.append(statement)
             continue
+        # Expanding one predecessor into several changes concrete edge
+        # identities.  Do not retain stale IDs or manufacture replacements.
+        if statement.value.edge_ids:
+            return None
         if len({predecessor for predecessor, _value in statement.value.incoming}) != len(statement.value.incoming):
             return None
         previous_values = tuple(
@@ -3561,7 +3653,10 @@ def _structure_exact_acyclic_shared_linear_block(function: FunctionIR) -> Functi
         if successor is None or successor.id == shared.id:
             continue
         predecessor_blocks = [block_map.get(predecessor) for predecessor in predecessors]
-        if any(block is None or block.exception_edge is not None for block in predecessor_blocks):
+        if any(
+            block is None or exceptional_transfers(block)
+            for block in predecessor_blocks
+        ):
             continue
         if any(
             edge.source in predecessors
@@ -3668,6 +3763,11 @@ def _add_shared_block_phi_incomings(
         if not (isinstance(statement, Assign) and isinstance(statement.value, Phi)):
             statements.append(statement)
             continue
+        # Cloning the shared predecessor creates new physical CFG edges.  A
+        # logical block label cannot prove their identities, so leave the
+        # original CFG intact when the Phi is already edge-keyed.
+        if statement.value.edge_ids:
+            return None
         incoming = _unique_phi_incoming(statement.value)
         if incoming is None:
             return None
@@ -8912,6 +9012,11 @@ def _prepare_collapsed_exit_statements(
             continue
         if saw_non_phi:
             return None
+        # The replacement preheader edge is not one of the original loop-exit
+        # edges.  A correct transformation needs an explicit mapping for each
+        # concrete ID; fail closed until that proof exists.
+        if statement.value.edge_ids:
+            return None
         incoming = _unique_phi_incoming(statement.value)
         if incoming is None:
             return None
@@ -9425,6 +9530,7 @@ def _render_loop_body(
     statements = _statements_without_trivial_phi_assignments(
         block.statements,
         incoming_blocks=incoming,
+        allow_carrier_phis=True,
     )
     if statements is None:
         return None
@@ -9882,7 +9988,10 @@ def _stmt_reads_var(statement: Stmt, name: str) -> bool:
         )
     if isinstance(statement, Try):
         return any(_stmt_reads_var(child, name) for child in statement.body) or any(
-            _expr_reads_var(handler.exception_type, name)
+            (
+                handler.exception_type is not None
+                and _expr_reads_var(handler.exception_type, name)
+            )
             or any(_stmt_reads_var(child, name) for child in handler.body)
             for handler in statement.handlers
         )
@@ -10042,15 +10151,63 @@ def _statements_without_trivial_phi_assignments(
     statements: tuple[Stmt, ...],
     *,
     incoming_blocks: tuple[str, ...],
+    allow_carrier_phis: bool = False,
 ) -> tuple[Stmt, ...] | None:
     kept: list[Stmt] = []
     for statement in statements:
         if _is_trivial_phi_assignment(statement, incoming_blocks=incoming_blocks):
             continue
         if isinstance(statement, Assign) and isinstance(statement.value, Phi):
+            if allow_carrier_phis and _is_safe_carrier_phi(
+                statement.value,
+                incoming_blocks=incoming_blocks,
+            ):
+                kept.append(statement)
+                continue
             return None
         kept.append(statement)
     return tuple(kept)
+
+
+def _is_safe_carrier_phi(phi: Phi, *, incoming_blocks: tuple[str, ...]) -> bool:
+    """Prove a non-entry Phi is a pure value carrier across a block edge.
+
+    Stateful stack lifting may materialize a value produced by an earlier
+    merge in a later, single-predecessor block.  That Phi is not a merge for
+    the later block, and moving the block into a structured loop does not
+    change its evaluation.  Only a single incoming wrapper around another
+    Phi is accepted; every leaf must be a side-effect-free ``Var`` or
+    ``Const`` and the wrapper label must not pretend to be the current CFG
+    predecessor.  Multi-edge or effectful values remain on the preservation
+    floor.
+    """
+
+    if len(phi.incoming) != 1:
+        return False
+    label, value = phi.incoming[0]
+    if label in incoming_blocks or not isinstance(value, Phi):
+        return False
+    if phi.edge_ids and len(phi.edge_ids) != len(phi.incoming):
+        return False
+    return _pure_phi_value(value)
+
+
+def _pure_phi_value(value: Expr) -> bool:
+    if isinstance(value, (Var, Const)):
+        return True
+    if isinstance(value, Phi):
+        if not value.incoming:
+            return False
+        if value.edge_ids and (
+            len(value.edge_ids) != len(value.incoming)
+            or len(set(value.edge_ids)) != len(value.edge_ids)
+        ):
+            return False
+        labels = tuple(label for label, _ in value.incoming)
+        if len(labels) != len(set(labels)):
+            return False
+        return all(_pure_phi_value(item) for _label, item in value.incoming)
+    return False
 
 
 def _statements_without_identity_phi_assignments(statements: tuple[Stmt, ...]) -> tuple[Stmt, ...] | None:
@@ -10116,6 +10273,9 @@ def _is_short_circuit_bool_phi(
 def _unique_phi_incoming(phi: Phi) -> dict[str, Expr] | None:
     """Return edge values only when every predecessor identity is unique."""
 
+    if phi.edge_ids:
+        if len(phi.edge_ids) != len(phi.incoming) or len(set(phi.edge_ids)) != len(phi.edge_ids):
+            return None
     incoming = dict(phi.incoming)
     if len(incoming) != len(phi.incoming):
         return None
@@ -10240,3 +10400,6 @@ register_low_level_cfg_structurer(_structure_exact_direct_phi_dispatch_region)
 register_low_level_cfg_structurer(_structure_exact_terminal_branch_region)
 register_low_level_cfg_structurer(_structure_exact_partial_branch_arm_splice)
 register_low_level_cfg_structurer(_structure_exact_partial_multiway_arm_splice)
+# Generic fallback after the existing exact rules.  It is intentionally last:
+# exact matchers retain their specialized value proofs, while this rule only
+# handles a plain, Phi-free local SESE diamond.

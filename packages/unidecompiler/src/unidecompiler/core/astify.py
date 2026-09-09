@@ -13,6 +13,9 @@ from unidecompiler.core.ast import (
     CollectionProjectionExpr,
     ConstExpr,
     CurrentExceptionRef,
+    ExceptionRewriteExpr,
+    ExceptionCleanupValueExpr,
+    ExceptionResumePositionExpr,
     DeleteStmt,
     ResumeInputExpr,
     UndefinedLiteralExpr,
@@ -55,6 +58,8 @@ from unidecompiler.core.ast import (
     VarRef,
     YieldStmt,
     ContinueStmt,
+    DoWhileStmt,
+    FallthroughStmt,
     WhileStmt,
 )
 from unidecompiler.core.ir import (
@@ -69,10 +74,14 @@ from unidecompiler.core.ir import (
     CollectionProjection,
     Const,
     CurrentException,
+    ExceptionRewrite,
+    ExceptionCleanupValue,
+    ExceptionResumePosition,
     Delete,
     ResumeInput,
     UndefinedLiteral,
     Continue,
+    DoWhile,
     Expr,
     ForEach,
     ForRange,
@@ -108,7 +117,9 @@ from unidecompiler.core.ir import (
     Unsupported,
     Var,
     While,
+    Fallthrough,
     Yield,
+    exceptional_transfers,
 )
 from unidecompiler.core.structuring import (
     StructuredBlock,
@@ -132,12 +143,13 @@ def module_to_ast(module: ModuleIR) -> ModuleDecl:
 
 def function_to_ast(function: FunctionIR) -> FunctionDecl:
     ssa_index = index_assignments(function)
+    logical_params = tuple(_logical_name(param) for param in function.params)
     if not function.metadata.get("recovery_phi_materialized"):
         function = insert_phi_nodes(function)
     if function.metadata.get("decompile_status") == "unsupported":
         return FunctionDecl(
             name=function.name,
-            params=tuple(_logical_name(param) for param in function.params),
+            params=logical_params,
             source=function.source,
             metadata={**function.metadata, "ssa_index": _ssa_index_to_metadata(ssa_index)},
             body=(
@@ -154,12 +166,40 @@ def function_to_ast(function: FunctionIR) -> FunctionDecl:
             body.extend(_low_level_block_to_ast(block))
         return FunctionDecl(
             name=function.name,
-            params=tuple(_logical_name(param) for param in function.params),
+            params=logical_params,
             source=function.source,
             metadata={
                 **function.metadata,
                 "ssa_index": _ssa_index_to_metadata(ssa_index),
-                "predeclared_names": _predeclared_names(tuple(body)),
+                "predeclared_names": _predeclared_names(
+                    tuple(body), initially_bound=frozenset(logical_params)
+                ),
+            },
+            body=tuple(body),
+            nested_functions=tuple(function_to_ast(nested) for nested in function.nested_functions),
+        )
+
+    if _requires_low_level_cfg_presentation(function):
+        # A structured recovery kind is not enough to remove labels.  A local
+        # core rewrite may have recovered one region while unrelated explicit
+        # CFG edges remain.  Rendering those remaining edges without labels
+        # makes their goto targets unresolvable and violates the preservation
+        # fallback contract.  Backends receive the complete labelled CFG and
+        # never infer what a missing target was meant to be.
+        body: list[object] = []
+        for block in function.blocks:
+            body.extend(_low_level_block_to_ast(block))
+        return FunctionDecl(
+            name=function.name,
+            params=logical_params,
+            source=function.source,
+            metadata={
+                **function.metadata,
+                "preservation_fallback": True,
+                "ssa_index": _ssa_index_to_metadata(ssa_index),
+                "predeclared_names": _predeclared_names(
+                    tuple(body), initially_bound=frozenset(logical_params)
+                ),
             },
             body=tuple(body),
             nested_functions=tuple(function_to_ast(nested) for nested in function.nested_functions),
@@ -171,19 +211,41 @@ def function_to_ast(function: FunctionIR) -> FunctionDecl:
         body.extend(_node_to_ast(node))
     return FunctionDecl(
         name=function.name,
-        params=tuple(_logical_name(param) for param in function.params),
+        params=logical_params,
         source=function.source,
         metadata={
             **function.metadata,
             "ssa_index": _ssa_index_to_metadata(ssa_index),
-            "predeclared_names": _predeclared_names(tuple(body)),
+            "predeclared_names": _predeclared_names(
+                tuple(body), initially_bound=frozenset(logical_params)
+            ),
         },
         body=tuple(body),
         nested_functions=tuple(function_to_ast(nested) for nested in function.nested_functions),
     )
 
 
-def _predeclared_names(statements: tuple[object, ...]) -> tuple[str, ...]:
+def _requires_low_level_cfg_presentation(function: FunctionIR) -> bool:
+    """Return whether a generic function still owns explicit CFG transfers."""
+
+    if function.recovery_kind == "generic-vm-low-level-cfg":
+        return True
+    if function.recovery_kind != "generic-vm-low-level-cfg-structured":
+        return False
+    if not function.metadata.get("recovery_proofs"):
+        return True
+    return any(
+        isinstance(block.terminator, (Jump, Branch, MultiBranch))
+        or bool(exceptional_transfers(block))
+        for block in function.blocks
+    )
+
+
+def _predeclared_names(
+    statements: tuple[object, ...],
+    *,
+    initially_bound: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
     """Return names that must be visible before a nested control statement.
 
     This is a core data-flow fact used by renderers to keep temporaries in the
@@ -250,7 +312,7 @@ def _predeclared_names(statements: tuple[object, ...]) -> tuple[str, ...]:
             for _value, body in statement.cases:
                 output.update(assigned_sequence(body))
             return output
-        if isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+        if isinstance(statement, (WhileStmt, DoWhileStmt, ForEachStmt, ForRangeStmt)):
             output = assigned_sequence(statement.body)
             if isinstance(statement, (ForEachStmt, ForRangeStmt)):
                 output.add(statement.target.name)
@@ -269,7 +331,7 @@ def _predeclared_names(statements: tuple[object, ...]) -> tuple[str, ...]:
             return (statement.then_body, statement.else_body)
         if isinstance(statement, SwitchStmt):
             return tuple(body for _value, body in statement.cases) + (statement.default_body,)
-        if isinstance(statement, (WhileStmt, ForEachStmt, ForRangeStmt)):
+        if isinstance(statement, (WhileStmt, DoWhileStmt, ForEachStmt, ForRangeStmt)):
             return (statement.body,)
         if isinstance(statement, TryStmt):
             return (statement.body, *(handler.body for handler in statement.handlers))
@@ -281,30 +343,70 @@ def _predeclared_names(statements: tuple[object, ...]) -> tuple[str, ...]:
             output.update(assigned(statement))
         return output
 
-    def visit(sequence: tuple[object, ...], inherited: frozenset[str] = frozenset()) -> None:
+    def direct_assignments(statement: object) -> set[str]:
+        """Return bindings established before the next sibling statement."""
+
+        if isinstance(statement, AssignStmt) and isinstance(statement.target, VarRef):
+            return {statement.target.name}
+        if isinstance(statement, AssignManyStmt):
+            return {target.name for target in statement.targets}
+        return set()
+
+    def visit(
+        sequence: tuple[object, ...],
+        inherited: frozenset[str] = frozenset(),
+        bound: frozenset[str] = frozenset(),
+    ) -> None:
         suffix: set[str] = set()
         uses_after: list[set[str]] = [set() for _ in sequence]
         for index in range(len(sequence) - 1, -1, -1):
             uses_after[index] = set(suffix)
             suffix.difference_update(assigned(sequence[index]))
             suffix.update(uses(sequence[index]))
+        prior = set(bound)
         for index, statement in enumerate(sequence):
             if children(statement):
                 protected = inherited | frozenset(uses_after[index])
+                handler_bindings = (
+                    {
+                        handler.binding.name
+                        for handler in statement.handlers
+                        if handler.binding is not None
+                    }
+                    if isinstance(statement, TryStmt)
+                    else set()
+                )
+                # Preserve the original conservative rule for register-like
+                # temporaries: a later control edge can re-enter a low-level
+                # region even when a simple lexical scan sees no direct use.
                 result.update(
                     name
                     for name in assigned(statement) & protected
-                    if _is_temporary_name(name)
+                    if _is_temporary_name(name) and name not in initially_bound
+                )
+                # Non-temporary variables need an enclosing binding only
+                # when their proven value escapes the nested control region.
+                # This handles a Try/handler common continuation without
+                # applying source-language scope inference in a backend.
+                result.update(
+                    name
+                    for name in assigned(statement) & protected
+                    if (
+                        not _is_temporary_name(name)
+                        and name not in handler_bindings
+                        and name not in prior
+                    )
                 )
                 for child in children(statement):
-                    visit(child, protected)
+                    visit(child, protected, frozenset(prior))
+            prior.update(direct_assignments(statement))
 
-    visit(statements)
+    visit(statements, bound=initially_bound)
     return tuple(sorted(result))
 
 
 def _is_temporary_name(name: str) -> bool:
-    """Match neutral VM temporary naming conventions used by renderers."""
+    """Recognize neutral register-like temporary identities, not a VM name."""
 
     return (
         (name.startswith("r") and name[1:].isdigit())
@@ -377,11 +479,15 @@ def _low_level_block_to_ast(block) -> tuple[object, ...]:
     statements: list[object] = [LabelStmt(name=block.id)]
     for statement in block.statements:
         statements.append(_statement_to_ast(statement))
-    if block.exception_edge is not None:
+    # One source block may retain several concrete exceptional transfers.
+    # Preserve each one in the low-level AST rather than choosing a handler.
+    from unidecompiler.core.ir import exceptional_transfers
+
+    for transfer in exceptional_transfers(block):
         statements.append(
             OnExceptionGotoStmt(
-                source=block.exception_edge.source,
-                target=block.exception_edge.target,
+                source=transfer.source,
+                target=transfer.target,
             )
         )
     if block.terminator is not None:
@@ -446,6 +552,12 @@ def _statement_to_ast(statement) -> object:
             condition=_expr_to_ast(statement.condition),
             body=tuple(_statement_to_ast(inner) for inner in statement.body),
         )
+    if isinstance(statement, DoWhile):
+        return DoWhileStmt(
+            source=statement.source or statement.condition.source,
+            body=tuple(_statement_to_ast(inner) for inner in statement.body),
+            condition=_expr_to_ast(statement.condition),
+        )
     if isinstance(statement, ForEach):
         return ForEachStmt(
             source=statement.source,
@@ -466,6 +578,8 @@ def _statement_to_ast(statement) -> object:
         return BreakStmt(source=statement.source)
     if isinstance(statement, Continue):
         return ContinueStmt(source=statement.source)
+    if isinstance(statement, Fallthrough):
+        return FallthroughStmt(source=statement.source)
     if isinstance(statement, Return):
         return ReturnStmt(
             source=statement.source,
@@ -487,7 +601,11 @@ def _statement_to_ast(statement) -> object:
             cause=_expr_to_ast(statement.cause) if statement.cause is not None else None,
         )
     if isinstance(statement, Reraise):
-        return ReraiseStmt(source=statement.source)
+        return ReraiseStmt(
+            source=statement.source,
+            value=_expr_to_ast(statement.value) if statement.value is not None else None,
+            resume_slots=tuple(_expr_to_ast(slot) for slot in statement.resume_slots),
+        )
     if isinstance(statement, Yield):
         return YieldStmt(source=statement.source, value=_expr_to_ast(statement.value))
     if isinstance(statement, Try):
@@ -496,7 +614,11 @@ def _statement_to_ast(statement) -> object:
             body=tuple(_statement_or_terminator_to_ast(inner) for inner in statement.body),
             handlers=tuple(
                 ExceptHandlerStmt(
-                    exception_type=_expr_to_ast(handler.exception_type),
+                    exception_type=(
+                        _expr_to_ast(handler.exception_type)
+                        if handler.exception_type is not None
+                        else None
+                    ),
                     binding=(
                         VarRef(name=_logical_name(handler.binding.name), source=handler.binding.source)
                         if handler.binding is not None
@@ -550,6 +672,37 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
         return UndefinedLiteralExpr(source=expr.source, type=expr.type)
     if isinstance(expr, CurrentException):
         return CurrentExceptionRef(source=expr.source, type=expr.type)
+    if isinstance(expr, ExceptionRewrite):
+        return ExceptionRewriteExpr(
+            source=expr.source,
+            type=expr.type,
+            value=_expr_to_ast(expr.value),
+            predicate=_expr_to_ast(expr.predicate),
+            replacement=_expr_to_ast(expr.replacement),
+            retain_input_as_cause=expr.retain_input_as_cause,
+        )
+    if isinstance(expr, ExceptionCleanupValue):
+        return ExceptionCleanupValueExpr(
+            source=expr.source,
+            type=expr.type,
+            value=_expr_to_ast(expr.value),
+            input_exception=(
+                None
+                if expr.input_exception is None
+                else _expr_to_ast(expr.input_exception)
+            ),
+            propagate_input=expr.propagate_input,
+            predicate=(
+                None if expr.predicate is None else _expr_to_ast(expr.predicate)
+            ),
+            predicate_operand=(
+                None
+                if expr.predicate_operand is None
+                else _expr_to_ast(expr.predicate_operand)
+            ),
+        )
+    if isinstance(expr, ExceptionResumePosition):
+        return ExceptionResumePositionExpr(source=expr.source, type=expr.type)
     if isinstance(expr, ResumeInput):
         return ResumeInputExpr(source=expr.source, type=expr.type)
     if isinstance(expr, Placeholder):
@@ -606,6 +759,7 @@ def _expr_to_ast(expr: Expr) -> AstExpr:
             source=expr.source,
             type=expr.type,
             incoming=tuple((pred, _expr_to_ast(value)) for pred, value in expr.incoming),
+            edge_ids=expr.edge_ids,
         )
     if isinstance(expr, Global):
         return GlobalRef(source=expr.source, type=expr.type, name=expr.name)
