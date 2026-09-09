@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unidecompiler.core.ir import ModuleIR
 from unidecompiler.plugins import FrontendModule
+from unidecompiler.progress import ProgressReporter
 from unidecompiler_plugin_python_pyc.lifter import lift_pyc_module
 from unidecompiler_plugin_python_pyc.pyc import decode_pyc, looks_like_pyc
 from unidecompiler_plugin_python_pyc.simulation import PythonPycSimulationAdapter
@@ -45,3 +46,8 @@ class PythonPycFrontendPlugin:
             )
 
         return lift_pyc_module(module.payload, module.metadata)
+
+    def lift_with_progress(self, module: FrontendModule, reporter: ProgressReporter) -> ModuleIR:
+        if module.frontend_id != self.id:
+            raise TypeError(f"Python pyc frontend cannot lift module from {module.frontend_id!r}")
+        return lift_pyc_module(module.payload, module.metadata, reporter=reporter)

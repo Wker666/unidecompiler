@@ -97,6 +97,7 @@ from unidecompiler.core.vm_region import (
     build_hint_region_profile,
     lift_control_region as lift_vm_control_region,
 )
+from unidecompiler.progress import ProgressReporter, report_progress
 from unidecompiler_plugin_python_pyc.pyc import PycCodeObject, PycExceptionRegion, PycModule
 
 
@@ -756,8 +757,15 @@ PYTHON_EFFECT_TABLE = VMEffectTable(
 )
 
 
-def lift_pyc_module(pyc_module: PycModule, metadata: dict) -> ModuleIR:
-    functions = list(_lift_code_object_tree(pyc_module.code))
+def lift_pyc_module(
+    pyc_module: PycModule,
+    metadata: dict,
+    *,
+    reporter: ProgressReporter | None = None,
+) -> ModuleIR:
+    total = _code_object_count(pyc_module.code)
+    report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting Python code objects")
+    functions = list(_lift_code_object_tree(pyc_module.code, reporter=reporter, total=total, progress=[0]))
     return assemble_vm_module(
         name=pyc_module.filename or "<python-pyc>",
         source_language="python",
@@ -784,7 +792,13 @@ def lift_code_object(code: PycCodeObject) -> FunctionIR:
     return function
 
 
-def _lift_code_object_tree(code: PycCodeObject) -> tuple[FunctionIR, ...]:
+def _lift_code_object_tree(
+    code: PycCodeObject,
+    *,
+    reporter: ProgressReporter | None = None,
+    total: int | None = None,
+    progress: list[int] | None = None,
+) -> tuple[FunctionIR, ...]:
     spec = _python_function_spec(code)
     functions = [
         recover_vm_function(
@@ -793,9 +807,23 @@ def _lift_code_object_tree(code: PycCodeObject) -> tuple[FunctionIR, ...]:
             raw=tuple(_raw_instruction_line(instruction) for instruction in code.instructions),
         )
     ]
+    if reporter is not None and total is not None and progress is not None:
+        progress[0] += 1
+        report_progress(reporter, phase="lift", completed=progress[0], total=total, unit="function", message=f"lifting code object {progress[0]}/{total}")
     for child in code.children:
-        functions.extend(_lift_code_object_tree(child))
+        functions.extend(
+            _lift_code_object_tree(
+                child,
+                reporter=reporter,
+                total=total,
+                progress=progress,
+            )
+        )
     return tuple(functions)
+
+
+def _code_object_count(code: PycCodeObject) -> int:
+    return 1 + sum(_code_object_count(child) for child in code.children)
 
 
 def _python_low_effects(instruction, source: SourceRef) -> tuple[Effect, ...] | None:

@@ -586,7 +586,12 @@ def _natural_loops_from(
     for edge in cfg.edges:
         if edge.target not in dominators.get(edge.source, frozenset()):
             continue
-        blocks = _natural_loop_blocks(cfg, header=edge.target, tail=edge.source)
+        blocks = _natural_loop_blocks(
+            cfg,
+            header=edge.target,
+            tail=edge.source,
+            dominators=dominators,
+        )
         exits = tuple(
             candidate
             for candidate in cfg.edges
@@ -756,7 +761,22 @@ def _predecessors(cfg: CFG) -> dict[str, set[str]]:
     return preds
 
 
-def _natural_loop_blocks(cfg: CFG, header: str, tail: str) -> set[str]:
+def _natural_loop_blocks(
+    cfg: CFG,
+    header: str,
+    tail: str,
+    *,
+    dominators: dict[str, frozenset[str]] | None = None,
+) -> set[str]:
+    # A self edge is already a complete one-block natural loop.  Walking the
+    # predecessors of ``header`` in this case would incorrectly absorb every
+    # block that can reach the loop (including its preheader and all earlier
+    # control-flow regions).
+    if header == tail:
+        return {header}
+
+    if dominators is None:
+        dominators = compute_dominators(cfg)
     preds = _predecessors(cfg)
     loop_blocks = {header, tail}
     stack = [tail]
@@ -764,7 +784,11 @@ def _natural_loop_blocks(cfg: CFG, header: str, tail: str) -> set[str]:
     while stack:
         block = stack.pop()
         for pred in preds.get(block, set()):
-            if pred in loop_blocks:
+            # Natural-loop members must be dominated by the header.  Without
+            # this guard an alternate path into a loop tail can pull an
+            # external predecessor into the loop set and manufacture bogus
+            # nesting/irreducibility facts.
+            if pred in loop_blocks or header not in dominators.get(pred, frozenset()):
                 continue
             loop_blocks.add(pred)
             stack.append(pred)

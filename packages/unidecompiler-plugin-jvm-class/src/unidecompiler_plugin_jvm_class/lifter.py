@@ -61,6 +61,7 @@ from unidecompiler.core.vm_region import (
     VMRegionProfile,
     build_hint_region_profile,
 )
+from unidecompiler.progress import ProgressReporter, report_progress
 from unidecompiler_plugin_jvm_class.classfile import (
     JavaClassFile,
     JavaInstruction,
@@ -481,7 +482,18 @@ JVM_EFFECT_TABLE = VMEffectTable(
 )
 
 
-def lift_java_class(class_file: JavaClassFile, metadata: dict) -> "ModuleIR":
+def lift_java_class(
+    class_file: JavaClassFile,
+    metadata: dict,
+    *,
+    reporter: ProgressReporter | None = None,
+) -> "ModuleIR":
+    total = len(class_file.methods)
+    report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting JVM methods")
+    functions = []
+    for index, method in enumerate(class_file.methods, start=1):
+        functions.append(_recover_java_method(method))
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting method {index}/{total}")
     return assemble_vm_module(
         name=class_file.class_name or class_file.filename or "<jvm-class>",
         source_language="jvm",
@@ -489,7 +501,7 @@ def lift_java_class(class_file: JavaClassFile, metadata: dict) -> "ModuleIR":
             "frontend": metadata,
             "bytecode_format": "class",
         },
-        functions=tuple(_recover_java_method(method) for method in class_file.methods),
+        functions=tuple(functions),
     )
 
 

@@ -1,5 +1,14 @@
 # Agent Development Rules
 
+## Requested Feature
+
+__USER_REQUIREMENTS__
+
+This requirement does not override the architecture contract below.
+
+If simulation is enabled, the adapter must remain independent of frontend
+bytecode execution and must resolve only generic functions in the lifted module.
+
 This file defines mandatory development rules for `unidecompiler`.
 
 The project is built around one hard architectural rule: VM frontends are thin
@@ -388,14 +397,6 @@ paths and entry facts.
 The CLI's `--interactive`/`-i` template wizard is only an alternative way to
 collect these export settings; it must call the same exporter and must not
 contain decoding or recovery logic.
-
-VS Code navigation metadata is a separate opt-in host export. It writes an
-adjacent `.unidec.json` sidecar only when requested, after its pseudocode file
-has been written. The sidecar contains only a pseudocode UTF-8 hash, UTF-16
-source-map offsets, and selected instruction `(function_id, offset)`, raw text,
-and proven absolute byte ranges. It must not contain paths, pseudocode text,
-or engine/private recovery data. Pure pseudocode exports must never create a
-sidecar.
 
 Before a release, run the full test suite and `git diff --check`, build every
 package with both wheel and sdist (including `unidecompiler-all`), and run

@@ -10,14 +10,20 @@ from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from unidecompiler import DecompileResult, DecompilerEngine, FrontendRegistrationError
+from unidecompiler import DecompileResult, DecompilerEngine, FrontendRegistrationError, ProgressEvent
 from unidecompiler.input_sources import InputEntry, iter_input_entries, load_input_entry
 from unidecompiler_gui.themes import Theme, builtin_themes, external_theme
 from unidecompiler_gui.plugin_host import PluginHost
 from unidecompiler_gui.plugin_install import GuiPluginStore, load_enabled_plugins
 from unidecompiler_gui.frontend_store import FrontendRestoreFailure, FrontendStore
 from unidecompiler_gui.hex_view import HexView
-from unidecompiler_gui.pseudocode_export import export_pseudocode_documents, write_pseudocode
+from unidecompiler_gui.pseudocode_export import (
+    VscodeMetadataExportError,
+    export_pseudocode_documents,
+    export_pseudocode_documents_with_vscode_metadata,
+    write_pseudocode,
+    write_pseudocode_with_vscode_metadata,
+)
 from unidecompiler_simulator import (
     SimulationCancellation,
     SimulationEngine,
@@ -583,7 +589,7 @@ def _edge_color(kind: str, colors: dict[str, str]) -> str:
 
 
 class DecompileWorker(QObject):
-    progress = Signal(int, int, str)
+    progress = Signal(object)
     completed = Signal(object, bool)
     failed = Signal(str)
 
@@ -601,12 +607,19 @@ class DecompileWorker(QObject):
                 if self._cancelled.is_set():
                     self.completed.emit(tuple(results), True)
                     return
-                self.progress.emit(index, len(self._entries), entry.display_path)
                 artifact = load_input_entry(entry)
                 if self._cancelled.is_set():
                     self.completed.emit(tuple(results), True)
                     return
-                result = self._engine.decompile_artifact(artifact)
+                result = self._engine.decompile_artifact(
+                    artifact,
+                    progress=_GuiProgressScope(
+                        self.progress.emit,
+                        entry.display_path,
+                        index,
+                        len(self._entries),
+                    ),
+                )
                 results.append((result, artifact.data))
         except Exception as error:
             self.failed.emit(f"{type(error).__name__}: {error}")
@@ -672,6 +685,32 @@ class SimulationWorker(QObject):
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
+class _GuiProgressScope:
+    """Add batch context before forwarding events across the Qt signal seam."""
+
+    def __init__(self, emit, artifact_label: str, batch_index: int, batch_total: int) -> None:
+        self._emit = emit
+        self._artifact_label = artifact_label
+        self._batch_index = batch_index
+        self._batch_total = batch_total
+
+    def report(self, event: ProgressEvent) -> None:
+        self._emit(
+            ProgressEvent(
+                artifact_label=self._artifact_label,
+                batch_index=self._batch_index,
+                batch_total=self._batch_total,
+                phase=event.phase,
+                status=event.status,
+                completed=event.completed,
+                total=event.total,
+                unit=event.unit,
+                fraction=event.fraction,
+                message=event.message,
+            )
+        )
+
+
 class Workbench(QMainWindow):
     def __init__(self, engine: DecompilerEngine | None = None, frontend_store: FrontendStore | None = None) -> None:
         super().__init__()
@@ -730,6 +769,16 @@ class Workbench(QMainWindow):
         self.decompile_all_action.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         export = QAction("Export pseudocode", self, triggered=self.export_pseudocode)
         export_all = QAction("Export all pseudocode", self, triggered=self.export_all_pseudocode)
+        export_with_metadata = QAction(
+            "Export pseudocode with VS Code metadata...",
+            self,
+            triggered=self.export_pseudocode_with_vscode_metadata,
+        )
+        export_all_with_metadata = QAction(
+            "Export all pseudocode with VS Code metadata...",
+            self,
+            triggered=self.export_all_pseudocode_with_vscode_metadata,
+        )
         menu = self.menuBar().addMenu("File")
         menu.addAction(open_file)
         menu.addAction(open_directory)
@@ -737,6 +786,8 @@ class Workbench(QMainWindow):
         menu.addAction(self.decompile_all_action)
         menu.addAction(export)
         menu.addAction(export_all)
+        menu.addAction(export_with_metadata)
+        menu.addAction(export_all_with_metadata)
         self.recent_menu = menu.addMenu("Recent")
         self._rebuild_recent_menu()
 
@@ -1137,12 +1188,16 @@ class Workbench(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.hide()
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setMaximumWidth(140)
+        self.batch_progress.hide()
         self.cancel_button = QToolButton()
         self.cancel_button.setText("x")
         self.cancel_button.setToolTip("Cancel decompilation")
         self.cancel_button.clicked.connect(self._cancel_decompilation)
         self.cancel_button.hide()
         self.statusBar().addPermanentWidget(self.progress)
+        self.statusBar().addPermanentWidget(self.batch_progress)
         self.statusBar().addPermanentWidget(self.cancel_button)
         self.find_panel = FindPanel(self.pseudocode)
         self.find_panel.changed.connect(self._find_from_start)
@@ -1505,6 +1560,73 @@ class Workbench(QMainWindow):
             f"Exported {len(exported)} pseudocode file(s) to:\n{Path(directory).resolve()}{detail}",
         )
 
+    def export_pseudocode_with_vscode_metadata(self) -> None:
+        result = self._selected_result()
+        if result is None or result.pseudocode is None:
+            self.statusBar().showMessage("No pseudocode to export")
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export pseudocode with VS Code metadata",
+            "pseudocode.txt",
+            "Text files (*.txt);;All files (*)",
+        )
+        if not filename:
+            return
+        pseudocode_path = Path(filename)
+        try:
+            exported = write_pseudocode_with_vscode_metadata(result, pseudocode_path)
+        except VscodeMetadataExportError as error:
+            QMessageBox.critical(
+                self,
+                "VS Code metadata export failed",
+                f"Pseudocode was exported to:\n{error.pseudocode_path}\n\n"
+                f"VS Code metadata was not exported:\n{error.metadata_path}\n\n{error.cause}",
+            )
+            return
+        except OSError as error:
+            QMessageBox.critical(self, "Pseudocode export failed", str(error))
+            return
+        QMessageBox.information(
+            self,
+            "Pseudocode and VS Code metadata exported",
+            f"Pseudocode:\n{exported.pseudocode_path}\n\nMetadata:\n{exported.metadata_path}",
+        )
+
+    def export_all_pseudocode_with_vscode_metadata(self) -> None:
+        candidates = tuple(result for result in self.results if result.pseudocode is not None)
+        if not candidates:
+            self.statusBar().showMessage("No pseudocode to export")
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose pseudocode and VS Code metadata output directory",
+        )
+        if not directory:
+            return
+        try:
+            exported = export_pseudocode_documents_with_vscode_metadata(candidates, Path(directory))
+        except VscodeMetadataExportError as error:
+            QMessageBox.critical(
+                self,
+                "VS Code metadata export failed",
+                f"Exported {len(error.completed)} pseudocode/metadata pair(s).\n\n"
+                f"Pseudocode was exported to:\n{error.pseudocode_path}\n\n"
+                f"VS Code metadata was not exported:\n{error.metadata_path}\n\n{error.cause}",
+            )
+            return
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Pseudocode export failed", str(error))
+            return
+        skipped = len(self.results) - len(candidates)
+        detail = f"\nSkipped {skipped} result(s) without pseudocode." if skipped else ""
+        QMessageBox.information(
+            self,
+            "Pseudocode and VS Code metadata exported",
+            f"Exported {len(exported)} pseudocode/metadata pair(s) to:\n"
+            f"{Path(directory).resolve()}{detail}",
+        )
+
     def _update_cursor_status(self) -> None:
         cursor = self.pseudocode.textCursor()
         location = f"Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}"
@@ -1616,16 +1738,37 @@ class Workbench(QMainWindow):
         self._worker.failed.connect(self._worker_thread.quit)
         self._worker_thread.finished.connect(self._dispose_worker)
         self.progress.setValue(0)
+        self.progress.setRange(0, 1)
+        self.batch_progress.setRange(0, len(pending))
+        self.batch_progress.setValue(0)
         self.progress.show()
+        self.batch_progress.show()
         self.cancel_button.show()
         self.statusBar().showMessage(f"Decompiling {len(pending)} artifact(s)...")
         self._worker_thread.start()
 
-    def _update_progress(self, current: int, total: int, display_path: str) -> None:
-        self.progress.setMaximum(total)
-        if total:
-            self.progress.setValue(current)
-        self.statusBar().showMessage(f"Decompiling {current}/{total}: {Path(display_path).name}")
+    def _update_progress(self, event: object) -> None:
+        if not isinstance(event, ProgressEvent):
+            return
+        if event.batch_total is not None:
+            self.batch_progress.setMaximum(event.batch_total)
+        if event.batch_index is not None:
+            batch_value = event.batch_index
+            if event.status not in {"completed", "failed", "cancelled"}:
+                batch_value -= 1
+            self.batch_progress.setValue(max(0, batch_value))
+        if event.total is not None and event.total > 0:
+            self.progress.setRange(0, event.total)
+            self.progress.setValue(event.completed or 0)
+        else:
+            self.progress.setRange(0, 0)
+        detail = event.message or event.phase
+        batch = (
+            f"File {event.batch_index}/{event.batch_total}"
+            if event.batch_index is not None and event.batch_total is not None
+            else "Decompiling"
+        )
+        self.statusBar().showMessage(f"{batch}: {Path(event.artifact_label).name} — {detail}")
 
     def _cancel_decompilation(self) -> None:
         if self._cancelled is not None:
@@ -1675,6 +1818,7 @@ class Workbench(QMainWindow):
         self._worker_thread = None
         self._cancelled = None
         self.progress.hide()
+        self.batch_progress.hide()
         self.cancel_button.hide()
         self.cancel_button.setEnabled(True)
         self._update_frontend_mutation_enabled()

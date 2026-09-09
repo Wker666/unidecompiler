@@ -52,12 +52,16 @@ from unidecompiler.core.cfg import (
 )
 from unidecompiler.core.region import RegionGraph
 from unidecompiler.core.region_reducer import RegionReducer
+from unidecompiler.core.structuring_utils import (
+    contains_unscoped_loop_control as _contains_unscoped_loop_control,
+)
 from unidecompiler.core.local_region_structuring import (
     collapse_local_if_diamond,
     collapse_local_infinite_loop,
     collapse_local_linear_chain,
     collapse_local_multi_backedge_while,
     collapse_local_posttested_do_while,
+    collapse_local_posttested_self_loop,
     collapse_local_pretested_while,
     collapse_local_proper_if,
     collapse_local_short_circuit,
@@ -154,6 +158,7 @@ def structure_low_level_cfg(
             collapse_local_while_break_continue,
             collapse_local_multi_backedge_while,
             collapse_local_posttested_do_while,
+            collapse_local_posttested_self_loop,
             collapse_local_infinite_loop,
             collapse_local_switch,
             collapse_local_switch_fallthrough,
@@ -8719,36 +8724,6 @@ def _contains_terminal_statement(statements: tuple[Stmt, ...]) -> bool:
     return False
 
 
-def _contains_unscoped_loop_control(statements: tuple[Stmt, ...]) -> bool:
-    """Find break/continue that would be outside a loop after a rewrite.
-
-    ``If``, ``Switch`` and ``Try`` do not introduce loop scope, while a nested
-    loop owns its own control statements.  The helper therefore descends only
-    through the former constructs.  It is used as a fail-closed preheader
-    guard before statements are moved outside the newly materialized loop.
-    """
-
-    for statement in statements:
-        if isinstance(statement, (Break, Continue)):
-            return True
-        if isinstance(statement, If) and (
-            _contains_unscoped_loop_control(statement.then_body)
-            or _contains_unscoped_loop_control(statement.else_body)
-        ):
-            return True
-        if isinstance(statement, Switch) and (
-            any(_contains_unscoped_loop_control(body) for _value, body in statement.cases)
-            or _contains_unscoped_loop_control(statement.default_body)
-        ):
-            return True
-        if isinstance(statement, Try) and (
-            _contains_unscoped_loop_control(statement.body)
-            or any(_contains_unscoped_loop_control(handler.body) for handler in statement.handlers)
-        ):
-            return True
-    return False
-
-
 def _structure_exact_natural_loop_with_shared_exit(function: FunctionIR) -> FunctionIR | None:
     """Recover a natural loop whose distinct exits share one linear tail.
 
@@ -10384,6 +10359,11 @@ register_low_level_cfg_structurer(_structure_exact_statement_guard_loop)
 register_low_level_cfg_structurer(_structure_exact_nested_loop_flattening)
 register_low_level_cfg_structurer(_structure_exact_innermost_natural_loop_region)
 register_low_level_cfg_structurer(_structure_exact_entry_natural_loop_region)
+# Keep the historical whole-function entry matcher above for its strict
+# two/three-block contract.  ``collapse_local_posttested_self_loop`` is a
+# separate local-region rule: it handles the same VM-neutral self-loop shape
+# when unrelated blocks surround the region, preserves the exit block, and
+# can materialize only its narrowly proven carrier Phis.
 register_low_level_cfg_structurer(_structure_exact_entry_posttested_self_loop)
 register_low_level_cfg_structurer(_structure_exact_infinite_loop_with_optional_arm)
 register_low_level_cfg_structurer(_structure_exact_try_common_join_region)

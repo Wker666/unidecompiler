@@ -3,22 +3,22 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "unidecompiler-plugin-wasm"
+name = "unidecompiler-export"
 version = "0.2.0"
-description = "WebAssembly frontend plugin for unidecompiler"
+description = "Host-side export helpers for unidecompiler results"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "Wker", email = "1670133844@qq.com" }]
 requires-python = ">=3.11"
-dependencies = ["unidecompiler>=0.2.0,<0.3.0", "wasm>=1.2,<2", "wasmtime>=24,<40"]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/Wker666/unidecompiler"
 Repository = "https://github.com/Wker666/unidecompiler"
 Issues = "https://github.com/Wker666/unidecompiler/issues"
 
-[project.entry-points."unidecompiler.frontends"]
-wasm = "unidecompiler_plugin_wasm.plugin:WasmFrontendPlugin"
-
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+unidecompiler_export = ["assets/**/*"]

@@ -13,12 +13,14 @@ from dataclasses import fields, is_dataclass, replace
 
 from unidecompiler.core.cfg import build_cfg
 from unidecompiler.core.ir import (
+    Assign,
     BasicBlock,
     BinaryOp,
     Branch,
     Break,
     Const,
     DoWhile,
+    Expr,
     Fallthrough,
     FunctionIR,
     If,
@@ -27,15 +29,19 @@ from unidecompiler.core.ir import (
     MultiBranch,
     Phi,
     Return,
+    Raise,
+    Reraise,
     Stmt,
     Switch,
     Terminator,
     Try,
     UnaryOp,
+    Var,
     While,
     exceptional_transfers,
 )
 from unidecompiler.core.region import RegionGraph
+from unidecompiler.core.structuring_utils import contains_unscoped_loop_control
 
 
 def collapse_local_linear_chain(function: FunctionIR) -> FunctionIR | None:
@@ -797,6 +803,314 @@ def collapse_local_posttested_do_while(function: FunctionIR) -> FunctionIR | Non
                 rule="local-posttested-do-while",
             )
     return None
+
+
+def collapse_local_posttested_self_loop(function: FunctionIR) -> FunctionIR | None:
+    """Collapse a single block whose body and post-test share one block.
+
+    Stack VMs commonly emit the body effects and the terminating condition in
+    one basic block, with the non-exit edge returning directly to that block.
+    This is a post-tested loop even though there is no separate condition
+    block.  Keep the condition as an inner ``break`` so the body executes
+    before the first test and on every subsequent iteration.
+    """
+
+    if not _is_low_level_cfg(function):
+        return None
+    cfg = build_cfg(function)
+    if cfg.entry is None or cfg.diagnostics:
+        return None
+    analysis = cfg.analyze()
+    blocks = cfg.blocks
+
+    for header in function.blocks:
+        branch = header.terminator
+        if (
+            not isinstance(branch, Branch)
+            or not _ordinary_block(header)
+            or branch.true_target == branch.false_target
+        ):
+            continue
+        if branch.true_target == header.id:
+            exit_id = branch.false_target
+            break_condition: Expr = UnaryOp(
+                source=branch.condition.source,
+                type=branch.condition.type,
+                op="not ",
+                value=branch.condition,
+            )
+        elif branch.false_target == header.id:
+            exit_id = branch.true_target
+            break_condition = branch.condition
+        else:
+            continue
+
+        exit_block = blocks.get(exit_id)
+        if (
+            exit_block is None
+            or exit_id == header.id
+            or not _ordinary_block(exit_block)
+            or len(cfg.outgoing_edges(header.id)) != 2
+            or len(cfg.incoming_edges(header.id)) < 1
+            or not any(
+                edge.source == header.id
+                for edge in cfg.incoming_edges(exit_id)
+            )
+        ):
+            continue
+
+        loop = _single_exact_loop(
+            analysis.loop_infos,
+            header.id,
+            header.id,
+            {header.id},
+        )
+        if loop is None or tuple(edge.target for edge in loop.exits) != (exit_id,):
+            continue
+        if sum(edge.target == exit_id for edge in cfg.outgoing_edges(header.id)) != 1:
+            continue
+        if not _ordinary_loop_scope_isolated(
+            cfg,
+            members=frozenset({header.id}),
+            header_id=header.id,
+            exit_id=exit_id,
+        ):
+            continue
+
+        if _contains_phi((exit_block,)):
+            continue
+
+        preheader_edges = tuple(
+            edge
+            for edge in cfg.incoming_edges(header.id)
+            if edge.source != header.id
+        )
+        if len(preheader_edges) != 1:
+            continue
+        preheader = blocks.get(preheader_edges[0].source)
+        if preheader is None or not isinstance(preheader.terminator, Jump):
+            continue
+        if preheader.terminator.target != header.id:
+            continue
+
+        carrier_rewrite = _rewrite_self_loop_carrier_phis(
+            header,
+            preheader,
+            preheader_edge=preheader_edges[0],
+            backedge=next(
+                edge
+                for edge in cfg.outgoing_edges(header.id)
+                if edge.target == header.id
+            ),
+        )
+        if carrier_rewrite is None:
+            if _contains_phi((header,)):
+                continue
+            rewritten_preheader = preheader
+            header_statements = header.statements
+        else:
+            rewritten_preheader, header_statements = carrier_rewrite
+        if any(
+            isinstance(statement, (Return, Raise, Reraise))
+            for statement in header_statements
+        ):
+            continue
+        if contains_unscoped_loop_control(header_statements):
+            # A pre-existing break/continue targets an enclosing loop.  Once
+            # these statements are wrapped in the synthesized loop, their
+            # nearest loop would change, so retain the preservation CFG.
+            continue
+
+        replacement = replace(
+            header,
+            statements=(
+                While(
+                    source=branch.source,
+                    condition=Const(source=branch.source, value=True),
+                    body=(
+                        *header_statements,
+                        If(
+                            source=branch.source,
+                            condition=break_condition,
+                            then_body=(Break(source=branch.source),),
+                        ),
+                    ),
+                ),
+            ),
+            terminator=Jump(source=branch.source, target=exit_id),
+        )
+        # Keep the exit block addressable: surrounding CFG edges and any
+        # following blocks remain untouched by this local rewrite.
+        rewritten_blocks = tuple(
+            replacement
+            if block.id == header.id
+            else rewritten_preheader
+            if block.id == preheader.id
+            else block
+            for block in function.blocks
+        )
+        return replace(
+            function,
+            blocks=rewritten_blocks,
+            recovery_kind="generic-vm-low-level-cfg-structured",
+            metadata={
+                **function.metadata,
+                "structured_lift": "generic-vm-low-level-cfg-structured",
+                "low_level_cfg_structured": "local-posttested-self-loop",
+            },
+        )
+    return None
+
+
+def _rewrite_self_loop_carrier_phis(
+    header: BasicBlock,
+    preheader: BasicBlock,
+    *,
+    preheader_edge,
+    backedge,
+) -> tuple[BasicBlock, tuple[Stmt, ...]] | None:
+    """Materialize a narrowly provable self-loop carrier Phi set.
+
+    A carrier is accepted only when its initial value is a pure expression and
+    its backedge value is produced by one self-update in the same block.  The
+    initial assignments are emitted in the preheader, so the loop body sees
+    exactly the value selected by the original Phi on its first iteration.
+    Cross-carrier dependencies are rejected to preserve parallel-copy order.
+    """
+
+    phi_statements: list[Assign] = []
+    index = 0
+    while index < len(header.statements):
+        statement = header.statements[index]
+        if not isinstance(statement, Assign) or not isinstance(statement.value, Phi):
+            break
+        if not isinstance(statement.target, Var):
+            return None
+        phi_statements.append(statement)
+        index += 1
+    if not phi_statements:
+        return None
+
+    preheader_label = preheader_edge.edge_id
+    backedge_label = backedge.edge_id
+    carrier_names = {statement.target.name for statement in phi_statements}
+    updates = header.statements[index:]
+
+    def incoming_for(phi: Phi, edge_id: str, block_id: str):
+        for position, (label, value) in enumerate(phi.incoming):
+            concrete = phi.edge_ids[position] if position < len(phi.edge_ids) else label
+            if concrete == edge_id or label == block_id:
+                return value
+        return None
+
+    def contains_name(value: object, name: str) -> bool:
+        if isinstance(value, Var):
+            return value.name == name
+        if isinstance(value, tuple):
+            return any(contains_name(item, name) for item in value)
+        if is_dataclass(value):
+            return any(
+                contains_name(getattr(value, field.name), name)
+                for field in fields(value)
+                if field.name not in {"source", "type"}
+            )
+        return False
+
+    rewritten_updates = list(updates)
+    initial_assignments: list[Stmt] = []
+    back_value_names: set[str] = set()
+    for statement in phi_statements:
+        phi = statement.value
+        if len(phi.incoming) != 2:
+            return None
+        if phi.edge_ids:
+            if (
+                len(phi.edge_ids) != 2
+                or len(set(phi.edge_ids)) != 2
+                or set(phi.edge_ids) != {preheader_label, backedge_label}
+            ):
+                return None
+        elif {label for label, _value in phi.incoming} != {
+            preheader.id,
+            header.id,
+        }:
+            return None
+        initial = incoming_for(phi, preheader_label, preheader.id)
+        back_value = incoming_for(phi, backedge_label, header.id)
+        if not isinstance(initial, (Var, Const)) or not isinstance(back_value, (Var, Const)):
+            return None
+        if not isinstance(back_value, Var):
+            return None
+        target_name = statement.target.name
+        # Only accept a true self-carrier.  Renaming a distinct backedge
+        # variable would require proving and rewriting every use across the
+        # body, condition, and exit region; retaining the CFG is safer than
+        # risking an undefined or stale value.
+        if back_value.name != target_name:
+            return None
+        if back_value.name in back_value_names:
+            return None
+        back_value_names.add(back_value.name)
+        assignments_to_back_value = [
+            position
+            for position, candidate in enumerate(rewritten_updates)
+            if isinstance(candidate, Assign)
+            and isinstance(candidate.target, Var)
+            and candidate.target.name == back_value.name
+        ]
+        update_positions = [
+            position
+            for position, candidate in enumerate(rewritten_updates)
+            if isinstance(candidate, Assign)
+            and isinstance(candidate.target, Var)
+            and candidate.target.name == back_value.name
+            and contains_name(candidate.value, target_name)
+        ]
+
+        # A carrier with no proven self-update cannot be materialized safely:
+        # its value may still be observed by an exit block or another region.
+        if not update_positions:
+            return None
+        if len(update_positions) != 1:
+            return None
+        if assignments_to_back_value != update_positions:
+            return None
+        update_position = update_positions[0]
+        update = rewritten_updates[update_position]
+        assert isinstance(update, Assign)
+        # A self-referential incoming value already denotes the value in the
+        # preheader's variable.  Emitting ``x = x`` would add no semantics and
+        # would manufacture the exact redundant assignment this pass is
+        # intended to avoid.  Other pure initial values still need an
+        # explicit preheader materialization.
+        if not (isinstance(initial, Var) and initial.name == target_name):
+            initial_assignments.append(
+                Assign(
+                    source=statement.source,
+                    target=Var(name=back_value.name, source=statement.target.source),
+                    value=initial,
+                )
+            )
+
+    if any(
+        isinstance(statement, Assign)
+        and isinstance(statement.value, Phi)
+        for statement in rewritten_updates
+    ):
+        return None
+    if any(
+        contains_name(initial, carrier)
+        for initial in (assignment.value for assignment in initial_assignments)
+        for carrier in carrier_names
+    ):
+        return None
+    return (
+        replace(
+            preheader,
+            statements=(*preheader.statements, *initial_assignments),
+        ),
+        tuple(rewritten_updates),
+    )
 
 
 def collapse_local_while_break_continue(function: FunctionIR) -> FunctionIR | None:

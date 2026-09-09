@@ -121,6 +121,42 @@ admitted. These records are analysis evidence, not frontend control-flow
 instructions; they let a remaining `goto` be traced to a specific proof
 boundary without weakening the preservation fallback.
 
+Hosts may observe decompilation through the optional `progress` argument on
+`DecompilerEngine`. It emits immutable, frontend-neutral events with separate
+current-artifact and batch coordinates. Existing frontends remain compatible;
+frontends that can prove finer-grained work units may additionally implement
+`decode_with_progress()` or `lift_with_progress()`. Progress is observational
+only, is never stored in IR or metadata, and observer failures are isolated from
+decompilation. The CLI keeps progress disabled by default; bare `--progress`
+enables TTY auto mode and `--progress always` forces it. The single-line bar is
+written only to stderr, so pseudocode and AST JSON on stdout remain
+machine-readable.
+
+File and project exports are host functionality provided by the separate
+`unidecompiler-export` package. It writes recovered pseudocode documents and
+generates frontend or GUI-plugin starter projects without adding file-system
+I/O or template-generation responsibilities to the core engine.
+
+CLI exports mirror the GUI host behavior: `-o/--output` writes one result,
+`--output-dir` writes one collision-safe file per successful artifact, and the
+`template`/`export-template` command generates a VM frontend or GUI-plugin
+starter project. Template destinations are created atomically and are never
+overwritten. Frontend templates can explicitly enable the optional data-only
+simulator adapter and AI development kit; both are off by default. AI input
+files are validated for regular-file status, size, and likely credentials
+before they are copied into a generated project.
+
+VS Code navigation metadata is opt-in: pair `--output` with
+`--vscode-metadata path.unidec.json` to write a sidecar after the pseudocode.
+It contains a UTF-8 text hash, UTF-16 pseudocode ranges, and minimal instruction
+facts only. It does not duplicate pseudocode or export source paths, AST, IR,
+CFG, diagnostics, recovery data, or frontend-private objects. Ordinary CLI and
+GUI pseudocode exports do not produce sidecars.
+
+`unidecompiler template --interactive` (short form `-i`) provides a guided
+version of the same template export. It only collects host-side template
+settings and does not affect the decompiler engine or recovery pipeline.
+
 ## Package Architecture
 
 `unidecompiler` is an embeddable core library. It has no command-line entry
@@ -132,6 +168,7 @@ lives under `packages/` and can be installed independently.
 - `unidecompiler-cli`: optional command-line host.
 - `unidecompiler-gui`: read-only PySide6 workbench.
 - `unidecompiler-gui-sdk`: stable, Qt-neutral API for trusted GUI plugins.
+- `unidecompiler-export`: host-side pseudocode and starter-project exporters.
 - `unidecompiler-simulator`: optional bounded executor for recovered generic IR.
 - `unidecompiler-simulation-host-python`: trusted Python runtime host for
   applications that provide unresolved functions.
@@ -200,6 +237,7 @@ Supported frontend families follow this model:
 - `packages/unidecompiler-cli/`: optional CLI host package.
 - `packages/unidecompiler-gui/`: read-only desktop workbench package.
 - `packages/unidecompiler-gui-sdk/`: versioned data contracts for GUI plugins.
+- `packages/unidecompiler-export/`: host-side pseudocode and starter-project exporters.
 - `packages/unidecompiler-simulator/`: bounded generic IR execution library.
 - `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
@@ -237,6 +275,25 @@ python -m pip install unidecompiler-cli \
 Run `unidecompiler --help` to see CLI options. Plugins are discovered through
 Python entry points, so installing another frontend adds its input formats
 without changing the core or host application.
+
+The CLI keeps stdout suitable for pipelines. Use `-o/--output` for one result
+or `--output-dir` for a collision-safe batch export; destinations and errors
+are reported on stderr. Progress is disabled by default, `--progress` enables
+TTY auto mode, and `--progress always` forces the single-line bar on stderr.
+Install `unidecompiler-export` with the CLI when using host-side exports and
+starter projects:
+
+```sh
+python -m pip install unidecompiler-cli unidecompiler-export
+unidecompiler template frontend MyVM -o ./my-vm \
+  --author "Your Name" --description "A VM frontend" \
+  --requirements "Decode and lift the VM" --suffix .vm --version 1
+```
+
+Add `--simulation` to include the optional data-only simulator adapter, or
+`--ai-guidance` with explicit interpreter/sample files and entry facts to add
+the static-analysis kit. Both options are disabled by default; generated
+directories are created atomically and are never overwritten.
 
 The optional simulator command executes a selected function from the recovered
 generic IR. The frontend chooses how the function query is resolved:
@@ -289,6 +346,9 @@ the currently selected result to one text file. `Export all pseudocode` writes
 every open result that has pseudocode to a directory, using sanitized source
 basenames and numeric suffixes for collisions. Results without pseudocode are
 reported as skipped; source paths are never copied into output filenames.
+`Export pseudocode with VS Code metadata...` and `Export all pseudocode with
+VS Code metadata...` are separate opt-in actions. They write the same
+pseudocode files plus adjacent `.unidec.json` sidecars.
 
 The GUI plugin SDK is installed automatically with `unidecompiler-gui`. Plugin
 authors can install it directly when developing against the public, Qt-neutral

@@ -18,3 +18,7 @@ This requirement does not override the architecture rules below.
 - Add tests for commands, panels, snapshots, and failure states.
 
 See `docs/GUI_PLUGIN_DEVELOPMENT.md` for the full contract.
+
+Template generation is performed by the host before installation. The plugin
+itself must not generate projects, export decompiler files, display progress,
+or depend on private host implementation modules.

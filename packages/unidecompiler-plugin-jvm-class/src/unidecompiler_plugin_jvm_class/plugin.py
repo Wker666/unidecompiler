@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unidecompiler.core.ir import FunctionIR, ModuleIR, SourceRef
 from unidecompiler.plugins import FrontendModule
+from unidecompiler.progress import ProgressReporter
 from unidecompiler_plugin_jvm_class.classfile import (
     ClassFileDecoder,
     PreferredClassFileDecoder,
@@ -53,3 +54,8 @@ class JavaClassFrontendPlugin:
             )
 
         return lift_java_class(module.payload, module.metadata)
+
+    def lift_with_progress(self, module: FrontendModule, reporter: ProgressReporter) -> ModuleIR:
+        if module.frontend_id != self.id:
+            raise TypeError(f"JVM class frontend cannot lift module from {module.frontend_id!r}")
+        return lift_java_class(module.payload, module.metadata, reporter=reporter)

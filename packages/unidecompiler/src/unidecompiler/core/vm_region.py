@@ -356,14 +356,26 @@ def lift_stateful_low_level_cfg(
     # context itself.  Tagged frames preserve the VM-neutral nesting exactly.
     StateKey = tuple[int, tuple[_HandlerFrame, ...]]
 
+    def block_coordinate(index: int) -> str:
+        """Return a stable, non-null coordinate for a CFG leader.
+
+        Synthetic instructions such as an implicit return may intentionally
+        have no VM/source offset.  They still need an addressable CFG label;
+        rendering ``None`` as part of ``block_None`` would create a misleading
+        target and can collide with no real bytecode coordinate.
+        """
+
+        offset = profile.offset(instructions[index])
+        return str(offset) if offset is not None else f"index_{index}"
+
     def block_name(key: StateKey) -> str:
         index, handler_frames = key
-        base = f"block_{profile.offset(instructions[index])}"
+        base = f"block_{block_coordinate(index)}"
         if not handler_frames:
             return base
         suffixes = [
             f"{'handlers' if frame.kind is _HandlerFrameKind.PROTECTED else 'handling'}_"
-            f"{profile.offset(instructions[frame.handler])}"
+            f"{block_coordinate(frame.handler)}"
             for frame in handler_frames
         ]
         return f"{base}__{'__'.join(suffixes)}"
@@ -765,7 +777,7 @@ def lift_stateful_low_level_cfg(
                 # transfer; another source in the same block remains a real
                 # parallel exceptional edge and must not be discarded.
                 handler_chain = tuple(
-                    f"handler_{profile.offset(instructions[frame.handler])}"
+                    f"handler_{block_coordinate(frame.handler)}"
                     for frame in successor_frames
                     if frame.kind is _HandlerFrameKind.ACTIVE
                 )
@@ -872,7 +884,7 @@ def lift_stateful_low_level_cfg(
         key=lambda item: (
             item[0],
             tuple(
-                (frame.kind.value, profile.offset(instructions[frame.handler]))
+                (frame.kind.value, block_coordinate(frame.handler))
                 for frame in item[1]
             ),
         ),
@@ -900,7 +912,7 @@ def lift_stateful_low_level_cfg(
             (
                 block_name(key),
                 tuple(
-                    f"handler_{profile.offset(instructions[handler])}"
+                    f"handler_{block_coordinate(handler)}"
                     for frame in key[1]
                     if frame.kind is _HandlerFrameKind.ACTIVE
                     for handler in (frame.handler,)

@@ -40,6 +40,7 @@ from unidecompiler.core.vm_region import (
     VMStatefulCallbacks,
     build_hint_region_profile,
 )
+from unidecompiler.progress import ProgressReporter, report_progress
 from unidecompiler_plugin_dotnet_cli.assembly import (
     DotNetAssembly,
     DotNetInstruction,
@@ -406,12 +407,23 @@ DOTNET_EFFECT_TABLE = VMEffectTable(
 )
 
 
-def lift_dotnet_assembly(assembly: DotNetAssembly, metadata: dict) -> "ModuleIR":
+def lift_dotnet_assembly(
+    assembly: DotNetAssembly,
+    metadata: dict,
+    *,
+    reporter: ProgressReporter | None = None,
+) -> "ModuleIR":
+    total = len(assembly.methods)
+    report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting .NET functions")
+    functions = []
+    for index, method in enumerate(assembly.methods, start=1):
+        functions.append(_recover_dotnet_method(method))
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting function {index}/{total}")
     return assemble_vm_module(
         name=assembly.name,
         source_language="dotnet",
         metadata={"frontend": metadata, "bytecode_format": "cli-assembly"},
-        functions=tuple(_recover_dotnet_method(method) for method in assembly.methods),
+        functions=tuple(functions),
     )
 
 

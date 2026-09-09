@@ -7,6 +7,11 @@ code.
 GUI plugins extend the desktop application. They are **not** VM frontends,
 decompiler backends, simulator adapters, or MCP servers.
 
+Project-template creation and pseudocode/file export are host operations
+provided by `unidecompiler-export`; an installed plugin must not call those
+helpers or access their template assets. Progress events are likewise consumed
+by the host and are not a plugin recovery mechanism.
+
 ## 1. Design Boundary
 
 The plugin boundary is intentionally strict:

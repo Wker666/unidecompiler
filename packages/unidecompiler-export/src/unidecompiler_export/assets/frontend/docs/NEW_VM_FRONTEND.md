@@ -183,6 +183,30 @@ point repetition or budget exhaustion is recorded as a diagnostic and returns
 the last verified function. These are audit records only: a frontend must not
 use them as a substitute for thin IR facts or perform recovery itself.
 
+### 0.5.4 Exceptional transfers and cleanup effects
+
+When one basic block contains multiple operations that may throw, represent
+each proven transfer with the generic `ExceptionalTransfer` fact. A transfer
+keeps its handler target, source provenance, deterministic ordinal, handler
+entry stack snapshot, and active handler chain. Do not collapse parallel
+exception edges into one block-level edge. The legacy single `exception_edge`
+field remains a read-compatible view only; new producers should populate
+`exception_transfers`.
+
+Use the neutral `ConditionalExceptionCleanup` effect when a VM cleanup step has
+a normal stack result and a separately preserved exceptional outcome. State the
+consumed stack slots, success values, explicit input exception, propagation
+flag, and generic predicate operands. The exceptional path remains an
+`ExceptionalTransfer`; cleanup effects must not name a Python opcode or infer a
+language-specific exception type. Explicit `Reraise`/resume metadata remains
+distinct from ordinary `Raise`, and handler-entry stack order must be retained.
+If either normal or exceptional semantics cannot be expressed and validated,
+keep the low-level preservation form or emit contextual unsupported IR.
+
+Core may recover body-first loops as `DoWhile` and explicit switch-arm
+fallthrough as `Fallthrough`. These are generic structures, not frontend hints;
+frontends submit only branch/loop/fallthrough facts and never construct them.
+
 ## 0. First clarify the boundaries of frontend
 
 Frontend can do:
@@ -362,7 +386,36 @@ class MyVmFrontendPlugin:
 
 `lift()` only converts the private model into thin VM facts and then calls the core helper.
 
-### 4.1 Frontend-owned version support
+### 4.1 Optional host progress capability
+
+Progress reporting is a host concern and does not change the required
+`FrontendPlugin` interface. `DecompilerEngine.decompile_bytes()`,
+`decompile_artifact()`, and `decompile_artifacts()` accept an optional
+`ProgressReporter` (or callback). The engine emits immutable events for
+discovery, decode, lift, render, and completion; batch events carry both the
+current artifact index/total and any proven work-unit completed/total for that
+artifact. A frontend may expose `decode_with_progress()` and/or
+`lift_with_progress()` with the same semantics, while retaining the ordinary
+`decode()`/`lift()` methods for compatibility. Do not invent percentages when
+the total is unknown. Progress must never be written into `ModuleIR`, CFG, AST,
+frontend metadata, or recovery decisions. Hosts must treat reporter failures as
+non-fatal; the CLI uses stderr and GUI hosts should consume the events without
+inspecting frontend-private objects.
+
+`ProgressEvent` carries an artifact label, optional `batch_index`/
+`batch_total`, phase/status, optional completed/total work counts, unit, and a
+proven fraction. Existing frontends need no changes: without the optional
+progress methods the engine reports phase-level events around `decode()` and
+`lift()`. The CLI keeps progress disabled by default; bare `--progress` uses
+TTY auto mode and `--progress always` forces the single-line bar. Progress is
+never part of a decompilation result and must not affect success or fallback
+selection.
+
+Starter-project generation is likewise a host concern. The optional
+`unidecompiler-export` package owns frontend and GUI-plugin template assets and
+validation. Core, frontends, and the engine must not generate project files.
+
+### 4.2 Frontend-owned version support
 
 Each frontend owns the declaration of the VM versions or bytecode families it
 accepts. Keep this declaration next to the plugin implementation with
@@ -2346,12 +2399,13 @@ When implementing optional simulations, proceed in the following order:
 First support a minimal function, and then expand coverage. Do not design a
 frontend-specific runtime framework for all language features up front.
 
-## 20.2 GUI pseudocode export
+## 20.2 Host exports and starter projects
 
-Pseudocode export belongs to the GUI host and does not change frontend
-responsibilities. A frontend only supplies the recovered result and its
-display path; it must not implement file dialogs, output naming, or export
-selection.
+Pseudocode and project export belong to the host layer and do not change
+frontend responsibilities. A frontend only supplies recovered results and
+provenance; it must not implement file dialogs, output naming, or export
+selection. The optional `unidecompiler-export` package is shared by CLI and
+GUI and is intentionally independent of `unidecompiler` core.
 
 The GUI exposes two read-only commands:
 
@@ -2365,6 +2419,22 @@ unsafe characters, and adds a numeric suffix instead of overwriting an
 existing file. Results without pseudocode are skipped and reported. Absolute
 source paths, decoder objects, and private metadata must never be copied into
 the output filename or file content.
+
+The CLI provides equivalent host operations: `-o/--output` writes one
+successful result and requires exactly one successful input artifact;
+`--output-dir` writes one collision-safe file per successful artifact; and
+`unidecompiler template frontend ...` or `unidecompiler template gui_plugin ...`
+generates starter projects (`export-template` is an alias). Frontend template
+generation accepts explicit `--simulation` and `--ai-guidance` options, both
+disabled by default. AI guidance requires user-selected interpreter/sample
+files and an entry fact; the exporter validates those files and copies only
+sanitized, user-selected inputs. Template generation is atomic and never
+overwrites an existing destination directory.
+
+The CLI also provides `unidecompiler template --interactive` (short form
+`-i`) as a guided version of the same export. It collects template metadata
+and frontend-only options, then calls the same `unidecompiler-export` API. The
+wizard performs no decoding, lifting, recovery, simulation, or rendering.
 
 This feature is intentionally independent of CFG recovery, simulation, and
 frontend lookup. It is safe for documents opened from files, directories, or

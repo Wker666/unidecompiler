@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unidecompiler.core.ir import ModuleIR
 from unidecompiler.plugins import FrontendModule
+from unidecompiler.progress import ProgressReporter
 from unidecompiler_plugin_wasm.lifter import lift_wasm_module
 from unidecompiler_plugin_wasm.module import (
     WasmLibraryModuleDecoder,
@@ -49,3 +50,8 @@ class WasmFrontendPlugin:
             raise TypeError(f"WASM frontend cannot lift module from {module.frontend_id!r}")
 
         return lift_wasm_module(module.payload, module.metadata)
+
+    def lift_with_progress(self, module: FrontendModule, reporter: ProgressReporter) -> ModuleIR:
+        if module.frontend_id != self.id:
+            raise TypeError(f"WASM frontend cannot lift module from {module.frontend_id!r}")
+        return lift_wasm_module(module.payload, module.metadata, reporter=reporter)

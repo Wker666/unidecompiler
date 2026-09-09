@@ -15,6 +15,13 @@ from unidecompiler.core.reporting import ModuleReport, build_module_report
 from unidecompiler.input_sources import InputArtifact, expand_input_path
 from unidecompiler.plugin_registry import FrontendRegistry, FrontendSelectionError
 from unidecompiler.plugins import FrontendDecodeError
+from unidecompiler.progress import (
+    ProgressCallback,
+    ProgressEvent,
+    ProgressReporter,
+    SafeProgressReporter,
+    fraction_for,
+)
 from unidecompiler.provenance import ByteRange
 
 
@@ -113,33 +120,179 @@ class DecompilerEngine:
     def unregister_frontend(self, frontend_id: str):
         return self._registry.unregister(frontend_id)
 
-    def decompile_bytes(self, data: bytes, display_path: str, frontend_id: str | None = None) -> DecompileResult:
+    def decompile_bytes(
+        self,
+        data: bytes,
+        display_path: str,
+        frontend_id: str | None = None,
+        *,
+        progress: ProgressReporter | ProgressCallback | None = None,
+    ) -> DecompileResult:
+        session = _ProgressSession(progress, display_path)
+        session.emit("discover", "started", message="selecting frontend")
         try:
             frontend = self._registry.select(data, display_path, explicit_id=frontend_id)
         except FrontendSelectionError as error:
+            session.emit("discover", "failed", message=str(error))
+            session.emit("complete", "failed", message=str(error), unit="artifact")
             return _empty(display_path, "resource", None, "input.unsupported", str(error), "warning")
+        session.emit("discover", "completed", completed=1, total=1, unit="phase")
+        session.emit("decode", "started", message="decoding input")
         try:
-            decoded = frontend.decode(data, display_path)
+            progressive_decode = getattr(frontend, "decode_with_progress", None)
+            if callable(progressive_decode):
+                decoded = progressive_decode(data, display_path, session.scoped_reporter())
+            else:
+                decoded = frontend.decode(data, display_path)
         except FrontendDecodeError as error:
+            session.emit("decode", "failed", message=str(error))
+            session.emit("complete", "failed", message=str(error), unit="artifact")
             return _empty(display_path, "error", frontend.id, "frontend.decode", str(error), "error")
         except Exception as error:
-            return _empty(display_path, "error", frontend.id, "frontend.decode-error", _error(error), "error")
+            message = _error(error)
+            session.emit("decode", "failed", message=message)
+            session.emit("complete", "failed", message=message, unit="artifact")
+            return _empty(display_path, "error", frontend.id, "frontend.decode-error", message, "error")
+        session.emit("decode", "completed", completed=1, total=1, unit="phase")
+        session.emit("lift", "started", message="lifting generic IR")
         try:
-            return _present(display_path, frontend.id, frontend.lift(decoded), decoded.metadata, len(data))
+            progressive_lift = getattr(frontend, "lift_with_progress", None)
+            module = (
+                progressive_lift(decoded, session.scoped_reporter())
+                if callable(progressive_lift)
+                else frontend.lift(decoded)
+            )
         except Exception as error:
-            return _empty(display_path, "error", frontend.id, "core.lift-error", _error(error), "error")
+            message = _error(error)
+            session.emit("lift", "failed", message=message)
+            session.emit("complete", "failed", message=message, unit="artifact")
+            return _empty(display_path, "error", frontend.id, "core.lift-error", message, "error")
+        session.emit("lift", "completed", completed=1, total=1, unit="phase")
+        session.emit("render", "started", message="rendering result")
+        try:
+            result = _present(display_path, frontend.id, module, decoded.metadata, len(data))
+        except Exception as error:
+            message = _error(error)
+            session.emit("render", "failed", message=message)
+            session.emit("complete", "failed", message=message, unit="artifact")
+            return _empty(display_path, "error", frontend.id, "core.render-error", message, "error")
+        session.emit("render", "completed", completed=1, total=1, unit="phase")
+        session.emit("complete", "completed", completed=1, total=1, unit="artifact")
+        return result
 
-    def decompile_artifacts(self, input_path: Path | str | Iterable[InputArtifact], frontend_id: str | None = None) -> tuple[DecompileResult, ...]:
+    def decompile_artifacts(
+        self,
+        input_path: Path | str | Iterable[InputArtifact],
+        frontend_id: str | None = None,
+        *,
+        progress: ProgressReporter | ProgressCallback | None = None,
+    ) -> tuple[DecompileResult, ...]:
         artifacts = expand_input_path(Path(input_path)) if isinstance(input_path, str | Path) else tuple(input_path)
-        return tuple(self.decompile_artifact(item, frontend_id) for item in artifacts)
+        reporter = SafeProgressReporter(progress)
+        total = len(artifacts)
+        results: list[DecompileResult] = []
+        for index, artifact in enumerate(artifacts, start=1):
+            session = _ProgressSession(reporter, artifact.display_path, index, total)
+            result = self.decompile_artifact(
+                artifact,
+                frontend_id,
+                progress=session,
+            )
+            results.append(result)
+        return tuple(results)
 
     def decompile_artifact(
         self,
         artifact: InputArtifact,
         frontend_id: str | None = None,
+        *,
+        progress: ProgressReporter | ProgressCallback | None = None,
     ) -> DecompileResult:
         """Decompile one already-expanded artifact without mutating host state."""
-        return self.decompile_bytes(artifact.data, artifact.display_path, frontend_id)
+        return self.decompile_bytes(
+            artifact.data,
+            artifact.display_path,
+            frontend_id,
+            progress=progress,
+        )
+
+
+class _ProgressSession:
+    """Attach batch/file context to one runtime progress stream."""
+
+    def __init__(
+        self,
+        reporter: ProgressReporter | ProgressCallback | SafeProgressReporter | None,
+        artifact_label: str,
+        batch_index: int | None = None,
+        batch_total: int | None = None,
+    ) -> None:
+        self._reporter = (
+            reporter
+            if isinstance(reporter, SafeProgressReporter)
+            else SafeProgressReporter(reporter)
+        )
+        self._artifact_label = artifact_label
+        self._batch_index = batch_index
+        self._batch_total = batch_total
+
+    def scoped_reporter(self) -> ProgressReporter:
+        return _ScopedProgressReporter(self)
+
+    def report(self, event: ProgressEvent) -> None:
+        """Accept an already-scoped event when nested under batch processing."""
+
+        self.emit(
+            event.phase,
+            event.status,
+            completed=event.completed,
+            total=event.total,
+            unit=event.unit,
+            fraction=event.fraction,
+            message=event.message,
+        )
+
+    def emit(
+        self,
+        phase,
+        status,
+        *,
+        completed: int | None = None,
+        total: int | None = None,
+        unit="phase",
+        fraction: float | None = None,
+        message: str = "",
+    ) -> None:
+        self._reporter.report(
+            ProgressEvent(
+                artifact_label=self._artifact_label,
+                batch_index=self._batch_index,
+                batch_total=self._batch_total,
+                phase=phase,
+                status=status,
+                completed=completed,
+                total=total,
+                unit=unit,
+                fraction=fraction if fraction is not None else fraction_for(completed, total),
+                message=message,
+            )
+        )
+
+
+class _ScopedProgressReporter:
+    def __init__(self, session: _ProgressSession) -> None:
+        self._session = session
+
+    def report(self, event: ProgressEvent) -> None:
+        self._session.emit(
+            event.phase,
+            event.status,
+            completed=event.completed,
+            total=event.total,
+            unit=event.unit,
+            fraction=event.fraction,
+            message=event.message,
+        )
 
 
 def _present(display_path: str, frontend_id: str, module: ModuleIR, metadata: dict, artifact_size: int) -> DecompileResult:

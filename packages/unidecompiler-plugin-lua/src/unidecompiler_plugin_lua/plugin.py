@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unidecompiler.core.ir import ModuleIR
 from unidecompiler.plugins import FrontendModule
+from unidecompiler.progress import ProgressReporter
 from unidecompiler_plugin_lua.lifter import lift_lua_chunk
 from unidecompiler_plugin_lua.chunk54 import decode_lua54_chunk, Lua54ChunkError
 from unidecompiler_plugin_lua.luac import (
@@ -68,6 +69,11 @@ class LuaFrontendPlugin:
             )
 
         return lift_lua_chunk(module.payload, module.metadata)
+
+    def lift_with_progress(self, module: FrontendModule, reporter: ProgressReporter) -> ModuleIR:
+        if module.frontend_id != self.id:
+            raise TypeError(f"Lua frontend cannot lift module from {module.frontend_id!r}")
+        return lift_lua_chunk(module.payload, module.metadata, reporter=reporter)
 
 
 class Lua54BinaryChunkDecoder:

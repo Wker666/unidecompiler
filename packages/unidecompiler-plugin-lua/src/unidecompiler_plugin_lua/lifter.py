@@ -41,6 +41,7 @@ from unidecompiler.core.vm_region import (
     VMStatefulCallbacks,
     build_hint_region_profile,
 )
+from unidecompiler.progress import ProgressReporter, report_progress
 from unidecompiler_plugin_lua.luac import LuaChunk, LuaFunctionListing
 
 
@@ -919,10 +920,17 @@ LUA_EFFECT_TABLE = VMEffectTable(
 )
 
 
-def lift_lua_chunk(chunk: LuaChunk, metadata: dict) -> ModuleIR:
+def lift_lua_chunk(
+    chunk: LuaChunk,
+    metadata: dict,
+    *,
+    reporter: ProgressReporter | None = None,
+) -> ModuleIR:
     functions: tuple[FunctionIR, ...]
     if chunk.functions:
-        root, next_index = _lift_lua_function_tree(chunk.functions, 0)
+        total = len(chunk.functions)
+        report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting Lua functions")
+        root, next_index = _lift_lua_function_tree(chunk.functions, 0, reporter=reporter, total=total, progress=[0])
         if next_index != len(chunk.functions):
             raise ValueError("incomplete Lua function tree reconstruction")
         functions = (root,)
@@ -950,6 +958,10 @@ def lift_lua_chunk(chunk: LuaChunk, metadata: dict) -> ModuleIR:
 def _lift_lua_function_tree(
     listings: tuple[LuaFunctionListing, ...],
     index: int,
+    *,
+    reporter: ProgressReporter | None = None,
+    total: int | None = None,
+    progress: list[int] | None = None,
 ) -> tuple[FunctionIR, int]:
     listing = listings[index]
     function_ir = recover_vm_function(
@@ -960,10 +972,19 @@ def _lift_lua_function_tree(
             for instruction in listing.instructions
         ),
     )
+    if reporter is not None and total is not None and progress is not None:
+        progress[0] += 1
+        report_progress(reporter, phase="lift", completed=progress[0], total=total, unit="function", message=f"lifting function {progress[0]}/{total}")
     next_index = index + 1
     nested_functions: list[FunctionIR] = []
     for _ in range(listing.child_function_count):
-        nested_function, next_index = _lift_lua_function_tree(listings, next_index)
+        nested_function, next_index = _lift_lua_function_tree(
+            listings,
+            next_index,
+            reporter=reporter,
+            total=total,
+            progress=progress,
+        )
         nested_functions.append(nested_function)
     return replace(function_ir, nested_functions=tuple(nested_functions)), next_index
 

@@ -28,6 +28,7 @@ from unidecompiler.core.vm_module import assemble_vm_module
 from unidecompiler.core.vm_operands import VMDecodedInstruction, VMOperand
 from unidecompiler.provenance import ByteRange
 from unidecompiler.core.vm_region import VMRegionOpcodeClasses, VMStatefulCallbacks, build_hint_region_profile
+from unidecompiler.progress import ProgressReporter, report_progress
 from unidecompiler_plugin_wasm.module import WasmFunctionListing, WasmInstruction, WasmModule
 
 
@@ -509,12 +510,23 @@ WASM_EFFECT_TABLE = VMEffectTable(
 )
 
 
-def lift_wasm_module(module: WasmModule, metadata: dict) -> "ModuleIR":
+def lift_wasm_module(
+    module: WasmModule,
+    metadata: dict,
+    *,
+    reporter: ProgressReporter | None = None,
+) -> "ModuleIR":
+    total = len(module.functions)
+    report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting WASM functions")
+    functions = []
+    for index, function in enumerate(module.functions, start=1):
+        functions.append(_recover_wasm_function(function, module))
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting function {index}/{total}")
     return assemble_vm_module(
         name=module.filename or "<wasm-module>",
         source_language="wasm",
         metadata={"frontend": metadata, "bytecode_format": "wasm"},
-        functions=tuple(_recover_wasm_function(function, module) for function in module.functions),
+        functions=tuple(functions),
     )
 
 
