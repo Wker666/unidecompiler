@@ -21,7 +21,9 @@ Issues = "https://github.com/Wker666/unidecompiler/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-unidecompiler_export = ["assets/**/*"]
-
-[tool.setuptools.exclude-package-data]
-unidecompiler_export = ["*.pyc", "*.pyo", "__pycache__/*", "**/__pycache__/*"]
+unidecompiler_export = [
+    "assets/**/*.md",
+    "assets/**/*.py",
+    "assets/**/*.toml",
+    "assets/**/*.yaml",
+]
