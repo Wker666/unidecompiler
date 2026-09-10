@@ -277,7 +277,8 @@ class _CLIProgressReporter:
         current = _bar(file_fraction, self._BAR_WIDTH)
         batch_count = _count_text(batch_current, batch_total)
         file_count = _work_count_text(event)
-        detail = event.message or event.phase
+        detail = event.item_label or event.message or event.phase
+        detail = " ".join(detail.split())
         label = _truncate(event.artifact_label or "artifact", 64)
         detail_text = f"{event.phase}: {detail} ({label})"
         return f"Files [{batch}] {batch_count} | File [{current}] {file_count} | {detail_text}"

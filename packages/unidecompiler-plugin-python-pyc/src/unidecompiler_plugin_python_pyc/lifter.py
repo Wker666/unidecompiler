@@ -800,6 +800,17 @@ def _lift_code_object_tree(
     progress: list[int] | None = None,
 ) -> tuple[FunctionIR, ...]:
     spec = _python_function_spec(code)
+    item_label = code.name or "<anonymous>"
+    if reporter is not None and total is not None and progress is not None:
+        report_progress(
+            reporter,
+            phase="lift",
+            completed=progress[0],
+            total=total,
+            unit="function",
+            item_label=item_label,
+            message=f"lifting {item_label}",
+        )
     functions = [
         recover_vm_function(
             spec,
@@ -809,7 +820,15 @@ def _lift_code_object_tree(
     ]
     if reporter is not None and total is not None and progress is not None:
         progress[0] += 1
-        report_progress(reporter, phase="lift", completed=progress[0], total=total, unit="function", message=f"lifting code object {progress[0]}/{total}")
+        report_progress(
+            reporter,
+            phase="lift",
+            completed=progress[0],
+            total=total,
+            unit="function",
+            item_label=item_label,
+            message=f"lifted {item_label}",
+        )
     for child in code.children:
         functions.extend(
             _lift_code_object_tree(

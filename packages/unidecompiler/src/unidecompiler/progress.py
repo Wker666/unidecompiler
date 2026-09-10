@@ -37,6 +37,7 @@ class ProgressEvent:
     unit: ProgressUnit = "phase"
     fraction: float | None = None
     message: str = ""
+    item_label: str = ""
 
     def __post_init__(self) -> None:
         if self.batch_index is not None and self.batch_index < 1:
@@ -77,6 +78,7 @@ def report_progress(
     total: int | None = None,
     unit: ProgressUnit = "phase",
     message: str = "",
+    item_label: str = "",
 ) -> None:
     """Best-effort helper for optional frontend/core instrumentation."""
 
@@ -92,6 +94,7 @@ def report_progress(
             unit=unit,
             fraction=fraction_for(completed, total),
             message=message,
+            item_label=item_label,
         )
     )
 

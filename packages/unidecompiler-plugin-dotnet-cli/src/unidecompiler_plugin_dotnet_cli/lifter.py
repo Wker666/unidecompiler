@@ -417,8 +417,9 @@ def lift_dotnet_assembly(
     report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting .NET functions")
     functions = []
     for index, method in enumerate(assembly.methods, start=1):
+        report_progress(reporter, phase="lift", completed=index - 1, total=total, unit="function", item_label=method.name, message=f"lifting function {method.name}")
         functions.append(_recover_dotnet_method(method))
-        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting function {index}/{total}")
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", item_label=method.name, message=f"lifted function {method.name}")
     return assemble_vm_module(
         name=assembly.name,
         source_language="dotnet",

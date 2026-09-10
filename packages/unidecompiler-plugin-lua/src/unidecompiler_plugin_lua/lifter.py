@@ -964,6 +964,17 @@ def _lift_lua_function_tree(
     progress: list[int] | None = None,
 ) -> tuple[FunctionIR, int]:
     listing = listings[index]
+    item_label = listing.inferred_name or listing.source or f"function {index + 1}"
+    if reporter is not None and total is not None and progress is not None:
+        report_progress(
+            reporter,
+            phase="lift",
+            completed=progress[0],
+            total=total,
+            unit="function",
+            item_label=item_label,
+            message=f"lifting {item_label}",
+        )
     function_ir = recover_vm_function(
         _lua_function_spec(listing),
         lambda: lift_lua_function(listing),
@@ -974,7 +985,15 @@ def _lift_lua_function_tree(
     )
     if reporter is not None and total is not None and progress is not None:
         progress[0] += 1
-        report_progress(reporter, phase="lift", completed=progress[0], total=total, unit="function", message=f"lifting function {progress[0]}/{total}")
+        report_progress(
+            reporter,
+            phase="lift",
+            completed=progress[0],
+            total=total,
+            unit="function",
+            item_label=item_label,
+            message=f"lifted {item_label}",
+        )
     next_index = index + 1
     nested_functions: list[FunctionIR] = []
     for _ in range(listing.child_function_count):

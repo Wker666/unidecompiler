@@ -707,6 +707,7 @@ class _GuiProgressScope:
                 unit=event.unit,
                 fraction=event.fraction,
                 message=event.message,
+                item_label=event.item_label,
             )
         )
 
@@ -1762,7 +1763,8 @@ class Workbench(QMainWindow):
             self.progress.setValue(event.completed or 0)
         else:
             self.progress.setRange(0, 0)
-        detail = event.message or event.phase
+        detail = event.item_label or event.message or event.phase
+        detail = " ".join(detail.split())
         batch = (
             f"File {event.batch_index}/{event.batch_total}"
             if event.batch_index is not None and event.batch_total is not None

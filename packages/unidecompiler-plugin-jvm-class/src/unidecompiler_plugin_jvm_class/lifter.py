@@ -492,8 +492,9 @@ def lift_java_class(
     report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting JVM methods")
     functions = []
     for index, method in enumerate(class_file.methods, start=1):
+        report_progress(reporter, phase="lift", completed=index - 1, total=total, unit="function", item_label=method.name, message=f"lifting method {method.name}")
         functions.append(_recover_java_method(method))
-        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting method {index}/{total}")
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", item_label=method.name, message=f"lifted method {method.name}")
     return assemble_vm_module(
         name=class_file.class_name or class_file.filename or "<jvm-class>",
         source_language="jvm",

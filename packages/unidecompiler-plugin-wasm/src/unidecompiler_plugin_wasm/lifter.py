@@ -520,8 +520,9 @@ def lift_wasm_module(
     report_progress(reporter, phase="lift", status="started", completed=0, total=total, unit="function", message="lifting WASM functions")
     functions = []
     for index, function in enumerate(module.functions, start=1):
+        report_progress(reporter, phase="lift", completed=index - 1, total=total, unit="function", item_label=function.name, message=f"lifting function {function.name}")
         functions.append(_recover_wasm_function(function, module))
-        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", message=f"lifting function {index}/{total}")
+        report_progress(reporter, phase="lift", completed=index, total=total, unit="function", item_label=function.name, message=f"lifted function {function.name}")
     return assemble_vm_module(
         name=module.filename or "<wasm-module>",
         source_language="wasm",

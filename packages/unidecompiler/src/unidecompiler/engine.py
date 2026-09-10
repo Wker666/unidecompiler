@@ -250,6 +250,7 @@ class _ProgressSession:
             unit=event.unit,
             fraction=event.fraction,
             message=event.message,
+            item_label=event.item_label,
         )
 
     def emit(
@@ -262,6 +263,7 @@ class _ProgressSession:
         unit="phase",
         fraction: float | None = None,
         message: str = "",
+        item_label: str = "",
     ) -> None:
         self._reporter.report(
             ProgressEvent(
@@ -275,6 +277,7 @@ class _ProgressSession:
                 unit=unit,
                 fraction=fraction if fraction is not None else fraction_for(completed, total),
                 message=message,
+                item_label=item_label,
             )
         )
 
@@ -292,6 +295,7 @@ class _ScopedProgressReporter:
             unit=event.unit,
             fraction=event.fraction,
             message=event.message,
+            item_label=event.item_label,
         )
 
 
