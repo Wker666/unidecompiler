@@ -10,7 +10,7 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "__AUTHOR__" }]
 requires-python = ">=3.11"
-dependencies = ["unidecompiler-gui-sdk>=0.2.1,<0.3.0"]
+dependencies = ["unidecompiler-gui-sdk>=0.2.2,<0.3.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

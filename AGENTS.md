@@ -124,6 +124,13 @@ file export and starter-project generation for VM frontends and GUI plugins.
 Neither capability may be implemented in a frontend, backend, CFG pass, or
 `DecompilerEngine` recovery decision.
 
+Progress events may include an optional VM-neutral `item_label` for the
+currently processed, frontend-proven work item (such as a function, method, or
+code-object name). Hosts may display it, but it is observation-only and must
+not enter IR, metadata, CFG, AST, or recovery decisions. Frontends must omit it
+when no stable label is proven and must use a neutral offset-based fallback
+rather than guessing a source name.
+
 ## Simulation Architecture Contract
 
 Simulation is a separate, optional consumer of recovered generic IR. Its

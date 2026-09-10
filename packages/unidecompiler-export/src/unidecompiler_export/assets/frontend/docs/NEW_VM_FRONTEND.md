@@ -403,13 +403,51 @@ non-fatal; the CLI uses stderr and GUI hosts should consume the events without
 inspecting frontend-private objects.
 
 `ProgressEvent` carries an artifact label, optional `batch_index`/
-`batch_total`, phase/status, optional completed/total work counts, unit, and a
-proven fraction. Existing frontends need no changes: without the optional
-progress methods the engine reports phase-level events around `decode()` and
-`lift()`. The CLI keeps progress disabled by default; bare `--progress` uses
-TTY auto mode and `--progress always` forces the single-line bar. Progress is
-never part of a decompilation result and must not affect success or fallback
-selection.
+`batch_total`, phase/status, optional completed/total work counts, unit, an
+optional VM-neutral `item_label`, and a proven fraction. `item_label` names
+the work item currently being processed (for example a function, method,
+code-object name, or another stable frontend-proven label). It is presentation
+data only: it must never be copied into IR, metadata, CFG, AST, or recovery
+decisions, and a frontend must not guess a name that it cannot prove. For an
+anonymous item, use a stable neutral fallback such as `function@<offset>` when
+the offset is known; otherwise omit the label. CLI and GUI hosts should prefer
+`item_label` when displaying progress and fall back to the event `message` when
+it is absent. Reporter failures remain non-fatal and must not affect
+decompilation.
+
+Existing frontends need no changes: without the optional progress methods the
+engine reports phase-level events around `decode()` and `lift()`. The CLI
+keeps progress disabled by default; bare `--progress` uses TTY auto mode and
+`--progress always` forces the single-line bar. Progress is never part of a
+decompilation result and must not affect success or fallback selection.
+
+A frontend that can prove function-level work may report the current name
+without adding language-specific recovery logic:
+
+```python
+report_progress(
+    reporter,
+    phase="lift",
+    completed=index - 1,
+    total=total,
+    unit="function",
+    item_label=function.name or f"function@{function.offset}",
+    message="lifting current function",
+)
+lifted = recover_function(function)
+report_progress(
+    reporter,
+    phase="lift",
+    completed=index,
+    total=total,
+    unit="function",
+    item_label=function.name or f"function@{function.offset}",
+    message="lifted current function",
+)
+```
+
+The example is optional host observation; it does not require every frontend
+to expose function names or change its thin-IR submission.
 
 Starter-project generation is likewise a host concern. The optional
 `unidecompiler-export` package owns frontend and GUI-plugin template assets and
