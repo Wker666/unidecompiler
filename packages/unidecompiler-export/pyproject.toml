@@ -22,3 +22,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 unidecompiler_export = ["assets/**/*"]
+
+[tool.setuptools.exclude-package-data]
+unidecompiler_export = ["*.pyc", "*.pyo", "__pycache__/*", "**/__pycache__/*"]
