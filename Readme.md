@@ -347,6 +347,25 @@ corresponding bytes. Logical VM offsets are kept separate from artifact byte
 offsets; when a range cannot be proven, the GUI deliberately does not guess.
 This view never edits, re-encodes, or executes the original bytes.
 
+### VS Code navigation extension
+
+UniDecompiler supports the [UniDecompiler Pseudocode VS Code
+extension](https://marketplace.visualstudio.com/items?itemName=Wker666.unidecompiler-pseudocode).
+Install it from the Visual Studio Code Marketplace, then export pseudocode
+with its optional navigation sidecar. Keep the `.pse` file and the adjacent
+`.unidec.json` file together so the extension can resolve pseudocode locations
+back to proven bytecode instruction facts:
+
+```sh
+unidecompiler sample.pyc \
+  --output sample.pse \
+  --vscode-metadata sample.pse.unidec.json
+```
+
+The same paired export is available from the GUI's `Export pseudocode with VS
+Code metadata...` action. Ordinary CLI and GUI pseudocode exports remain
+unchanged and do not create a sidecar unless this option is explicitly chosen.
+
 Pseudocode can be exported from the `File` menu. `Export pseudocode` writes
 the currently selected result to one text file. `Export all pseudocode` writes
 every open result that has pseudocode to a directory, using sanitized source
