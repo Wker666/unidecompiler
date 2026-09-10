@@ -1,0 +1,3 @@
+recursive-include src/unidecompiler_export/assets *.md *.py *.toml *.yaml
+recursive-exclude src/unidecompiler_export/assets *.pyc *.pyo
+prune src/unidecompiler_export/assets/**/__pycache__
