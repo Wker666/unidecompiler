@@ -130,7 +130,13 @@ only, is never stored in IR or metadata, and observer failures are isolated from
 decompilation. The CLI keeps progress disabled by default; bare `--progress`
 enables TTY auto mode and `--progress always` forces it. The single-line bar is
 written only to stderr, so pseudocode and AST JSON on stdout remain
-machine-readable.
+machine-readable. Events may also carry an optional VM-neutral `item_label`
+for the currently processed, frontend-proven function, method, code object, or
+other stable work item. Hosts prefer that label and fall back to the event
+message when it is absent. A frontend must omit it when no stable name or
+proven offset exists; when an offset is proven, a neutral fallback such as
+`function@<offset>` is appropriate. This label is display-only and must never
+enter IR, metadata, CFG, AST, or recovery decisions.
 
 File and project exports are host functionality provided by the separate
 `unidecompiler-export` package. It writes recovered pseudocode documents and

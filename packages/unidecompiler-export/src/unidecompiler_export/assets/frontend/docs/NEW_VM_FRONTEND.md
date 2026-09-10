@@ -424,6 +424,10 @@ decompilation result and must not affect success or fallback selection.
 A frontend that can prove function-level work may report the current name
 without adding language-specific recovery logic:
 
+In this illustrative snippet, `proven_offset` is an optional offset already
+verified by the frontend; it is not derived from an instruction index or a
+search.
+
 ```python
 report_progress(
     reporter,
@@ -431,7 +435,9 @@ report_progress(
     completed=index - 1,
     total=total,
     unit="function",
-    item_label=function.name or f"function@{function.offset}",
+    item_label=function.name or (
+        f"function@{proven_offset}" if proven_offset is not None else ""
+    ),
     message="lifting current function",
 )
 lifted = recover_function(function)
@@ -441,7 +447,9 @@ report_progress(
     completed=index,
     total=total,
     unit="function",
-    item_label=function.name or f"function@{function.offset}",
+    item_label=function.name or (
+        f"function@{proven_offset}" if proven_offset is not None else ""
+    ),
     message="lifted current function",
 )
 ```
@@ -2451,12 +2459,23 @@ The GUI exposes two read-only commands:
   text file.
 - `Export all pseudocode` writes every open result that has pseudocode to a
   user-chosen existing directory.
+- `Export pseudocode with VS Code metadata...` writes one selected pseudocode
+  file followed by an adjacent `.unidec.json` navigation sidecar.
+- `Export all pseudocode with VS Code metadata...` writes collision-safe
+  pseudocode/sidecar pairs to a user-chosen existing directory.
 
 The all-result exporter derives names from the final source basename, replaces
 unsafe characters, and adds a numeric suffix instead of overwriting an
 existing file. Results without pseudocode are skipped and reported. Absolute
 source paths, decoder objects, and private metadata must never be copied into
 the output filename or file content.
+
+VS Code sidecars are strictly opt-in and do not replace a normal pseudocode
+export. They contain only the exported text's UTF-8 SHA-256, UTF-16 source-map
+ranges that resolve to an exported instruction, and instruction function ID,
+offset, raw text, and proven absolute byte range when available. They never
+include pseudocode text, paths, AST, generic IR, CFG, diagnostics, recovery
+proofs, effect data, raw artifact bytes, or frontend-private decoded objects.
 
 The CLI provides equivalent host operations: `-o/--output` writes one
 successful result and requires exactly one successful input artifact;
@@ -2468,6 +2487,11 @@ disabled by default. AI guidance requires user-selected interpreter/sample
 files and an entry fact; the exporter validates those files and copies only
 sanitized, user-selected inputs. Template generation is atomic and never
 overwrites an existing destination directory.
+
+The CLI writes VS Code navigation metadata only when both `--output PATH` and
+`--vscode-metadata PATH` are supplied for pseudocode output. The option is
+rejected with `--output-dir` and `--format ast-json`; ordinary CLI export never
+creates a sidecar.
 
 The CLI also provides `unidecompiler template --interactive` (short form
 `-i`) as a guided version of the same export. It collects template metadata

@@ -800,7 +800,12 @@ def _lift_code_object_tree(
     progress: list[int] | None = None,
 ) -> tuple[FunctionIR, ...]:
     spec = _python_function_spec(code)
-    item_label = code.name or "<anonymous>"
+    item_label = code.name or (
+        f"function@{code.artifact_code_offset}"
+        if code.artifact_code_offset is not None
+        else ""
+    )
+    message_label = item_label or "current function"
     if reporter is not None and total is not None and progress is not None:
         report_progress(
             reporter,
@@ -809,7 +814,7 @@ def _lift_code_object_tree(
             total=total,
             unit="function",
             item_label=item_label,
-            message=f"lifting {item_label}",
+            message=f"lifting {message_label}",
         )
     functions = [
         recover_vm_function(
@@ -827,7 +832,7 @@ def _lift_code_object_tree(
             total=total,
             unit="function",
             item_label=item_label,
-            message=f"lifted {item_label}",
+            message=f"lifted {message_label}",
         )
     for child in code.children:
         functions.extend(

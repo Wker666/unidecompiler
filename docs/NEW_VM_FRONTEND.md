@@ -424,6 +424,10 @@ decompilation result and must not affect success or fallback selection.
 A frontend that can prove function-level work may report the current name
 without adding language-specific recovery logic:
 
+In this illustrative snippet, `proven_offset` is an optional offset already
+verified by the frontend; it is not derived from an instruction index or a
+search.
+
 ```python
 report_progress(
     reporter,
@@ -431,7 +435,9 @@ report_progress(
     completed=index - 1,
     total=total,
     unit="function",
-    item_label=function.name or f"function@{function.offset}",
+    item_label=function.name or (
+        f"function@{proven_offset}" if proven_offset is not None else ""
+    ),
     message="lifting current function",
 )
 lifted = recover_function(function)
@@ -441,7 +447,9 @@ report_progress(
     completed=index,
     total=total,
     unit="function",
-    item_label=function.name or f"function@{function.offset}",
+    item_label=function.name or (
+        f"function@{proven_offset}" if proven_offset is not None else ""
+    ),
     message="lifted current function",
 )
 ```
