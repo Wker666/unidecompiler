@@ -152,7 +152,7 @@ def export_pseudocode_documents(results: Iterable[object], directory: Path) -> t
             if getattr(result, "pseudocode", None) is not None
         ),
         directory,
-        suffix=".pseudocode.txt",
+        suffix=".pse",
     )
 
 
@@ -175,7 +175,7 @@ def export_pseudocode_documents_with_vscode_metadata(
             display_path,
             used,
             directory,
-            suffix=".pseudocode.txt",
+            suffix=".pse",
             companion_suffixes=(_VSCODE_METADATA_SUFFIX,),
         )
         pseudocode_path = directory / filename
@@ -284,11 +284,18 @@ __all__ = (
     "write_vscode_metadata",
 )
 
-from .templates import TemplateExportError, TemplateRequest, derive_project_names, export_template
+from .templates import (
+    TemplateExportError,
+    TemplateRequest,
+    build_ai_goal_prompt,
+    derive_project_names,
+    export_template,
+)
 
 __all__ += (
     "TemplateExportError",
     "TemplateRequest",
+    "build_ai_goal_prompt",
     "derive_project_names",
     "export_template",
 )

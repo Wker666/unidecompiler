@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-export"
-version = "0.2.0"
+version = "0.2.1"
 description = "Host-side export helpers for unidecompiler results"
 readme = "README.md"
 license = "AGPL-3.0-or-later"

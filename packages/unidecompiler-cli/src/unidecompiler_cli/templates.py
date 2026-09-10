@@ -8,6 +8,7 @@ from pathlib import Path
 from unidecompiler_export.templates import (
     TemplateExportError,
     TemplateRequest,
+    build_ai_goal_prompt,
     derive_project_names,
     export_template,
 )
@@ -120,6 +121,9 @@ def main(argv: list[str]) -> int:
     except (TemplateExportError, OSError) as error:
         parser.error(str(error))
     print(destination)
+    if args.ai_guidance:
+        print("\nCopy-ready AI prompt:\n", file=sys.stderr)
+        print(build_ai_goal_prompt(request, destination), file=sys.stderr)
     return 0
 
 

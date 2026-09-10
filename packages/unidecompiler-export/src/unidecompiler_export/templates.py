@@ -98,6 +98,45 @@ def export_template(request: TemplateRequest) -> Path:
     return destination
 
 
+def build_ai_goal_prompt(request: TemplateRequest, output_directory: Path) -> str:
+    """Build the copy-ready ``/goal`` prompt for an AI-assisted template.
+
+    The prompt is an interactive host result, not a generated project asset.
+    Therefore it may identify the actual destination selected by the user,
+    while no host path is written into template files or manifests.
+    """
+    if not request.include_ai_guidance:
+        raise TemplateExportError("AI goal prompt requires AI development guidance")
+    destination = output_directory.expanduser().resolve()
+    simulation_goal = (
+        "Implement the optional data-only simulation adapter and add tests for "
+        "target discovery, function resolution, arguments, return values, and external calls."
+        if request.include_simulation
+        else
+        "Do not implement a simulation adapter or execute frontend bytecode; limit the work to decoding, thin-IR lifting, registration, and verification tests."
+    )
+    return (
+        "/goal Complete this VM frontend in the current project directory.\n\n"
+        f"Output directory: {destination}\n"
+        "Run the agent from this directory and keep all changes inside it.\n\n"
+        "First read and follow AGENTS.md, docs/AI_CONTEXT.md, docs/VM_ANALYSIS.md, "
+        "analysis_inputs/manifest.json, and skills/vm-frontend-development/SKILL.md.\n"
+        "Use the interpreter source and bytecode under analysis_inputs/ for static analysis only: "
+        "do not execute, import, or send them to a remote service. Build a proven/inferred/unresolved "
+        "evidence table with file-relative line numbers and public bytecode offsets, then verify the "
+        f"user-supplied entry ({request.entry_kind}: {_redact_machine_paths(request.entry_value.strip())}) "
+        "before implementing.\n\n"
+        f"Requested feature: {request.requirements.strip()}\n\n"
+        "Implement a complete deterministic decoder, frontend-private model, thin-IR lifter, plugin "
+        "registration, and focused tests. Every decodable instruction must submit a VMBytecodeStep or "
+        "an explicit contextual fallback. Do not construct CFG/AST/loops in the frontend or add "
+        "language-specific special cases to core.\n"
+        f"Simulation scope: {simulation_goal}\n\n"
+        "Finish by running project tests and real-sample verification. Check semantics, unsupported/partial "
+        "diagnostics, deterministic output, and privacy-path leakage."
+    )
+
+
 def _validate(request: TemplateRequest) -> None:
     if request.kind not in {"frontend", "gui_plugin"}:
         raise TemplateExportError("template kind must be 'frontend' or 'gui_plugin'")
@@ -144,8 +183,8 @@ def _render_tree(request: TemplateRequest, destination: Path) -> None:
         "__FIRST_SUFFIX__": request.suffixes[0] if request.suffixes else ".vm",
         "__VERSIONS__": repr(request.versions),
         "__DEPENDENCIES__": _toml_array(
-            ("unidecompiler>=0.2.0,<0.3.0", "unidecompiler-simulator>=0.2.0,<0.3.0")
-            if request.include_simulation else ("unidecompiler>=0.2.0,<0.3.0",)
+            ("unidecompiler>=0.2.1,<0.3.0", "unidecompiler-simulator>=0.2.1,<0.3.0")
+            if request.include_simulation else ("unidecompiler>=0.2.1,<0.3.0",)
         ),
         "__INTERPRETER_FILE__": interpreter_name,
         "__BYTECODE_FILE__": bytecode_name,

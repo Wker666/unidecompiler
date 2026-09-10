@@ -1532,7 +1532,7 @@ class Workbench(QMainWindow):
         if result is None or result.pseudocode is None:
             self.statusBar().showMessage("No pseudocode to export")
             return
-        filename, _ = QFileDialog.getSaveFileName(self, "Export pseudocode", "pseudocode.txt", "Text files (*.txt);;All files (*)")
+        filename, _ = QFileDialog.getSaveFileName(self, "Export pseudocode", "pseudocode.pse", "Pseudocode files (*.pse);;All files (*)")
         if filename:
             try:
                 write_pseudocode(result, Path(filename))
@@ -1569,8 +1569,8 @@ class Workbench(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export pseudocode with VS Code metadata",
-            "pseudocode.txt",
-            "Text files (*.txt);;All files (*)",
+            "pseudocode.pse",
+            "Pseudocode files (*.pse);;All files (*)",
         )
         if not filename:
             return

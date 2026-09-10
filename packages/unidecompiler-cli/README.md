@@ -23,7 +23,7 @@ exports use sanitized basenames and never overwrite an existing file; these
 options leave stdout empty and report the destinations on stderr:
 
 ```sh
-unidecompiler sample.pyc --output sample.pseudocode.txt
+unidecompiler sample.pyc --output sample.pse
 unidecompiler samples/ --output-dir decompiled/
 unidecompiler samples/ --format ast-json --output-dir ast/
 ```
@@ -35,8 +35,8 @@ for `--output-dir` or `--format ast-json`:
 
 ```sh
 unidecompiler sample.pyc \
-  --output sample.pseudocode.txt \
-  --vscode-metadata sample.pseudocode.txt.unidec.json
+  --output sample.pse \
+  --vscode-metadata sample.pse.unidec.json
 ```
 
 The sidecar contains the exported text's UTF-8 SHA-256, UTF-16 source-map

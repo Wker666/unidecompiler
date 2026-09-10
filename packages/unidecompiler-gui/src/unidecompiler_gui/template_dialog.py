@@ -20,7 +20,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from unidecompiler_gui.template_export import TemplateExportError, TemplateRequest, derive_project_names, export_template
+from unidecompiler_gui.template_export import (
+    TemplateExportError,
+    TemplateRequest,
+    build_ai_goal_prompt,
+    derive_project_names,
+    export_template,
+)
 
 
 class TemplateDialog(QDialog):
@@ -176,28 +182,11 @@ class TemplateDialog(QDialog):
             return
         QMessageBox.information(self, "Template exported", f"Template exported to:\n{destination}")
         if ai_enabled:
-            self._show_ai_goal_prompt(include_simulation=self.simulation.isChecked())
+            self._show_ai_goal_prompt(request, destination)
         self.accept()
 
-    def _show_ai_goal_prompt(self, *, include_simulation: bool) -> None:
-        simulation_goal = (
-            "Implement the optional data-only simulation adapter and add tests for target discovery, function resolution, arguments, return values, and external calls."
-            if include_simulation else
-            "Do not implement a simulation adapter or execute frontend bytecode; limit the work to decoding, thin-IR lifting, registration, and verification tests."
-        )
-        prompt = (
-            "/goal Complete this VM frontend in the current project directory.\n\n"
-            "First read and follow AGENTS.md, docs/AI_CONTEXT.md, docs/VM_ANALYSIS.md, "
-            "analysis_inputs/manifest.json, and skills/vm-frontend-development/SKILL.md.\n"
-            "Use the interpreter source and bytecode under analysis_inputs/ for static analysis only: do not execute, import, or send them to a remote service. "
-            "Build a proven/inferred/unresolved evidence table with file-relative line numbers and public bytecode offsets, "
-            "then verify the user-supplied entry before implementing.\n\n"
-            "Implement a complete deterministic decoder, frontend-private model, thin-IR lifter, plugin registration, and focused tests. "
-            "Every decodable instruction must submit a VMBytecodeStep or an explicit contextual fallback. "
-            "Do not construct CFG/AST/loops in the frontend or add language-specific special cases to core.\n"
-            f"Simulation scope: {simulation_goal}\n\n"
-            "Finish by running project tests and real-sample verification. Check semantics, unsupported/partial diagnostics, deterministic output, and privacy-path leakage."
-        )
+    def _show_ai_goal_prompt(self, request: TemplateRequest, destination: Path) -> None:
+        prompt = build_ai_goal_prompt(request, destination)
         dialog = QDialog(self)
         dialog.setWindowTitle("Copy AI goal prompt")
         dialog.resize(760, 520)
