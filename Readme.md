@@ -176,6 +176,7 @@ lives under `packages/` and can be installed independently.
 - `unidecompiler-gui-sdk`: stable, Qt-neutral API for trusted GUI plugins.
 - `unidecompiler-export`: host-side pseudocode and starter-project exporters.
 - `unidecompiler-simulator`: optional bounded executor for recovered generic IR.
+- `unidecompiler-symbolic`: bounded symbolic executor for recovered generic IR.
 - `unidecompiler-simulation-host-python`: trusted Python runtime host for
   applications that provide unresolved functions.
 - `unidecompiler-plugin-*`: independently installable frontend adapters.

@@ -12,5 +12,6 @@ pythonpath = [
     "packages/unidecompiler-gui-sdk/src",
     "packages/unidecompiler-simulator/src",
     "packages/unidecompiler-simulation-host-python/src",
+    "packages/unidecompiler-symbolic/src",
 ]
 testpaths = ["tests"]

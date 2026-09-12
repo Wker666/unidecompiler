@@ -18,6 +18,7 @@ dependencies = [
     "unidecompiler-gui-sdk>=0.2.2,<0.3.0",
     "unidecompiler-simulator>=0.2.2,<0.3.0",
     "unidecompiler-simulation-host-python>=0.2.2,<0.3.0",
+    "unidecompiler-symbolic>=0.2.2,<0.3.0",
     "unidecompiler-plugin-python-pyc>=0.2.2,<0.3.0",
     "unidecompiler-plugin-jvm-class>=0.2.2,<0.3.0",
     "unidecompiler-plugin-lua>=0.2.2,<0.3.0",
