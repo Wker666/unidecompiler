@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 
-from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, copy_metadata
 
 
 ROOT = Path(SPECPATH)
@@ -31,10 +31,17 @@ datas = [(str(ROOT / "src" / "unidecompiler_gui" / "themes"), "unidecompiler_gui
 for distribution in ("unidecompiler", *PLUGIN_DISTRIBUTIONS):
     datas.extend(copy_metadata(distribution))
 
+# z3-solver loads a platform-native library at import time.  PyInstaller does
+# not infer that ctypes load, so collect the matching .so/.dylib/.dll into the
+# package-relative directory searched by z3.z3core.
+binaries = collect_dynamic_libs("z3")
+if not binaries:
+    raise RuntimeError("z3-solver native library was not found")
+
 a = Analysis(
     [str(ROOT / "src" / "unidecompiler_gui" / "app.py")],
     pathex=[str(ROOT / "src")],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
 )
