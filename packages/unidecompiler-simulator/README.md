@@ -29,6 +29,12 @@ result = SimulationEngine().simulate_artifact(
 )
 ```
 
+`prepare_artifact_target()` is the public host seam for consumers that need a
+resolved generic-IR function without executing it, such as
+`unidecompiler-symbolic`. It validates frontend selection, adapter ownership,
+opaque query resolution, and `FunctionIR` membership before returning the
+data-only prepared target.
+
 The `unidecompiler-cli` package hosts the command-line interface and accepts a
 frontend-owned function query and JSON arguments:
 

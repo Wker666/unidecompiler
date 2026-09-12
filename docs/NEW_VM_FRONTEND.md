@@ -2445,7 +2445,53 @@ When implementing optional simulations, proceed in the following order:
 First support a minimal function, and then expand coverage. Do not design a
 frontend-specific runtime framework for all language features up front.
 
-## 20.2 Host exports and starter projects
+## 20.2 Optional symbolic execution support
+
+Symbolic execution is a host feature built on recovered generic IR; it is not
+an interpreter extension for the frontend. A frontend does not implement a
+second symbolic adapter. Instead, hosts reuse the optional data-only
+`simulation_adapter` contract for target discovery and resolution, then pass
+the resolved `FunctionIR` to `unidecompiler-symbolic`.
+
+The workflow is:
+
+1. The host selects a frontend and asks it to decode and lift the artifact.
+2. The frontend lists presentation-safe, opaque target queries.
+3. The host resolves the selected query to a `FunctionIR` in the lifted module.
+4. The symbolic engine validates module ownership and creates symbolic inputs.
+5. The engine explores generic IR paths under explicit resource limits.
+
+The symbolic package owns path states, constraint construction, solver calls,
+models, and cancellation. It must not read frontend bytecode, decoder models,
+VM opcodes, thin IR, effect tables, simulator frames, or executable callbacks.
+Frontend adapters remain data-only and may only resolve targets or provide
+narrow runtime facts. CLI and GUI treat queries as opaque and render the
+public `SymbolicResult`; they do not infer language-specific names or perform
+path exploration.
+
+`SymbolicInput` supports `bool`, `int`, `real`, and fixed-width `bitvec`
+declarations. `SymbolicLimits` bounds paths, steps, loop unrolling, call depth,
+and solver time. Results must preserve explicit `completed`, `raised`,
+`unsupported`, `invalid_request`, limit, solver-timeout, and `cancelled`
+statuses. Unsupported generic IR or runtime facts must include contextual
+diagnostics rather than guessed values. Current coverage is scalar expressions,
+branches, Phi/multiway control flow, and bounded loops; calls, mutable
+containers, and ambiguous exception transfers remain explicit unsupported
+outcomes until represented soundly in generic IR.
+
+CLI example:
+
+```sh
+unidecompiler symbolic sample.pyc --function choose \
+  --symbolic '{"value":{"sort":"int"}}' \
+  --max-paths 64 --max-loop-unroll 8
+```
+
+The GUI exposes the same operation in its Symbolic tab. Frontend authors who
+advertise symbolic support should test target resolution, branch feasibility,
+models and returns, unsupported IR, and each configured exploration limit.
+
+## 20.3 Host exports and starter projects
 
 Pseudocode and project export belong to the host layer and do not change
 frontend responsibilities. A frontend only supplies recovered results and

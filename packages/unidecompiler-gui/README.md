@@ -23,6 +23,24 @@ plugins through `DecompilerEngine` and does not modify input artifacts or save
 workspace state. Its optional Simulation tab uses the separate generic IR
 simulator and can load a trusted Python runtime file for unresolved functions.
 
+The **Symbolic** tab performs bounded path exploration over recovered generic
+IR. Targets come from the selected frontend's opaque, data-only query list;
+the GUI does not infer names, overloads, or dynamic call targets. The parameter
+table displays the frontend's parameters and lets you choose `bool`, `int`,
+`real`, or fixed-width `bitvec` sorts. **Concrete** accepts a JSON object such
+as `{}` or `{"value": 5}` for values that should not be symbolic. Press
+**Explore** to inspect path constraints, solver models, returns or raises, and
+the concrete CFG block/edge trace. Path, step, loop-unroll, call-depth, and
+solver-timeout limits keep exploration bounded; `unsupported`, limit,
+timeout, cancellation, and invalid-request outcomes remain visible instead of
+being presented as successful execution.
+
+For example, a `choose(value)` function explored with `{"value":{"sort":"int"}}`
+produces separate paths for each branch. Supplying **Concrete** `{"value":5}`
+constrains the same target to the paths feasible for that value. The tab
+consumes only the public `SymbolicResult` and never receives Z3 runners,
+simulator frames, frontend decoders, or private IR objects.
+
 ## Structure and Hex analysis
 
 `Structure / Hex` is a read-only, IR-first provenance view. It shows the

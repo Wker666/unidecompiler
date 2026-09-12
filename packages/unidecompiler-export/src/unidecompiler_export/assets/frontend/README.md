@@ -54,6 +54,24 @@ exceptions, unsupported operations, limits, cancellation, and execution trace.
 See `packages/unidecompiler-simulator/README.md` for the public library API and
 frontend query formats.
 
+### Symbolic execution
+
+The optional `unidecompiler-symbolic` package explores bounded paths through
+the recovered generic IR. It reuses this frontend's data-only simulation
+adapter for opaque target discovery and resolution; it does not require (and
+must not receive) a frontend interpreter or symbolic callback. A typical CLI
+run is:
+
+```sh
+unidecompiler symbolic sample.pyc --function choose \
+  --symbolic '{"value":{"sort":"int"}}'
+```
+
+The GUI's Symbolic tab exposes the same target list and displays constraints,
+models, returns/raises, CFG edges, and explicit unsupported or limit outcomes.
+Ensure advertised functions lift to generic IR supported by the symbolic
+engine, and test branch feasibility, parameter metadata, and bounded limits.
+
 Supported frontend families follow this model:
 
 - Python `.pyc`
@@ -70,6 +88,7 @@ Supported frontend families follow this model:
 - `packages/unidecompiler-gui-sdk/`: versioned data contracts for GUI plugins.
 - `packages/unidecompiler-export/`: host-side pseudocode and starter-project exporters.
 - `packages/unidecompiler-simulator/`: bounded generic IR execution library.
+- `packages/unidecompiler-symbolic/`: bounded symbolic execution over generic IR.
 - `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
 - `packages/unidecompiler-all/`: complete-installation meta-package.
@@ -131,6 +150,11 @@ The runtime file is trusted host Python code selected by the user. It is not a
 sandbox and is loaded by the application-host package, not by core, the
 simulator, or a frontend. The simulator itself receives only data-only call
 requests and validated runtime values.
+
+To explore the same target symbolically, install `unidecompiler-symbolic` and
+declare symbolic parameters with `--symbolic`. Keep target queries opaque:
+the frontend owns name or overload resolution, while the host passes the query
+to the symbolic engine unchanged.
 
 For the desktop workbench, install the GUI and all bundled frontend packages:
 

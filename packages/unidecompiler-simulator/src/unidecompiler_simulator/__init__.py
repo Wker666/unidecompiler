@@ -17,6 +17,7 @@ from unidecompiler_simulator.engine import (
     SimulationResult,
     SimulationStatus,
     SimulationTargetListing,
+    PreparedSimulationTarget,
 )
 from unidecompiler_simulator.environment import (
     ExternalCallRequest,
@@ -47,6 +48,7 @@ __all__ = [
     "SimulationResult",
     "SimulationStatus",
     "SimulationTargetListing",
+    "PreparedSimulationTarget",
     "ExternalCallRequest",
     "ExternalCallResult",
     "ExternalCallStatus",

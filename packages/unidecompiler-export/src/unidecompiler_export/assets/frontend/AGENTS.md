@@ -183,6 +183,38 @@ unhandled external calls, invalid requests, limits, and cancellation must never
 be silently converted into success or guessed behavior. Trace limits may
 truncate recorded events, but must not alter execution semantics.
 
+## Symbolic Execution Contract
+
+Symbolic execution is an optional consumer of recovered generic IR. Its
+dependency direction is:
+
+```txt
+frontend -> core generic IR <- simulator / symbolic <- CLI / GUI / hosts
+```
+
+`unidecompiler-symbolic` may reuse the simulator's public artifact-preparation
+boundary (`prepare_artifact_target`) to obtain a module and resolve a
+frontend-owned opaque query, but it owns path states, constraints, solver
+interaction, limits, and diagnostics. It must execute only `ModuleIR` and
+`FunctionIR`; it must never read frontend bytecode, decoded models, VM opcodes,
+effect tables, thin IR, simulator frames, or executable adapter callbacks.
+
+Frontend simulation adapters remain optional and data-only. They may enumerate
+targets, resolve a query to a `FunctionIR` in the current lifted module, and
+provide narrow runtime facts. They must not implement symbolic evaluation,
+path exploration, VM interpretation, or language-specific execution. CLI and
+GUI pass queries through as opaque data and only render public symbolic
+results.
+
+`SymbolicResult` must make every outcome explicit: completed paths, raised
+values, unsupported IR or runtime facts, invalid requests, path/step/loop/call
+depth limits, solver timeouts, and cancellation. A bounded exploration limit
+or solver uncertainty is not success and must not be guessed away. Trace limits
+may truncate diagnostics but must not change execution semantics. Current
+support is intended for scalar values, branches, Phi/multiway control flow,
+and bounded loops; unsupported containers, calls, or exception transfers must
+remain contextual unsupported results until a sound generic-IR model exists.
+
 ## GUI Plugin Architecture Contract
 
 GUI plugins are trusted, optional application extensions. They are not VM
@@ -301,11 +333,15 @@ These rules are mandatory.
   host runtime implementations.
 - The simulator must execute only recovered generic IR. It must not interpret
   frontend bytecode, thin IR, opcode tables, or language-specific semantics.
+- The symbolic executor must explore only recovered generic IR. It must not
+  interpret frontend bytecode, thin IR, opcode tables, simulator frames, or
+  language-specific semantics.
 - Simulation adapters are optional and data-only. They must not expose function
   execution, instruction stepping, evaluation, frame/stack management, control
   flow recovery, or executable callback behavior.
-- GUI and CLI must consume simulator APIs and opaque frontend queries only; they
-  must not implement frontend-specific target lookup or simulation semantics.
+- GUI and CLI must consume simulator/symbolic APIs and opaque frontend queries
+  only; they must not implement frontend-specific target lookup, simulation
+  semantics, solver behavior, or path exploration.
 - Runtime-file loading and other executable host integrations must remain
   outside core, simulator, and frontend packages. They are trusted host code,
   not a simulator sandbox.
@@ -394,6 +430,9 @@ existing project directory. Frontend templates may explicitly opt into the
 data-only simulator adapter (`--simulation`) and the AI analysis kit
 (`--ai-guidance`); both are disabled by default, and AI inputs require explicit
 paths and entry facts.
+The CLI also provides `unidecompiler symbolic`; the GUI exposes a Symbolic tab.
+Both consume the public symbolic API and must not implement path exploration or
+frontend-specific target lookup.
 The CLI's `--interactive`/`-i` template wizard is only an alternative way to
 collect these export settings; it must call the same exporter and must not
 contain decoding or recovery logic.
@@ -430,6 +469,15 @@ If a frontend elects to support simulation, it must additionally:
 4. Add focused tests for target discovery, query ambiguity, arguments and
    return values, and any frontend-specific runtime facts.
 
+If a frontend advertises symbolic execution, it must additionally:
+
+1. Reuse the data-only target discovery and resolution contract; do not add a
+   symbolic interpreter to the frontend.
+2. Ensure advertised targets lift to generic IR expressions, statements,
+   terminators, and parameter metadata that the symbolic package can validate.
+3. Add focused tests for branch feasibility, models/returns, unsupported IR,
+   and every configured exploration limit.
+
 ## Verification Guardrails
 
 Unit tests are only the first verification layer. A change is not correct just
@@ -457,6 +505,9 @@ The test suite includes frontend-decoupling checks that enforce this design:
 - CLI and GUI integration tests consume only simulator results, preserve target
   selection, and expose completion, failure, cancellation, and trace-truncation
   outcomes visibly.
+- CLI and GUI symbolic integration tests consume only `SymbolicResult`, preserve
+  opaque target selection, and expose path constraints, models, returns/raises,
+  unsupported results, limits, solver timeouts, and cancellation visibly.
 - GUI plugin tests cover SDK isolation, manifest validation, safe archive
   extraction, and enabled/disabled lifecycle behavior.
 - Every public thin effect and every generic IR expression, statement, and

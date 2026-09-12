@@ -95,6 +95,23 @@ separate simulator library:
 unidecompiler simulate sample.bytecode --function 'Example.run' --args '[1, 2]'
 ```
 
+Bounded symbolic execution uses the same opaque frontend query and explores
+the recovered generic IR only. `--symbolic` names scalar symbolic parameters;
+all other parameters are supplied through `--concrete`:
+
+```sh
+unidecompiler symbolic sample.pyc --function add \
+  --symbolic '{"left":{"sort":"int"}}' --concrete '{"right":5}'
+```
+
+Use `--format text` for a human-readable summary. Exploration is bounded by
+`--max-paths`, `--max-steps`, `--max-loop-unroll`, `--max-call-depth`, and
+`--solver-timeout-ms`; symbolic sorts are `bool`, `int`, `real`, and `bitvec`
+with a positive `bit_width`. JSON output contains each path's constraints,
+model, return/raise value, and CFG trace. Non-success statuses such as
+`unsupported`, `solver_timeout`, limits, `cancelled`, and `invalid_request`
+are returned explicitly and produce a non-zero exit code.
+
 For trusted programs that require functions outside the lifted module, pass a
 Python environment file. Top-level functions are matched by name, while their
 stdout and stderr are returned as structured simulation events:

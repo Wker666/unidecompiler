@@ -4,8 +4,8 @@ A small universal bytecode decompiler experiment.
 
 ## Quick start (PyPI)
 
-For the complete read-only GUI, CLI, simulator, and all bundled frontend
-formats, install the meta-package:
+For the complete read-only GUI, CLI, simulator, symbolic executor, and all
+bundled frontend formats, install the meta-package:
 
 ```sh
 python -m pip install --upgrade unidecompiler-all
@@ -230,6 +230,21 @@ exceptions, unsupported operations, limits, cancellation, and execution trace.
 See `packages/unidecompiler-simulator/README.md` for the public library API and
 frontend query formats.
 
+The optional symbolic executor follows the same ownership boundary. It receives
+only recovered generic IR and opaque frontend target queries through the host;
+it never interprets frontend bytecode. The CLI exposes it as `unidecompiler
+symbolic`, with JSON symbolic-input declarations and concrete parameter values:
+
+```sh
+unidecompiler symbolic sample.pyc --function choose \
+  --symbolic '{"value":{"sort":"int"}}' --concrete '{}'
+```
+
+The Workbench's Symbolic tab uses the same opaque target listing and presents
+bounded path constraints, models, return or raise outcomes, and concrete CFG
+edge IDs. Unsupported IR, solver uncertainty, limits, and cancellation remain
+visible structured results.
+
 Supported frontend families follow this model:
 
 - Python `.pyc`
@@ -246,6 +261,7 @@ Supported frontend families follow this model:
 - `packages/unidecompiler-gui-sdk/`: versioned data contracts for GUI plugins.
 - `packages/unidecompiler-export/`: host-side pseudocode and starter-project exporters.
 - `packages/unidecompiler-simulator/`: bounded generic IR execution library.
+- `packages/unidecompiler-symbolic/`: bounded symbolic execution over generic IR.
 - `packages/unidecompiler-simulation-host-python/`: trusted Python runtime host shared by applications.
 - `packages/unidecompiler-plugin-*/`: independently installable frontend packages.
 - `packages/unidecompiler-all/`: complete-installation meta-package.
@@ -265,7 +281,7 @@ frontend adapter boundary.
 ## Installation And Use
 
 The `unidecompiler-all` meta-package provides the complete CLI, GUI, GUI plugin
-SDK, and all frontend plugins with one command:
+SDK, simulator, symbolic executor, and all frontend plugins with one command:
 
 ```sh
 python -m pip install unidecompiler-all
@@ -327,6 +343,28 @@ sandbox and is loaded by the application-host package, not by core, the
 simulator, or a frontend. The simulator itself receives only data-only call
 requests and validated runtime values.
 
+The symbolic command explores multiple feasible paths through a recovered
+function. Install `unidecompiler-all` (or `unidecompiler-cli` together with
+`unidecompiler-symbolic`) and declare symbolic parameters as a JSON object:
+
+```sh
+unidecompiler symbolic sample.pyc \
+  --frontend python-pyc \
+  --function choose \
+  --symbolic '{"value":{"sort":"int"}}'
+```
+
+`--concrete` supplies JSON values for parameters that should remain concrete,
+while `--max-paths`, `--max-steps`, `--max-loop-unroll`,
+`--max-call-depth`, and `--solver-timeout-ms` bound exploration resources.
+Inputs support `bool`, `int`, `real`, and fixed-width `bitvec` sorts (the latter
+also requires `bit_width`). Results are JSON by default; add `--format text`
+for a concise report. Each path includes its constraints, model, return or
+raise outcome, and concrete CFG block/edge trace. A top-level status of
+`completed` means exploration finished; `unsupported`, `solver_timeout`,
+`*_limit`, `cancelled`, and `invalid_request` are explicit non-success
+outcomes.
+
 For the desktop workbench, install the GUI and all bundled frontend packages:
 
 ```sh
@@ -340,6 +378,14 @@ public simulator API. Select a recovered artifact to discover targets from the
 registered frontend, enter a JSON argument array, optionally choose a trusted
 `runtime.py`, and press Run to inspect the result and execution trace. The GUI
 does not implement language-specific target lookup or simulation semantics.
+
+The Symbolic tab uses the same frontend-owned target list. Select a target,
+review the discovered parameter sorts, optionally enter a concrete JSON object,
+adjust path, step, loop, and solver limits, and press **Explore**. The result
+table shows one row per feasible path; selecting a row reveals constraints, a
+model, returns or raises, and the CFG edges taken. The GUI only renders the
+public `SymbolicResult`; it does not access Z3 state, simulator frames,
+frontend decoders, or private IR objects.
 
 The GUI also provides a read-only `Structure / Hex` view. When a frontend can
 prove an instruction's exact absolute byte range in the opened artifact, the
@@ -476,6 +522,7 @@ editable mode:
 .venv/bin/python -m pip install build -e packages/unidecompiler \
   -e packages/unidecompiler-gui-sdk \
   -e packages/unidecompiler-simulator \
+  -e packages/unidecompiler-symbolic \
   -e packages/unidecompiler-simulation-host-python \
   -e packages/unidecompiler-cli \
   -e packages/unidecompiler-gui \

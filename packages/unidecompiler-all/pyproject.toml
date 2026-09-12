@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-all"
-version = "0.2.2"
+version = "0.2.3"
 description = "Complete unidecompiler installation with CLI, GUI, and all frontend plugins"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -13,12 +13,12 @@ requires-python = ">=3.11"
 dependencies = [
     "unidecompiler>=0.2.2,<0.3.0",
     "unidecompiler-export>=0.2.2,<0.3.0",
-    "unidecompiler-cli>=0.2.2,<0.3.0",
-    "unidecompiler-gui>=0.2.2,<0.3.0",
+    "unidecompiler-cli>=0.2.3,<0.3.0",
+    "unidecompiler-gui>=0.2.3,<0.3.0",
     "unidecompiler-gui-sdk>=0.2.2,<0.3.0",
-    "unidecompiler-simulator>=0.2.2,<0.3.0",
+    "unidecompiler-simulator>=0.2.3,<0.3.0",
     "unidecompiler-simulation-host-python>=0.2.2,<0.3.0",
-    "unidecompiler-symbolic>=0.2.2,<0.3.0",
+    "unidecompiler-symbolic>=0.2.3,<0.3.0",
     "unidecompiler-plugin-python-pyc>=0.2.2,<0.3.0",
     "unidecompiler-plugin-jvm-class>=0.2.2,<0.3.0",
     "unidecompiler-plugin-lua>=0.2.2,<0.3.0",

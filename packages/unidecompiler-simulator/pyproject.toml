@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-simulator"
-version = "0.2.2"
+version = "0.2.3"
 description = "A decoupled generic IR simulator for unidecompiler"
 readme = "README.md"
 license = "AGPL-3.0-or-later"

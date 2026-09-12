@@ -2,6 +2,7 @@
 
 from .engine import (
     SymbolicEngine,
+    SymbolicCancellation,
     SymbolicInput,
     SymbolicLimits,
     SymbolicPath,
@@ -12,6 +13,7 @@ from .engine import (
 
 __all__ = [
     "SymbolicEngine",
+    "SymbolicCancellation",
     "SymbolicInput",
     "SymbolicLimits",
     "SymbolicPath",

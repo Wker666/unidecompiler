@@ -171,6 +171,22 @@ class SimulationTargetListing:
     diagnostic: str | None = None
 
 
+@dataclass(frozen=True)
+class PreparedSimulationTarget:
+    """A frontend-resolved, module-owned generic-IR target.
+
+    Hosts may reuse this preparation boundary for consumers such as symbolic
+    execution.  It deliberately retains only data returned by the optional
+    adapter; execution stays owned by the consuming generic-IR engine.
+    """
+
+    frontend_id: str
+    module: ModuleIR
+    function: FunctionIR
+    adapter: object
+    target_context: object | None = None
+
+
 class _SimulationStop(Exception):
     def __init__(self, status: SimulationStatus, message: str, value: Any = None) -> None:
         super().__init__(message)
@@ -303,32 +319,16 @@ class SimulationEngine:
         cancellation: SimulationCancellation | None = None,
     ) -> SimulationResult:
         try:
-            frontend = self.registry.select(data, display_path, explicit_id=frontend_id)
-            decoded = frontend.decode(data, display_path)
-            module = frontend.lift(decoded)
-            adapter = adapter_for(frontend)
-            if adapter is None:
-                return SimulationResult(
-                    status=SimulationStatus.INVALID_REQUEST,
-                    diagnostic=f"frontend {frontend.id!r} does not support simulation function lookup",
-                )
-            if getattr(adapter, "frontend_id", None) != frontend.id:
-                raise TypeError("simulation adapter frontend_id does not match frontend")
-            resolved = call_adapter(adapter, "resolve_function", query, decoded, module)
-            if resolved is NotHandled:
-                return SimulationResult(
-                    status=SimulationStatus.INVALID_REQUEST,
-                    diagnostic=f"frontend {frontend.id!r} did not resolve the function query",
-                )
-            if not isinstance(resolved, ResolvedFunction):
-                raise TypeError("resolve_function must return ResolvedFunction or NotHandled")
+            prepared = self.prepare_artifact_target(
+                data, display_path, query, frontend_id=frontend_id
+            )
             return self.simulate_function(
-                module,
-                resolved.function,
+                prepared.module,
+                prepared.function,
                 args,
-                adapter=adapter,
+                adapter=prepared.adapter,
                 environment=environment,
-                target_context=resolved.context,
+                target_context=prepared.target_context,
                 limits=limits,
                 cancellation=cancellation,
             )
@@ -337,6 +337,44 @@ class SimulationEngine:
                 status=SimulationStatus.INVALID_REQUEST,
                 diagnostic=f"{type(error).__name__}: {error}",
             )
+
+    def prepare_artifact_target(
+        self,
+        data: bytes,
+        display_path: str,
+        query: object,
+        *,
+        frontend_id: str | None = None,
+    ) -> PreparedSimulationTarget:
+        """Lift one artifact and resolve its opaque, frontend-owned query.
+
+        This is intentionally a data-preparation API.  It does not execute a
+        function and is the one place hosts use adapter lookup for a recovered
+        artifact target.
+        """
+
+        frontend = self.registry.select(data, display_path, explicit_id=frontend_id)
+        decoded = frontend.decode(data, display_path)
+        module = frontend.lift(decoded)
+        adapter = adapter_for(frontend)
+        if adapter is None:
+            raise ValueError(
+                f"frontend {frontend.id!r} does not support simulation function lookup"
+            )
+        if getattr(adapter, "frontend_id", None) != frontend.id:
+            raise TypeError("simulation adapter frontend_id does not match frontend")
+        resolved = call_adapter(adapter, "resolve_function", query, decoded, module)
+        if resolved is NotHandled:
+            raise ValueError(f"frontend {frontend.id!r} did not resolve the function query")
+        if not isinstance(resolved, ResolvedFunction):
+            raise TypeError("resolve_function must return ResolvedFunction or NotHandled")
+        if not self._contains_function(module, resolved.function):
+            raise TypeError("simulation target does not belong to the lifted module")
+        if callable(resolved.context):
+            raise TypeError("simulation target context cannot be executable")
+        return PreparedSimulationTarget(
+            frontend.id, module, resolved.function, adapter, resolved.context
+        )
 
     def simulate_path(
         self,

@@ -14,3 +14,16 @@ python -m pip install unidecompiler-all
 
 After installation, run `unidecompiler --help` for the CLI or
 `unidecompiler-gui` for the desktop workbench.
+
+The complete installation also includes bounded symbolic execution through
+the CLI and GUI. Explore a recovered function with:
+
+```sh
+unidecompiler symbolic sample.pyc --function choose \
+  --symbolic '{"value":{"sort":"int"}}'
+```
+
+The GUI exposes the same operation in its **Symbolic** tab. Both hosts consume
+only recovered generic IR and frontend-owned opaque target queries; limits,
+unsupported operations, solver timeouts, and cancellations are reported as
+structured outcomes.

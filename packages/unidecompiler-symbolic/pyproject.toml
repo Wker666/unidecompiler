@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unidecompiler-symbolic"
-version = "0.2.2"
+version = "0.2.3"
 description = "Bounded symbolic execution for unidecompiler generic IR"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -12,7 +12,7 @@ authors = [{ name = "Wker", email = "1670133844@qq.com" }]
 requires-python = ">=3.11"
 dependencies = [
     "unidecompiler>=0.2.2,<0.3.0",
-    "unidecompiler-simulator>=0.2.2,<0.3.0",
+    "unidecompiler-simulator>=0.2.3,<0.3.0",
     "z3-solver>=5.1.0",
 ]
 

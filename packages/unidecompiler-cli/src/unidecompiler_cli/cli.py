@@ -24,11 +24,15 @@ from unidecompiler.progress import ProgressEvent, ProgressReporter
 
 def main(argv: list[str] | None = None, *, registry: FrontendRegistry | None = None) -> int:
     command_argv = sys.argv[1:] if argv is None else argv
-    if command_argv and command_argv[0] in {"simulate", "template", "export-template"}:
+    if command_argv and command_argv[0] in {"simulate", "symbolic", "template", "export-template"}:
         if command_argv[0] in {"template", "export-template"}:
             from unidecompiler_cli.templates import main as template_main
 
             return template_main(command_argv[1:])
+        if command_argv[0] == "symbolic":
+            from unidecompiler_cli.symbolic import main as symbolic_main
+
+            return symbolic_main(command_argv[1:], registry=registry)
         from unidecompiler_cli.simulation import main as simulate_main
 
         return simulate_main(command_argv[1:], registry=registry)
@@ -40,6 +44,7 @@ def main(argv: list[str] | None = None, *, registry: FrontendRegistry | None = N
             "  template         export a VM frontend or GUI plugin starter project\n"
             "  export-template  alias for template\n"
             "  simulate         run a recovered generic-IR function\n\n"
+            "  symbolic         explore recovered generic-IR paths\n\n"
             "Template examples:\n"
             "  unidecompiler template frontend MyVM -o ./my-vm --author NAME "
             "--description TEXT --requirements TEXT --suffix .vm --version 1\n"

@@ -33,6 +33,14 @@ from unidecompiler_simulator import (
     SimulationTargetListing,
 )
 from unidecompiler_simulation_host_python import PythonFileEnvironment
+from unidecompiler_symbolic import (
+    SymbolicCancellation,
+    SymbolicEngine,
+    SymbolicInput,
+    SymbolicLimits,
+    SymbolicResult,
+    SymbolicSort,
+)
 
 FULL_PSEUDOCODE_CONFIRM_BYTES = 512 * 1024
 
@@ -685,6 +693,49 @@ class SimulationWorker(QObject):
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
+class SymbolicWorker(QObject):
+    """Run generic-IR symbolic exploration outside the Qt event thread."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        engine: DecompilerEngine,
+        entry: InputEntry,
+        target: SimulationTarget,
+        symbolic_inputs: tuple[SymbolicInput, ...],
+        concrete_args: dict[str, object],
+        limits: SymbolicLimits,
+        cancellation: SymbolicCancellation,
+    ) -> None:
+        super().__init__()
+        self._engine = engine
+        self._entry = entry
+        self._target = target
+        self._symbolic_inputs = symbolic_inputs
+        self._concrete_args = concrete_args
+        self._limits = limits
+        self._cancellation = cancellation
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            artifact = load_input_entry(self._entry)
+            result = SymbolicEngine.from_registry(self._engine.registry).explore_artifact(
+                artifact.data,
+                artifact.display_path,
+                self._target.query,
+                symbolic_inputs=self._symbolic_inputs,
+                concrete_args=self._concrete_args,
+                limits=self._limits,
+                cancellation=self._cancellation,
+            )
+            self.completed.emit(result)
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class _GuiProgressScope:
     """Add batch context before forwarding events across the Qt signal seam."""
 
@@ -748,6 +799,14 @@ class Workbench(QMainWindow):
         self._simulation_job_path = ""
         self._simulation_result_path = ""
         self._simulation_target_path = ""
+        self._symbolic_thread: QThread | None = None
+        self._symbolic_worker: SymbolicWorker | None = None
+        self._symbolic_cancellation: SymbolicCancellation | None = None
+        self._symbolic_result: SymbolicResult | None = None
+        self._symbolic_job_path = ""
+        self._symbolic_job_result: DecompileResult | None = None
+        self._symbolic_result_path = ""
+        self._symbolic_target_path = ""
         self._history: list[tuple[str, str | None]] = []
         self._history_index = -1
         self._restoring_history = False
@@ -1036,6 +1095,81 @@ class Workbench(QMainWindow):
         simulation_layout.addWidget(self.simulation_filter)
         simulation_layout.addWidget(simulation_splitter, 1)
         self.simulation_panel = simulation_panel
+        self.symbolic_frontend = QLabel("No symbolic target selected")
+        self.symbolic_target = QComboBox()
+        self.symbolic_target.currentIndexChanged.connect(self._symbolic_target_changed)
+        self.symbolic_inputs = QTableWidget(0, 3)
+        self.symbolic_inputs.setHorizontalHeaderLabels(["Parameter", "Sort", "Bit width"])
+        self.symbolic_inputs.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.symbolic_inputs.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.symbolic_concrete = QLineEdit("{}")
+        self.symbolic_concrete.setPlaceholderText("Concrete parameter JSON object")
+        self.symbolic_paths = QSpinBox()
+        self.symbolic_paths.setRange(1, 1_000_000)
+        self.symbolic_paths.setValue(256)
+        self.symbolic_steps = QSpinBox()
+        self.symbolic_steps.setRange(1, 10_000_000)
+        self.symbolic_steps.setValue(100_000)
+        self.symbolic_loop_unroll = QSpinBox()
+        self.symbolic_loop_unroll.setRange(1, 100_000)
+        self.symbolic_loop_unroll.setValue(32)
+        self.symbolic_solver_timeout = QSpinBox()
+        self.symbolic_solver_timeout.setRange(1, 600_000)
+        self.symbolic_solver_timeout.setValue(5_000)
+        self.symbolic_run = QPushButton("Explore")
+        self.symbolic_run.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.symbolic_run.clicked.connect(self._run_symbolic)
+        self.symbolic_cancel = QToolButton()
+        self.symbolic_cancel.setText("x")
+        self.symbolic_cancel.setToolTip("Cancel symbolic execution")
+        self.symbolic_cancel.clicked.connect(self._cancel_symbolic)
+        self.symbolic_cancel.hide()
+        self.symbolic_clear = QToolButton()
+        self.symbolic_clear.setText("Clear")
+        self.symbolic_clear.setToolTip("Clear symbolic results")
+        self.symbolic_clear.clicked.connect(self._clear_symbolic)
+        symbolic_controls = QHBoxLayout()
+        symbolic_controls.setContentsMargins(0, 0, 0, 0)
+        symbolic_controls.addWidget(QLabel("Target"))
+        symbolic_controls.addWidget(self.symbolic_target, 2)
+        symbolic_controls.addWidget(QLabel("Concrete"))
+        symbolic_controls.addWidget(self.symbolic_concrete, 2)
+        symbolic_controls.addWidget(QLabel("Paths"))
+        symbolic_controls.addWidget(self.symbolic_paths)
+        symbolic_controls.addWidget(QLabel("Steps"))
+        symbolic_controls.addWidget(self.symbolic_steps)
+        symbolic_controls.addWidget(QLabel("Loop"))
+        symbolic_controls.addWidget(self.symbolic_loop_unroll)
+        symbolic_controls.addWidget(QLabel("Solver ms"))
+        symbolic_controls.addWidget(self.symbolic_solver_timeout)
+        symbolic_controls.addWidget(self.symbolic_run)
+        symbolic_controls.addWidget(self.symbolic_cancel)
+        symbolic_controls.addWidget(self.symbolic_clear)
+        self.symbolic_status = QLabel()
+        self.symbolic_path_table = QTableWidget(0, 7)
+        self.symbolic_path_table.setHorizontalHeaderLabels(
+            ["ID", "Status", "Constraints", "Model", "Return / raise", "Steps", "Diagnostic"]
+        )
+        self.symbolic_path_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.symbolic_path_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.symbolic_path_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.symbolic_path_table.itemSelectionChanged.connect(self._symbolic_path_selected)
+        self.symbolic_details = QPlainTextEdit()
+        self.symbolic_details.setReadOnly(True)
+        self.symbolic_details.setFont(fixed_font)
+        symbolic_splitter = QSplitter(Qt.Orientation.Vertical)
+        symbolic_splitter.addWidget(self.symbolic_path_table)
+        symbolic_splitter.addWidget(self.symbolic_details)
+        symbolic_splitter.setSizes([400, 180])
+        symbolic_panel = QWidget()
+        symbolic_layout = QVBoxLayout(symbolic_panel)
+        symbolic_layout.setContentsMargins(0, 0, 0, 0)
+        symbolic_layout.addWidget(self.symbolic_frontend)
+        symbolic_layout.addLayout(symbolic_controls)
+        symbolic_layout.addWidget(self.symbolic_inputs)
+        symbolic_layout.addWidget(self.symbolic_status)
+        symbolic_layout.addWidget(symbolic_splitter, 1)
+        self.symbolic_panel = symbolic_panel
         self.global_search_query = QLineEdit()
         self.global_search_query.setPlaceholderText("Search all decompiled files")
         self.global_search_query.setClearButtonEnabled(True)
@@ -1110,7 +1244,8 @@ class Workbench(QMainWindow):
         self.detail_tabs.addTab(browse_panel, "Browser")
         self.detail_tabs.addTab(control_flow_panel, "CFG")
         self.detail_tabs.addTab(self.simulation_panel, "Simulation")
-        self.detail_tabs.currentChanged.connect(self._simulation_tab_changed)
+        self.detail_tabs.addTab(self.symbolic_panel, "Symbolic")
+        self.detail_tabs.currentChanged.connect(self._detail_tab_changed)
         self.detail_tabs.setCurrentWidget(self.pseudocode)
         self.welcome_page = QWidget()
         self.welcome_page.setObjectName("welcomePage")
@@ -1828,7 +1963,7 @@ class Workbench(QMainWindow):
     def _update_frontend_mutation_enabled(self) -> None:
         if self.frontend_manager is not None:
             self.frontend_manager.set_mutation_enabled(
-                self._worker_thread is None and self._simulation_thread is None
+                self._worker_thread is None and self._simulation_thread is None and self._symbolic_thread is None
             )
 
     def _entry_for_display_path(self, display_path: str) -> InputEntry | None:
@@ -1918,6 +2053,10 @@ class Workbench(QMainWindow):
         data = None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
         self._sync_simulation_target(result, data[1] if isinstance(data, tuple) else None)
 
+    def _detail_tab_changed(self, index: int) -> None:
+        self._simulation_tab_changed(index)
+        self._symbolic_tab_changed(index)
+
     def _simulation_target_changed(self, *_unused: object) -> None:
         target = self.simulation_target.currentData()
         if isinstance(target, SimulationTarget):
@@ -1925,6 +2064,227 @@ class Workbench(QMainWindow):
             self.simulation_args.setToolTip(f"Target parameters: {params}")
         else:
             self.simulation_args.setToolTip("")
+
+    def _sync_symbolic_target(self, result: DecompileResult, function_id: str | None) -> None:
+        if result.status != "ok":
+            self.symbolic_frontend.setText("Symbolic execution is available only for recovered bytecode artifacts")
+            self.symbolic_target.clear()
+            self.symbolic_run.setEnabled(False)
+            return
+        listing = self._simulation_targets.get(result.display_path)
+        if listing is None:
+            entry = self._entry_for_display_path(result.display_path)
+            if entry is None:
+                self.symbolic_frontend.setText("Symbolic input data is unavailable")
+                self.symbolic_run.setEnabled(False)
+                return
+            if self._simulation_thread is None:
+                self._start_simulation_worker(entry)
+            self.symbolic_frontend.setText("Discovering symbolic targets...")
+            self.symbolic_run.setEnabled(False)
+            return
+        self.symbolic_frontend.setText(f"Frontend: {listing.frontend_id or 'unavailable'}")
+        previous = self.symbolic_target.currentData()
+        preserve = previous if self._symbolic_target_path == result.display_path else None
+        self.symbolic_target.blockSignals(True)
+        try:
+            self.symbolic_target.clear()
+            for target in listing.targets:
+                self.symbolic_target.addItem(target.label, target)
+            selected = False
+            if function_id is not None:
+                for row in range(self.symbolic_target.count()):
+                    target = self.symbolic_target.itemData(row)
+                    if isinstance(target, SimulationTarget) and target.function_index < len(result.functions) and result.functions[target.function_index].id == function_id:
+                        self.symbolic_target.setCurrentIndex(row)
+                        selected = True
+                        break
+            if not selected and isinstance(preserve, SimulationTarget):
+                for row in range(self.symbolic_target.count()):
+                    target = self.symbolic_target.itemData(row)
+                    if isinstance(target, SimulationTarget) and target.query == preserve.query and target.function_index == preserve.function_index:
+                        self.symbolic_target.setCurrentIndex(row)
+                        break
+        finally:
+            self.symbolic_target.blockSignals(False)
+        self._symbolic_target_path = result.display_path
+        if listing.diagnostic:
+            self.symbolic_status.setText(listing.diagnostic)
+        self.symbolic_run.setEnabled(bool(listing.targets) and self._symbolic_thread is None)
+        self._symbolic_target_changed()
+
+    def _symbolic_tab_changed(self, _index: int) -> None:
+        if self.detail_tabs.currentWidget() is not self.symbolic_panel:
+            return
+        result = self._selected_result()
+        if not isinstance(result, DecompileResult):
+            self.symbolic_frontend.setText("Select a recovered artifact for symbolic execution")
+            self.symbolic_target.clear()
+            self.symbolic_run.setEnabled(False)
+            return
+        item = self.input_tree.currentItem()
+        data = None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
+        self._sync_symbolic_target(result, data[1] if isinstance(data, tuple) else None)
+
+    def _symbolic_target_changed(self, *_unused: object) -> None:
+        target = self.symbolic_target.currentData()
+        params = target.params if isinstance(target, SimulationTarget) else ()
+        self.symbolic_inputs.setRowCount(0)
+        for row, name in enumerate(params):
+            self.symbolic_inputs.insertRow(row)
+            self.symbolic_inputs.setItem(row, 0, QTableWidgetItem(name))
+            sort = QComboBox()
+            for value in SymbolicSort:
+                sort.addItem(value.value, value)
+            sort.setCurrentIndex(sort.findData(SymbolicSort.INT))
+            self.symbolic_inputs.setCellWidget(row, 1, sort)
+            self.symbolic_inputs.setItem(row, 2, QTableWidgetItem(""))
+
+    def _symbolic_request(self) -> tuple[tuple[SymbolicInput, ...], dict[str, object], SymbolicLimits]:
+        concrete = json.loads(self.symbolic_concrete.text())
+        if not isinstance(concrete, dict) or not all(isinstance(key, str) for key in concrete):
+            raise ValueError("concrete values must be a JSON object with string keys")
+        inputs: list[SymbolicInput] = []
+        for row in range(self.symbolic_inputs.rowCount()):
+            name_item = self.symbolic_inputs.item(row, 0)
+            width_item = self.symbolic_inputs.item(row, 2)
+            sort_box = self.symbolic_inputs.cellWidget(row, 1)
+            if name_item is None or not isinstance(sort_box, QComboBox):
+                raise ValueError("symbolic input table is incomplete")
+            name = name_item.text()
+            if name in concrete:
+                continue
+            width_text = "" if width_item is None else width_item.text().strip()
+            width = None if not width_text else int(width_text)
+            item = SymbolicInput(name, SymbolicSort(sort_box.currentData()), width)
+            item.validate()
+            inputs.append(item)
+        limits = SymbolicLimits(
+            self.symbolic_paths.value(), self.symbolic_steps.value(),
+            self.symbolic_loop_unroll.value(), 32, self.symbolic_solver_timeout.value(),
+        )
+        limits.validate()
+        return tuple(inputs), concrete, limits
+
+    def _run_symbolic(self) -> None:
+        result = self._selected_result()
+        target = self.symbolic_target.currentData()
+        if not isinstance(result, DecompileResult) or not isinstance(target, SimulationTarget):
+            self.symbolic_status.setText("Select a symbolic target first")
+            return
+        if self._worker_thread is not None:
+            self.symbolic_status.setText("Wait for decompilation to finish")
+            return
+        entry = self._entry_for_display_path(result.display_path)
+        if entry is None:
+            self.symbolic_status.setText("Symbolic input data is unavailable")
+            return
+        try:
+            inputs, concrete, limits = self._symbolic_request()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.symbolic_status.setText(f"Invalid symbolic request: {error}")
+            return
+        self._symbolic_cancellation = SymbolicCancellation()
+        self._symbolic_job_path = entry.display_path
+        self._symbolic_job_result = result
+        self._symbolic_thread = QThread(self)
+        self._symbolic_worker = SymbolicWorker(
+            self.engine, entry, target, inputs, concrete, limits, self._symbolic_cancellation,
+        )
+        self._symbolic_worker.moveToThread(self._symbolic_thread)
+        self._symbolic_thread.started.connect(self._symbolic_worker.run)
+        self._symbolic_worker.completed.connect(self._symbolic_completed)
+        self._symbolic_worker.completed.connect(self._symbolic_thread.quit)
+        self._symbolic_worker.failed.connect(self._symbolic_failed)
+        self._symbolic_worker.failed.connect(self._symbolic_thread.quit)
+        self._symbolic_thread.finished.connect(self._dispose_symbolic_worker)
+        self.symbolic_run.setEnabled(False)
+        self.symbolic_cancel.show()
+        self.symbolic_status.setText("Exploring paths...")
+        self._update_frontend_mutation_enabled()
+        self._symbolic_thread.start()
+
+    def _cancel_symbolic(self) -> None:
+        if self._symbolic_cancellation is not None:
+            self._symbolic_cancellation.cancel()
+            self.symbolic_cancel.setEnabled(False)
+            self.symbolic_status.setText("Cancelling symbolic execution...")
+
+    def _symbolic_completed(self, result: object) -> None:
+        if not isinstance(result, SymbolicResult):
+            self._symbolic_failed("symbolic worker returned an invalid result")
+            return
+        selected = self._selected_result()
+        if selected is not self._symbolic_job_result:
+            return
+        self._symbolic_result = result
+        self._symbolic_result_path = self._symbolic_job_path
+        self.symbolic_status.setText(
+            f"{result.status.value}; {result.explored_paths} explored; {result.pruned_paths} pruned"
+        )
+        self._refresh_symbolic_paths()
+
+    def _symbolic_failed(self, message: str) -> None:
+        self.symbolic_status.setText(f"Symbolic execution failed: {message}")
+
+    def _dispose_symbolic_worker(self) -> None:
+        if self._symbolic_worker is not None:
+            self._symbolic_worker.deleteLater()
+        if self._symbolic_thread is not None:
+            self._symbolic_thread.deleteLater()
+        self._symbolic_worker = None
+        self._symbolic_thread = None
+        self._symbolic_cancellation = None
+        self._symbolic_job_result = None
+        self.symbolic_cancel.hide()
+        self.symbolic_cancel.setEnabled(True)
+        selected = self._selected_result()
+        if isinstance(selected, DecompileResult) and self.detail_tabs.currentWidget() is self.symbolic_panel:
+            item = self.input_tree.currentItem()
+            data = None if item is None else item.data(0, Qt.ItemDataRole.UserRole)
+            self._sync_symbolic_target(selected, data[1] if isinstance(data, tuple) else None)
+        self._update_frontend_mutation_enabled()
+
+    def _clear_symbolic(self) -> None:
+        self._symbolic_result = None
+        self.symbolic_path_table.setRowCount(0)
+        self.symbolic_details.clear()
+        self.symbolic_status.clear()
+
+    def _refresh_symbolic_paths(self) -> None:
+        self.symbolic_path_table.setRowCount(0)
+        if self._symbolic_result is None:
+            return
+        for path in self._symbolic_result.paths:
+            row = self.symbolic_path_table.rowCount()
+            self.symbolic_path_table.insertRow(row)
+            model = "" if path.model is None else json.dumps({key: str(value) for key, value in path.model.items()}, sort_keys=True)
+            outcome = repr(path.raised if path.raised is not None else path.returns)
+            values = (
+                str(path.path_id), path.status.value, str(len(path.constraints)), model,
+                outcome, str(path.steps), path.diagnostic or "",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                self.symbolic_path_table.setItem(row, column, item)
+
+    def _symbolic_path_selected(self) -> None:
+        item = self.symbolic_path_table.currentItem()
+        path = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        if path is None:
+            return
+        self.symbolic_details.setPlainText(json.dumps({
+            "status": path.status.value,
+            "constraints": [str(value) for value in path.constraints],
+            "model": None if path.model is None else {key: str(value) for key, value in path.model.items()},
+            "returns": [str(value) for value in path.returns],
+            "raised": None if path.raised is None else str(path.raised),
+            "blocks": list(path.blocks),
+            "edges": list(path.edges),
+            "steps": path.steps,
+            "diagnostic": path.diagnostic,
+        }, indent=2, sort_keys=True))
 
     def _choose_simulation_runtime(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Choose runtime", "", "Python files (*.py)")
@@ -2022,7 +2382,10 @@ class Workbench(QMainWindow):
             if isinstance(result, DecompileResult) and result.display_path == self._simulation_job_path:
                 data = self.input_tree.currentItem().data(0, Qt.ItemDataRole.UserRole)
                 function_id = data[1] if isinstance(data, tuple) else None
-                self._sync_simulation_target(result, function_id)
+                if self.detail_tabs.currentWidget() is self.simulation_panel:
+                    self._sync_simulation_target(result, function_id)
+                if self.detail_tabs.currentWidget() is self.symbolic_panel:
+                    self._sync_symbolic_target(result, function_id)
             return
         if kind == "run" and isinstance(payload, SimulationResult):
             self._simulation_result = payload
